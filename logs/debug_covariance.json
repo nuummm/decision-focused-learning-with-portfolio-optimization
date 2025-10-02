@@ -1,0 +1,19 @@
+{
+  "phase": "debug_covariance",
+  "N": 2000,
+  "d": 6,
+  "snr_target": 0.001,
+  "snr_empirical": 0.0009955957645295247,
+  "rho": 0.5,
+  "sigma": 0.0125,
+  "res": 10,
+  "include_current": true,
+  "seed": 42,
+  "eps": 1e-08,
+  "num_Vhats": 1991,
+  "err_relFro": 0.057806414593560916,
+  "err_corr": 0.047470772307780434,
+  "v_signal_emp": 1.3604569686484433,
+  "v_noise_emp": 1366.4752474025802,
+  "tau": 2943.82394371983
+}

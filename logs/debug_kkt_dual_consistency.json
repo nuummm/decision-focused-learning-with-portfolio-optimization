@@ -1,0 +1,26 @@
+{
+  "N": 1000,
+  "d": 10,
+  "snr": 0.01,
+  "rho": 0.3,
+  "sigma": 0.02,
+  "delta": 1.0,
+  "diff_inf": 1.645772740310747e-09,
+  "res": 80,
+  "kkt_residuals": {
+    "dual": {
+      "eq_res": 2.7580222550227518e-09,
+      "ineq_res": 0.0,
+      "opt_res": 4.544975507059235e-16,
+      "comp_res": 1.9380027438873222e-10,
+      "lam_violation": 0.0
+    },
+    "kkt": {
+      "eq_res": 0.0,
+      "ineq_res": 0.0,
+      "opt_res": 8.760353553682876e-17,
+      "comp_res": 0.0,
+      "lam_violation": 0.0
+    }
+  }
+}
