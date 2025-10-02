@@ -45,7 +45,7 @@ solver_options:
     limited_memory_max_history: 20     # L-BFGS メモリ
     mu_strategy: adaptive
     watchdog_shortened_iter_trigger: 10
-    "max_cpu_time": 120
+    "max_cpu_time": 200
 
   gurobi:
     NonConvex: 2

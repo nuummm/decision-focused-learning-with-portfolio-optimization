@@ -51,6 +51,7 @@ def run_once(
     res: int, delta: float,
     tee: bool = True,
     reg_theta_l2: float = 0.0,
+    use_true_cov: bool = False,
 ) -> Tuple[float, float, int, float, float, float, float, float, float, float, float, float, float, float, float]:
 
     # ----- データ生成 -----
@@ -71,15 +72,33 @@ def run_once(
     X_te, Y_te = X[burn_in+n_tr:],        Y[burn_in+n_tr:]
 
     # ----- ローリング共分散 -----
-    Vhats, idx = estimate_epscov_rolling(Y, X, theta_0, tau, res=res, include_current=False)
+    if use_true_cov:
+        idx = list(range(burn_in, N))
+        Vhats = [V_true.copy() for _ in idx]   # 必要なら copy()
+    else:
+        Vhats, idx = estimate_epscov_rolling(
+            Y, X, theta_0, tau, res=res, include_current=False
+    )
     if len(Vhats) == 0:
-        return (np.nan, np.nan, 0, 1.0, np.nan, np.nan, np.nan, 0.0)
+        return (
+            np.nan, np.nan, 0, 1.0,
+            np.nan, np.nan, np.nan, 0.0,
+            np.nan, np.nan, np.nan,
+            np.nan, np.nan, np.nan, np.nan,
+            np.nan, np.nan, np.nan, np.nan,
+        )
 
     # ----- 学習区間（train: burn_in .. burn_in+n_tr-1） -----
     train_pairs = [(i, V) for i, V in zip(idx, Vhats)
                    if burn_in <= i < burn_in + n_tr]
     if not train_pairs:
-        return (np.nan, np.nan, 0, 1.0, np.nan, np.nan, np.nan, 0.0)
+        return (
+            np.nan, np.nan, 0, 1.0,
+            np.nan, np.nan, np.nan, 0.0,
+            np.nan, np.nan, np.nan,
+            np.nan, np.nan, np.nan, np.nan,
+            np.nan, np.nan, np.nan, np.nan,
+        )
     start_train, end_train = train_pairs[0][0], train_pairs[-1][0]
 
     # ----- OLS 初期値（train 全体で学習）-----
@@ -97,35 +116,39 @@ def run_once(
     )
     elapsed = time.perf_counter() - t0
 
-    # 新: 末尾に info(dict) が付いている可能性を考慮
-    if isinstance(trainer_ret, (list, tuple)) and len(trainer_ret) >= 5:
-        theta_hat, Z_tr, MU_tr, LAM_tr, used_train_idx = trainer_ret[:5]
-        info = trainer_ret[5] if len(trainer_ret) >= 6 else {}
-    else:
+    # 統一：(theta_hat, Z_tr, MU_tr, LAM_tr, used_train_idx, info)
+    if not (isinstance(trainer_ret, (list, tuple)) and len(trainer_ret) >= 5):
         raise RuntimeError("Trainer returned unexpected result format")
-    
-    # ---------- 早期打ち切り（max_iter / max_cpu_time）を検知してスキップ ----------
-    # 1) trainer 側からの明示ステータス
-    status = (info or {}).get("status", "").lower() if isinstance(info, dict) else ""
-    if status in {"max_iter", "max_cpu_time", "timeout"}:
-        raise RuntimeError(f"solver_stopped:{status}")
+    theta_hat, Z_tr, MU_tr, LAM_tr, used_train_idx = trainer_ret[:5]
+    info = trainer_ret[5] if len(trainer_ret) >= 6 else {}
 
-    # 2) フォールバック（経過時間 ≈ max_cpu_time）
-    #    solver_spec.options から max_cpu_time を拾えたら閾値比較
+    # ---- 早期打ち切り（max_iter / max_cpu_time / timeout）検知 → スキップ ----
+    tc  = str((info or {}).get("termination_condition", "")).lower()
+    st  = str((info or {}).get("status", "")).lower()
+    msg = str((info or {}).get("message", "") or "").lower()
+
+    bad_tc = {
+        "maxiterations", "maxtimelimit", "max_time_limit",
+        "max_time", "maxcputime", "error", "infeasible"
+    }
+    if (tc in bad_tc) or ("maximum cpu time exceeded" in msg) or (st in {"max_iter","max_cpu_time","timeout"}):
+        raise RuntimeError(f"solver_stopped:{tc or st or 'time_limit'}")
+
+    # フォールバック：経過時間が上限に十分近い
     try:
-        max_cpu_time_opt = solver_spec.options.get("max_cpu_time", None) if solver_spec and hasattr(solver_spec, "options") else None
+        max_cpu_time_opt = solver_spec.options.get("max_cpu_time", None)
         if max_cpu_time_opt is not None:
-            # ipopt は秒指定。95% 以上使っていたら「時間到達扱い」でスキップ
             max_cpu_time = float(max_cpu_time_opt)
             if max_cpu_time > 0 and elapsed >= 0.95 * max_cpu_time:
                 raise RuntimeError("solver_stopped:approx_max_cpu_time")
     except Exception:
-        # options が無い / 数値化不可のときは無視して続行
         pass
 
     # ----- 学習区間の MVO コスト（train で評価） -----
     train_cost_true_mean = np.nan
     train_cost_vhat_mean = np.nan
+    train_best_cost_true_mean = np.nan
+    decision_error_train = np.nan
 
     if train_pairs:
         used_train_idx = [i for i, _ in train_pairs]
@@ -136,12 +159,19 @@ def run_once(
             Yhat_all=Y_hat_all, Vhats=Vhats_train, idx=used_train_idx,
             delta=delta, psd_eps=1e-12, output=False, start_index=None
         )
+        Z_train_opt = solve_series_mvo_gurobi(
+            Yhat_all=Y, Vhats=Vhats_train, idx=used_train_idx,
+            delta=delta, psd_eps=1e-12, output=False, start_index=None
+        )
 
         Y_train_used = Y[used_train_idx]
-        mask_tr = ~np.isnan(Z_train).any(axis=1)
+        mask_tr_pred = ~np.isnan(Z_train).any(axis=1)
+        mask_tr_opt = ~np.isnan(Z_train_opt).any(axis=1)
+        mask_tr = mask_tr_pred & mask_tr_opt
         Z_tr_eval = Z_train[mask_tr]
         Y_tr_eval = Y_train_used[mask_tr]
         Vhats_tr_eval = [Vhats_train[k] for k, m in enumerate(mask_tr) if m]
+        Z_tr_opt_eval = Z_train_opt[mask_tr]
 
         if len(Z_tr_eval) > 0:
             costs_true = [mvo_cost(Z_tr_eval[t], Y_tr_eval[t], V_true, delta)
@@ -152,11 +182,27 @@ def run_once(
                           for t in range(len(Z_tr_eval))]
             train_cost_vhat_mean = float(np.mean(costs_vhat))
 
+            train_best_costs_true = [mvo_cost(Z_tr_opt_eval[t], Y_tr_eval[t], V_true, delta)
+                                     for t in range(len(Z_tr_opt_eval))]
+            if train_best_costs_true:
+                train_best_cost_true_mean = float(np.mean(train_best_costs_true))
+            if np.isfinite(train_best_cost_true_mean) and abs(train_best_cost_true_mean) > 1e-12:
+                decision_error_train = float((train_best_cost_true_mean - train_cost_true_mean) / train_best_cost_true_mean)
+
+    best_cost_true_mean = np.nan
+    decision_error_test = np.nan
+
     # ----- テスト区間 -----
     test_pairs = [(i, V) for i, V in zip(idx, Vhats)
                   if burn_in + n_tr <= i < N]
     if not test_pairs:
-        return (np.nan, np.nan, 0, 1.0, train_cost_true_mean, train_cost_vhat_mean, np.nan, elapsed)
+        return (
+            np.nan, np.nan, 0, 1.0,
+            train_cost_true_mean, train_cost_vhat_mean, np.nan, elapsed,
+            np.nan, np.nan, np.nan,
+            np.nan, np.nan, np.nan, np.nan,
+            np.nan, np.nan, np.nan, np.nan,
+        )
 
     used_test_idx = [i for i, _ in test_pairs]
     Vhats_test = [V for _, V in test_pairs]
@@ -167,14 +213,22 @@ def run_once(
         Yhat_all=Y_hat_all, Vhats=Vhats_test, idx=used_test_idx,
         delta=delta, psd_eps=1e-12, output=False, start_index=None
     )
+    Z_test_opt = solve_series_mvo_gurobi(
+        Yhat_all=Y, Vhats=Vhats_test, idx=used_test_idx,
+        delta=delta, psd_eps=1e-12, output=False, start_index=None
+    )
 
     Y_used = Y[used_test_idx]
     Yhat_used = Y_hat_all[used_test_idx]
-    mask = ~np.isnan(Z_test).any(axis=1)
+    mask_pred = ~np.isnan(Z_test).any(axis=1)
+    mask_opt = ~np.isnan(Z_test_opt).any(axis=1)
+    mask = mask_pred & mask_opt
+    fail_rate = 1.0 - (np.sum(mask_pred) / len(Z_test)) if len(Z_test) > 0 else 1.0
     Z_eval = Z_test[mask]
     Y_eval = Y_used[mask]
     Yhat_eval = Yhat_used[mask]
     Vhats_eval = [Vhats_test[k] for k, m in enumerate(mask) if m]
+    Z_opt_eval = Z_test_opt[mask]
 
     # ----- 指標（MVOコスト / 予測指標） -----
     costs_true = [mvo_cost(Z_eval[t], Y_eval[t], V_true, delta) for t in range(len(Z_eval))]
@@ -182,6 +236,16 @@ def run_once(
 
     costs_vhat = [mvo_cost(Z_eval[t], Y_eval[t], Vhats_eval[t], delta) for t in range(len(Z_eval))]
     mean_cost_vhat = float(np.mean(costs_vhat))
+
+    best_cost_true_mean = np.nan
+    if len(Z_opt_eval) > 0:
+        best_costs_true = [mvo_cost(Z_opt_eval[t], Y_eval[t], V_true, delta)
+                           for t in range(len(Z_opt_eval))]
+        best_cost_true_mean = float(np.mean(best_costs_true))
+
+    decision_error_test = np.nan
+    if np.isfinite(best_cost_true_mean) and abs(best_cost_true_mean) > 1e-12:
+        decision_error_test = float((best_cost_true_mean - mean_cost_true) / best_cost_true_mean)
 
     # --- corr^2（既存）
     corr_cols = []
@@ -218,7 +282,7 @@ def run_once(
             pve_cols.append(1.0 - np.mean((yj - yhj)**2) / var_y)
     mean_pve = float(np.nanmean(pve_cols))
 
-    fail_rate = 1.0 - (len(Z_eval) / len(Z_test))
+    # fail_rate は mask_pred 基準で算出済み
 
     # ----- 学習区間の指標 -----
     train_r2_corrsq = np.nan
@@ -279,7 +343,11 @@ def run_once(
         mse_mean,                 # 12 (test MSE)
         train_mse_mean,           # 13 (train MSE)
         mean_pve,                 # 14 (test PVE)
-        train_pve_mean            # 15 (train PVE)
+        train_pve_mean,           # 15 (train PVE)
+        best_cost_true_mean,      # 16 (test optimal cost)
+        train_best_cost_true_mean,# 17 (train optimal cost)
+        decision_error_test,      # 18 (test decision error)
+        decision_error_train      # 19 (train decision error)
     )
 def main():
     p = argparse.ArgumentParser(description="Unified runner for DFL experiments (KKT/DUAL) with pluggable solvers")
@@ -307,6 +375,10 @@ def main():
     p.add_argument("--outdir", type=str, default=None)
     p.add_argument("--log-every", type=int, default=None)
     p.add_argument("--no-plots", action="store_true", help="Do not save plots")
+    # argparse に CLI 上書きフラグもあると便利
+    p.add_argument("--ipopt-max-cpu-time", type=float, default=None)
+    p.add_argument("--ipopt-max-iter", type=int, default=None)
+    p.add_argument("--use-true-cov", action="store_true", help="共分散を推定せず V_true をそのまま使用する")
 
     args = p.parse_args()
 
@@ -320,30 +392,13 @@ def main():
         for k in ["model", "solver", "tee", "outdir", "log_every"]:
             if k in cfg:
                 setattr(args, k, cfg[k])
-        solver_options = cfg.get("solver_options", {})
-        if not solver_options and solver_name == "ipopt":
-            solver_options = {
-                "tol": "1e-6",
-                "acceptable_tol": "1e-5",
-                "max_iter": 50000,
-                "linear_solver": "mumps",
-                "hessian_approximation": "limited-memory",
-                "limited_memory_max_history": 20,
-                "mu_strategy": "adaptive",
-                "watchdog_shortened_iter_trigger": 10,
-                "max_cpu_time": 120
-            }
-
-        # ★ここで読む
         reg_cfg = cfg.get("regularization", {})
         lambda_theta_from_yaml = float(reg_cfg.get("theta_l2", 0.0))
     else:
         cfg = {}
-        solver_options = {}
         lambda_theta_from_yaml = 0.0
-    lambda_theta = lambda_theta_from_yaml
-    if getattr(args, "lambda_theta", None) is not None:
-        lambda_theta = float(args.lambda_theta)
+
+    lambda_theta = float(args.lambda_theta) if getattr(args, "lambda_theta", None) is not None else lambda_theta_from_yaml
 
     def pick(key, default=None):
         return getattr(args, key) if getattr(args, key) is not None else cfg.get(key, default)
@@ -351,12 +406,11 @@ def main():
     data_cfg = cfg.get("data", {})
     def pick_data(key, default=None):
         cli_val = getattr(args, key, None)
-        if cli_val is not None:
-            return cli_val
-        if key in data_cfg:
-            return data_cfg[key]
+        if cli_val is not None: return cli_val
+        if key in data_cfg: return data_cfg[key]
         return default
 
+    # ここで model/solver を確定
     model_key = pick("model", "kkt")
     solver_name = pick("solver", "knitro")
     tee = bool(pick("tee", False))
@@ -372,13 +426,31 @@ def main():
     delta = float(pick_data("delta", 1.0))
     runs  = int(pick_data("runs", 10))
     seed0 = int(pick_data("seed0", 100))
+    use_true_cov = bool(getattr(args, "use_true_cov", False))  # 共分散行列V_trueをそのまま使用するかどうか
 
-
-    # solver_options は solver 名ごとの dict を想定
+    # ここで solver_options を一回だけ作る
     solver_options_all = cfg.get("solver_options", {})
-    solver_options = solver_options_all.get(solver_name, {})
+    solver_options = dict(solver_options_all.get(solver_name, {}))  # 独立コピー
 
-    # ===== 実行 =====
+    if solver_name == "ipopt":
+        # デフォルト（未設定キーだけ）
+        solver_options.setdefault("tol", "1e-6")
+        solver_options.setdefault("acceptable_tol", "1e-5")
+        solver_options.setdefault("max_iter", 100000)
+        solver_options.setdefault("linear_solver", "mumps")
+        solver_options.setdefault("hessian_approximation", "limited-memory")
+        solver_options.setdefault("limited_memory_max_history", 20)
+        solver_options.setdefault("mu_strategy", "adaptive")
+        solver_options.setdefault("watchdog_shortened_iter_trigger", 10)
+        solver_options.setdefault("max_cpu_time", 200)
+
+        # CLI 上書き
+        if args.ipopt_max_cpu_time is not None:
+            solver_options["max_cpu_time"] = float(args.ipopt_max_cpu_time)
+        if args.ipopt_max_iter is not None:
+            solver_options["max_iter"] = int(args.ipopt_max_iter)
+
+    # これ以降、solver_spec は一度だけ作る
     solver_spec = SolverSpec(name=solver_name, options=solver_options, tee=tee)
 
     # 成功分だけためる
@@ -390,6 +462,8 @@ def main():
     r2_sklearn_list, tr_r2_sklearn_list = [], []
     mse_list, tr_mse_list = [], []
     pve_list, tr_pve_list = [], []
+    best_cost_opt_list, tr_best_cost_opt_list = [], []
+    decision_error_test_list, decision_error_train_list = [], []
 
     print(f"=== Start: model={model_key}, solver={solver_name} ===")
     print(f"N={N}, d={d}, snr={snr}, rho={rho}, sigma={sigma}, res={res}, delta={delta}, runs={runs}, lambda_theta={lambda_theta}")
@@ -410,13 +484,16 @@ def main():
              tr_r2_corr,
              r2_skl, tr_r2_skl,
              mse, tr_mse,
-             pve, tr_pve) = run_once(
+             pve, tr_pve,
+             best_cost_opt, tr_best_cost_opt,
+             dec_err_test, dec_err_train) = run_once(
                 model_key=model_key,
                 solver_spec=solver_spec,
                 seed=s,
                 N=N, d=d, snr=snr, rho=rho, sigma=sigma,
                 res=res, delta=delta,
                 tee=tee,
+                use_true_cov=use_true_cov,
                 reg_theta_l2=lambda_theta,
             )
         except RuntimeError as e:
@@ -448,14 +525,18 @@ def main():
         r2_sklearn_list.append(r2_skl); tr_r2_sklearn_list.append(tr_r2_skl)
         mse_list.append(mse); tr_mse_list.append(tr_mse)
         pve_list.append(pve); tr_pve_list.append(tr_pve)
+        best_cost_opt_list.append(best_cost_opt); tr_best_cost_opt_list.append(tr_best_cost_opt)
+        decision_error_test_list.append(dec_err_test); decision_error_train_list.append(dec_err_train)
         successes += 1
 
         if (successes % max(1, log_every)) == 0:
             print(f"[{successes}/{runs}] seed={s}  "
                   f"cost_test_vtrue={mc_true:.6f} cost_train_vtrue={tr_true:.6f}  "
                   f"corr2={r2_corr:.4f} R2={r2_skl:.4f} PVE={pve:.4f}  "
-                  f"train_corr2={tr_r2_corr:.4f} train_R2={tr_r2_skl:.4f} train_PVE={tr_pve:.4f}"
-                  f"mse={mse:.4e} train_mse={tr_mse:.4e}"
+                  f"train_corr2={tr_r2_corr:.4f} train_R2={tr_r2_skl:.4f} train_PVE={tr_pve:.4f} "
+                  f"mse={mse:.4e} train_mse={tr_mse:.4e} "
+                  f"opt_cost={best_cost_opt:.6f} dec_err={dec_err_test:.4f} "
+                  f"train_opt_cost={tr_best_cost_opt:.6f} train_dec_err={dec_err_train:.4f} "
                   f"rows={Te} fail={fr:.2%} rt={rt:.2f}s")
 
     total_elapsed = time.perf_counter() - T0
@@ -482,6 +563,10 @@ def main():
     tr_r2sk_mean, _, _, _ = summarize(np.array(tr_r2_sklearn_list))
     tr_mse_mean, _, _, _  = summarize(np.array(tr_mse_list))
     tr_pve_mean, _, _, _  = summarize(np.array(tr_pve_list))
+    best_cost_mean, best_cost_se, best_cost_ci, _ = summarize(np.array(best_cost_opt_list))
+    tr_best_cost_mean, tr_best_cost_se, tr_best_cost_ci, _ = summarize(np.array(tr_best_cost_opt_list))
+    dec_err_mean, dec_err_se, dec_err_ci, _ = summarize(np.array(decision_error_test_list))
+    tr_dec_err_mean, tr_dec_err_se, tr_dec_err_ci, _ = summarize(np.array(decision_error_train_list))
 
     print("\n==== Summary ====")
     print(f"  Mean MVO Cost (test, Vtrue): {cost_mean:.6f} (SE {cost_se:.6f}, 95% CI [{cost_ci[0]:.6f}, {cost_ci[1]:.6f}], n={n_cost})")
@@ -489,10 +574,14 @@ def main():
     print(f"  Mean R^2 (test, sklearn)   : {r2sk_mean:.6f} (SE {r2sk_se:.4f}, 95% CI [{r2sk_ci[0]:.4f}, {r2sk_ci[1]:.4f}])")
     print(f"  Mean MSE (test)            : {mse_mean:.6e} (SE {mse_se:.2e}, 95% CI [{mse_ci[0]:.2e}, {mse_ci[1]:.2e}])")
     print(f"  Mean PVE (test)            : {pve_mean:.6f} (SE {pve_se:.4f}, 95% CI [{pve_ci[0]:.4f}, {pve_ci[1]:.4f}])")
+    print(f"  Optimal MVO Cost (test)    : {best_cost_mean:.6f} (SE {best_cost_se:.6f}, 95% CI [{best_cost_ci[0]:.6f}, {best_cost_ci[1]:.6f}])")
+    print(f"  Decision Error (test)      : {dec_err_mean:.6f} (SE {dec_err_se:.6f}, 95% CI [{dec_err_ci[0]:.6f}, {dec_err_ci[1]:.6f}])")
     print(f"  Mean corr^2 (train)        : {tr_r2_mean:.6f}")
     print(f"  Mean R^2 (train, sklearn)  : {tr_r2sk_mean:.6f}")
     print(f"  Mean MSE (train)           : {tr_mse_mean:.6e}")
     print(f"  Mean PVE (train)           : {tr_pve_mean:.6f}")
+    print(f"  Optimal MVO Cost (train)   : {tr_best_cost_mean:.6f}")
+    print(f"  Decision Error (train)     : {tr_dec_err_mean:.6f}")
     print(f"  Train mean MVO (Vtrue)     : {tr_true_mean:.6f}")
     print(f"  Train mean MVO (Vhat)      : {tr_vhat_mean:.6f}")
     print(f"  Test  mean MVO (Vhat)      : {te_vhat_mean:.6f}")
@@ -536,6 +625,10 @@ def main():
         "eval_rows":            Te_list,
         "fail_rate":            fail_list,
         "runtime_sec":          run_times,
+        "optimal_cost_test_vtrue": best_cost_opt_list,
+        "optimal_cost_train_vtrue": tr_best_cost_opt_list,
+        "decision_error_test":   decision_error_test_list,
+        "decision_error_train":  decision_error_train_list,
     })
     run_csv = str(base) + "_runs.csv"
     run_df.to_csv(run_csv, index=False)
@@ -587,6 +680,24 @@ def main():
         "pve_test_ci_lo": float(pve_ci[0]),
         "pve_test_ci_hi": float(pve_ci[1]),
         "pve_train": float(tr_pve_mean),
+
+        # Optimal costs & decision error（新規）
+        "optimal_cost_test_vtrue": float(best_cost_mean),
+        "optimal_cost_test_vtrue_se": float(best_cost_se),
+        "optimal_cost_test_vtrue_ci_lo": float(best_cost_ci[0]),
+        "optimal_cost_test_vtrue_ci_hi": float(best_cost_ci[1]),
+        "optimal_cost_train_vtrue": float(tr_best_cost_mean),
+        "optimal_cost_train_vtrue_se": float(tr_best_cost_se),
+        "optimal_cost_train_vtrue_ci_lo": float(tr_best_cost_ci[0]),
+        "optimal_cost_train_vtrue_ci_hi": float(tr_best_cost_ci[1]),
+        "decision_error_test": float(dec_err_mean),
+        "decision_error_test_se": float(dec_err_se),
+        "decision_error_test_ci_lo": float(dec_err_ci[0]),
+        "decision_error_test_ci_hi": float(dec_err_ci[1]),
+        "decision_error_train": float(tr_dec_err_mean),
+        "decision_error_train_se": float(tr_dec_err_se),
+        "decision_error_train_ci_lo": float(tr_dec_err_ci[0]),
+        "decision_error_train_ci_hi": float(tr_dec_err_ci[1]),
 
         # 既存の運用系メタ情報
         "avg_eval_T": float(np.nanmean(Te_list)),

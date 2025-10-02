@@ -65,8 +65,8 @@ def _wrap_kkt(spec: SolverSpec) -> TrainerFn:
         X: NDArray, Y: NDArray, Vhats: List[NDArray], idx: List[int],
         start_index: Optional[int] = None, end_index: Optional[int] = None,
         delta: float = 1.0, theta_init: Optional[NDArray] = None,
-        tee: bool = False,                       # 実行時の表示（モデル側）
-        solver: str = "",                        # 呼び出し側で上書き可
+        tee: bool = False,
+        solver: str = "",
         solver_options: Optional[Dict[str, Any]] = None,
         **kw,
     ):
@@ -77,13 +77,23 @@ def _wrap_kkt(spec: SolverSpec) -> TrainerFn:
         local_tee = bool(tee or spec.tee)
         reg_theta_l2 = float(kw.get("reg_theta_l2", 0.0))
 
-        return _fit_kkt(
+        ret = _fit_kkt(
             X, Y, Vhats, idx,
             start_index=start_index, end_index=end_index,
             delta=delta, theta_init=theta_init, tee=local_tee,
             solver=use_solver, solver_options=use_opts,
-            reg_theta_l2=reg_theta_l2,  
+            reg_theta_l2=reg_theta_l2,
         )
+        # --- 戻り値を (.., info) 付きに正規化 ---
+        if isinstance(ret, (list, tuple)):
+            if len(ret) >= 6:
+                return ret  # 既に info あり
+            elif len(ret) == 5:
+                theta_hat, Z, MU, LAM, used_idx = ret
+                info = {}
+                return theta_hat, Z, MU, LAM, used_idx, info
+        # 想定外フォーマットの場合は例外
+        raise RuntimeError("fit_kkt returned unexpected format")
     return _runner
 
 def _wrap_dual(spec: SolverSpec) -> TrainerFn:
@@ -95,7 +105,7 @@ def _wrap_dual(spec: SolverSpec) -> TrainerFn:
         tee: bool = False,
         solver: str = "",
         solver_options: Optional[Dict[str, Any]] = None,
-        **kw, 
+        **kw,
     ):
         use_solver = (solver or spec.name)
         use_opts = dict(spec.options)
@@ -104,13 +114,22 @@ def _wrap_dual(spec: SolverSpec) -> TrainerFn:
         local_tee = bool(tee or spec.tee)
         reg_theta_l2 = float(kw.get("reg_theta_l2", 0.0))
 
-        return _fit_dual(
+        ret = _fit_dual(
             X, Y, Vhats, idx,
             start_index=start_index, end_index=end_index,
             delta=delta, theta_init=theta_init, tee=local_tee,
             solver=use_solver, solver_options=use_opts,
-            reg_theta_l2=reg_theta_l2, 
+            reg_theta_l2=reg_theta_l2,
         )
+        # --- 戻り値を (.., info) 付きに正規化 ---
+        if isinstance(ret, (list, tuple)):
+            if len(ret) >= 6:
+                return ret  # 既に info あり
+            elif len(ret) == 5:
+                theta_hat, Z, MU, LAM, used_idx = ret
+                info = {}
+                return theta_hat, Z, MU, LAM, used_idx, info
+        raise RuntimeError("fit_dual returned unexpected format")
     return _runner
 
 # レジストリ本体
@@ -129,11 +148,16 @@ def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
             tee: bool = False, solver: str = "", solver_options: Optional[Dict[str, Any]] = None,
             **kw,
         ):
-            return fit_ols_baseline(
+            ret = fit_ols_baseline(
                 X, Y, Vhats, idx,
                 start_index=start_index, end_index=end_index,
                 delta=delta, theta_init=theta_init, tee=tee
             )
+            if isinstance(ret, (list, tuple)) and len(ret) == 5:
+                theta_hat, Z, MU, LAM, used_idx = ret
+                info = {}
+                return theta_hat, Z, MU, LAM, used_idx, info
+            return ret
         return _runner
     raise KeyError(f"Unknown model_key: {model_key}. Use one of: kkt, dual, ols")
 
