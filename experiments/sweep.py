@@ -45,16 +45,33 @@ def cmd_for(params: dict, python_exec: str) -> list[str]:
     ]
     if params.get("tee", False): cmd.append("--tee")
     if params.get("no_plots", False): cmd.append("--no-plots")
+    if params["model"] == "flex":
+        cmd.extend([
+            "--flex-formulation", params.get("flex_formulation", "dual"),
+            "--flex-lambda-theta-anchor", str(params.get("flex_lambda_theta_anchor", 0.0)),
+            "--flex-lambda-w-anchor", str(params.get("flex_lambda_w_anchor", 0.0)),
+            "--flex-lambda-w-iso", str(params.get("flex_lambda_w_iso", 0.0)),
+            "--flex-dro-rho", str(params.get("flex_dro_rho", 0.0)),
+        ])
     return cmd
 
 def tag_for(params: dict) -> str:
     def f(x: float) -> str: return f"{x:g}"
-    return (
+    base = (
         f"{params['model']}_{params['solver']}"
         f"_N{params['N']}_d{params['d']}"
         f"_res{params['res']}_snr{f(params['snr'])}_rho{f(params['rho'])}"
-        f"_lambda{f(params['lambda_theta'])}"
+        f"_delta{f(params['delta'])}_lambda{f(params['lambda_theta'])}"
     )
+    if params["model"] == "flex":
+        base += (
+            f"_form{params.get('flex_formulation','dual')}"
+            f"_lth{f(params.get('flex_lambda_theta_anchor',0.0))}"
+            f"_lwa{f(params.get('flex_lambda_w_anchor',0.0))}"
+            f"_lwi{f(params.get('flex_lambda_w_iso',0.0))}"
+            f"_dro{f(params.get('flex_dro_rho',0.0))}"
+        )
+    return base
 
 def main():
     ap = argparse.ArgumentParser(
@@ -80,6 +97,12 @@ def main():
     ap.add_argument("--d",      type=int,   default=10)
     ap.add_argument("--sigma",  type=float, default=0.0125)
     ap.add_argument("--delta",  type=float, default=1.0)
+    ap.add_argument(
+        "--delta_list",
+        type=comma_floats,
+        default=None,
+        help='delta 候補 (例: "1, 10, 100"). 未指定なら --delta の単一値を使用'
+    )
     ap.add_argument("--runs",   type=int,   default=10)
     ap.add_argument("--seed0",  type=int,   default=100)
     ap.add_argument("--outdir", type=str,   default="results/exp_unified_yaml")
@@ -88,6 +111,13 @@ def main():
     ap.add_argument("--no-plots", action="store_true")
     ap.add_argument("--lambda_list", type=comma_floats, default=comma_floats("0.0"),
                     help='theta L2 list, e.g. "0, 1e-6, 1e-4"')
+    # flex model options
+    ap.add_argument("--flex_formulations", type=comma_strs, default=comma_strs("dual"),
+                    help='flex formulations, e.g. "dual,kkt"')
+    ap.add_argument("--flex_lambda_theta_anchor_list", type=comma_floats, default=comma_floats("0.0"))
+    ap.add_argument("--flex_lambda_w_anchor_list", type=comma_floats, default=comma_floats("0.0"))
+    ap.add_argument("--flex_lambda_w_iso_list", type=comma_floats, default=comma_floats("0.0"))
+    ap.add_argument("--flex_dro_rho_list", type=comma_floats, default=comma_floats("0.0"))
 
     # 実行制御
     ap.add_argument("--workers", type=int, default=4, help="並列実行スレッド数（-1 or 0 で全コア）")
@@ -112,13 +142,22 @@ def main():
     args.models   = _uniq_sorted(args.models)
     args.solvers  = _uniq_sorted(args.solvers)
     args.lambda_list = _uniq_sorted(args.lambda_list)
+    args.flex_formulations = _uniq_sorted(args.flex_formulations)
+    args.flex_lambda_theta_anchor_list = _uniq_sorted(args.flex_lambda_theta_anchor_list)
+    args.flex_lambda_w_anchor_list = _uniq_sorted(args.flex_lambda_w_anchor_list)
+    args.flex_lambda_w_iso_list = _uniq_sorted(args.flex_lambda_w_iso_list)
+    args.flex_dro_rho_list = _uniq_sorted(args.flex_dro_rho_list)
+    if args.delta_list:
+        args.delta_list = _uniq_sorted(args.delta_list)
+    else:
+        args.delta_list = _uniq_sorted([args.delta])
 
     for name in ["snr_list","N_list","res_list","rho_list","models","solvers"]:
         if not getattr(args, name):
             print(f"[ERR] {name} is empty.")
             sys.exit(2)
 
-    allowed_models  = {"dual","kkt","ols"}
+    allowed_models  = {"dual","kkt","ols","flex"}
     unknown_models  = set(args.models) - allowed_models
     if unknown_models:
         print(f"[ERR] unknown models: {sorted(unknown_models)}")
@@ -147,39 +186,66 @@ def main():
         writer.writerow([
             "tag", "model", "solver", "snr", "N", "res", "rho", "lambda_theta",
             "d", "sigma", "delta", "runs", "seed0",
+            "flex_formulation", "flex_lambda_theta_anchor", "flex_lambda_w_anchor",
+            "flex_lambda_w_iso", "flex_dro_rho",
             "returncode", "log_path", "cmd"
         ])
 
     # ---------- ジョブ列挙 ----------
     jobs = []
     # OLS は正則化を掃引しない（lambda=0 の 1 回だけ）
-    for snr, N, res, rho in itertools.product(args.snr_list, args.N_list, args.res_list, args.rho_list):
+    for snr, N, res, rho, delta in itertools.product(
+            args.snr_list, args.N_list, args.res_list, args.rho_list, args.delta_list):
         if "ols" in args.models:
             jobs.append({
                 "model": "ols",
                 "solver": args.ols_solver,      # 表示用
                 "snr": snr, "N": N, "res": res, "rho": rho,
                 "lambda_theta": 0.0,            # 固定
-                "d": args.d, "sigma": args.sigma, "delta": args.delta,
+                "d": args.d, "sigma": args.sigma, "delta": delta,
                 "runs": args.runs, "seed0": args.seed0,
                 "outdir": args.outdir, "log_every": args.log_every,
                 "tee": args.tee, "no_plots": args.no_plots,
             })
-        # dual/kkt は lambda を掃引
+        # dual/kkt/flex は lambda を掃引
         for model in args.models:
             if model == "ols":
                 continue
-            for solver, lam in itertools.product(args.solvers, args.lambda_list):
-                jobs.append({
-                    "model": model,
-                    "solver": solver,
-                    "snr": snr, "N": N, "res": res, "rho": rho,
-                    "lambda_theta": lam,
-                    "d": args.d, "sigma": args.sigma, "delta": args.delta,
-                    "runs": args.runs, "seed0": args.seed0,
-                    "outdir": args.outdir, "log_every": args.log_every,
-                    "tee": args.tee, "no_plots": args.no_plots,
-                })
+            if model == "flex":
+                for solver, lam, form, lam_t, lam_w, lam_iso, dro in itertools.product(
+                        args.solvers, args.lambda_list,
+                        args.flex_formulations,
+                        args.flex_lambda_theta_anchor_list,
+                        args.flex_lambda_w_anchor_list,
+                        args.flex_lambda_w_iso_list,
+                        args.flex_dro_rho_list):
+                    jobs.append({
+                        "model": model,
+                        "solver": solver,
+                        "snr": snr, "N": N, "res": res, "rho": rho,
+                        "lambda_theta": lam,
+                        "d": args.d, "sigma": args.sigma, "delta": delta,
+                        "runs": args.runs, "seed0": args.seed0,
+                        "outdir": args.outdir, "log_every": args.log_every,
+                        "tee": args.tee, "no_plots": args.no_plots,
+                        "flex_formulation": form,
+                        "flex_lambda_theta_anchor": lam_t,
+                        "flex_lambda_w_anchor": lam_w,
+                        "flex_lambda_w_iso": lam_iso,
+                        "flex_dro_rho": dro,
+                    })
+            else:
+                for solver, lam in itertools.product(args.solvers, args.lambda_list):
+                    jobs.append({
+                        "model": model,
+                        "solver": solver,
+                        "snr": snr, "N": N, "res": res, "rho": rho,
+                        "lambda_theta": lam,
+                        "d": args.d, "sigma": args.sigma, "delta": delta,
+                        "runs": args.runs, "seed0": args.seed0,
+                        "outdir": args.outdir, "log_every": args.log_every,
+                        "tee": args.tee, "no_plots": args.no_plots,
+                    })
 
     total = len(jobs)
     print(f"[INFO] total jobs: {total}")
@@ -214,10 +280,21 @@ def main():
             results.append((tag, params, rc, log_path, cmd_str))
             with open(index_csv, "a", newline="") as f:
                 writer = csv.writer(f)
+                if params["model"] == "flex":
+                    flex_vals = [
+                        params.get("flex_formulation", ""),
+                        params.get("flex_lambda_theta_anchor", ""),
+                        params.get("flex_lambda_w_anchor", ""),
+                        params.get("flex_lambda_w_iso", ""),
+                        params.get("flex_dro_rho", ""),
+                    ]
+                else:
+                    flex_vals = ["", "", "", "", ""]
                 writer.writerow([
                     tag, params["model"], params["solver"],
                     params["snr"], params["N"], params["res"], params["rho"], params["lambda_theta"],
                     params["d"], params["sigma"], params["delta"], params["runs"], params["seed0"],
+                    *flex_vals,
                     rc, log_path, cmd_str
                 ])
 
@@ -232,17 +309,37 @@ if __name__ == "__main__":
 cd ~/VScode/GraduationResearch
 
 python DFL_Portfolio_Optimization2/experiments/sweep.py \
-  --snr_list "0.001, 0.002, 0.005, 0.01" \
-  --N_list "500" \
-  --res_list "100" \
+  --snr_list " 0.01, 0.1, 1" \
+  --N_list "50" \
+  --res_list "10" \
   --rho_list "0.5" \
-  --models "dual, ols" \
-  --solvers "ipopt" \
-  --d 10 \
-  --runs 50 \
+  --models "dual, kkt, ols" \
+  --solvers "gurobi" \
+  --d 3 \
+  --runs 10 \
   --seed0 100 \
   --lambda_list "0" \
   --outdir results/exp_unified_yaml \
   --logdir results/sweep_logs \
   --workers -1
+
+
+cd ~/VScode/GraduationResearch
+python DFL_Portfolio_Optimization2/experiments/sweep.py \
+    --snr_list "100, 1, 0.1, 0.01, 0.001" \
+    --N_list "50" \
+    --res_list "10" \
+    --rho_list "0.5" \
+    --delta_list "1" \
+    --models "flex, ols" \
+    --solvers "gurobi" \
+    --d 3 \
+    --flex_formulations "dual, kkt" \
+    --flex_lambda_theta_anchor_list "0.0" \
+    --flex_lambda_w_anchor_list " 0.0" \
+    --flex_lambda_w_iso_list "0.0" \
+    --flex_dro_rho_list " 0.0" \
+    --runs 10 \
+    --seed0 100 \
+
 """

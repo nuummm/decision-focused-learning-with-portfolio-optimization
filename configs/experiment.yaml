@@ -1,213 +1,138 @@
 # DFL_Portfolio_Optimization2/configs/experiment.yaml
 
-model: dual         # kkt | dual | ols
-solver: ipopt       # gurobi | ipopt | knitro
-tee: false
+model: kkt         # kkt | dual | ols
+solver: gurobi       # gurobi | ipopt | knitro
+tee: True
 outdir: results/exp_unified_yaml
 log_every: 1
 
 data:
-  N: 500
-  d: 10
-  snr: 0.01
+  N: 100
+  d: 2
+  snr: 1e+6
   rho: 0.5
   sigma: 0.0125
-  res: 100
+  res: 10
   delta: 1
-  runs: 10
+  runs: 1
   seed0: 100
-# configs/experiment.yaml 例
 regularization:
   theta_l2: 1e-3   # まずは 0, 1e-6, 1e-5, 1e-4, 1e-3,... をログ刻みで
 
+# 厳密性（再現性・厳しめの可行性/最適性）重視プロファイル
 solver_options:
   knitro:
     outlev: 3
-    nlp_algorithm: 1         # 1=Barrier, 2=Active-set も試す
-    hessopt: 6               # 大規模はL-BFGS, 代表ケースで2=Exactを検証
-    lmsize: 30
+    nlp_algorithm: 1          # Interior-point (barrier, direct)
+    hessopt: 2                # Exact Hessian（可能なら）。大規模で厳しければ 4=SR1 へ
+    linsolver: ma57           # 使えるなら数値安定寄り（環境に応じて）
     scale: 1
-    feastol: 1e-6
-    opttol: 1e-6
-    maxit: 10000
+    presolve: 1
+    feastol: 1e-8
+    opttol: 1e-8
+    xtol: 1e-10
+    honorbnds: 1              # 境界遵守を優先
+    maxit: 20000
     maxtime_real: 600
-    numthreads: 4
-    ms_enable: 1             # multi-start 有効化
-    ms_maxsolves: 5          # 最大リスタート回数
-
+    numthreads: 1             # 再現性重視
+    ms_enable: 0              # 局所探索のばらつきを抑える（探索は別プロファイルで）
+    bar_initmu: 1e-1          # 初期バリア小さめ（数値が悪ければ 1e0→1e-1 調整）
+    bar_murule: 4             # adaptive寄り（環境で最安定のもの）
+    # ログを詳細化してKKT残差監視
+    outmode: 1
 
   ipopt:
-    tol: 1e-6
-    acceptable_tol: 1e-5
-    max_iter: 100000
-    linear_solver: mumps
-    hessian_approximation: limited-memory
-    limited_memory_max_history: 20     # L-BFGS メモリ
+    tol: 1e-8
+    acceptable_tol: 1e-6
+    dual_inf_tol: 1e-8
+    constr_viol_tol: 1e-8
+    compl_inf_tol: 1e-8
+    max_iter: 200000
+    max_cpu_time: 600
     mu_strategy: adaptive
-    watchdog_shortened_iter_trigger: 10
-    "max_cpu_time": 200
+    nlp_scaling_method: gradient-based
+    hessian_approximation: exact        # 可能なら exact（デフォルト）。無理なら limited-memory
+    linear_solver: ma57                 # or pardiso（使えるものを）
+    bound_push: 1e-12                   # 境界押し込みを最小化
+    bound_frac: 1e-12
+    warm_start_init_point: yes
+    print_level: 5
 
   gurobi:
     NonConvex: 2
-    TimeLimit: 300
-    Presolve: 2
+    Threads: 1
+    Seed: 0
+    TimeLimit: 600
     OutputFlag: 1
-    Threads: 8
-    MIPFocus: 3
-    # Heuristics: 0.05
-    # ImproveStartTime: 30
-    # NumericFocus: 3
-    # BarQCPConvTol: 1e-9
-    # FeasibilityTol: 1e-9
-    # OptimalityTol: 1e-9
-    # IntFeasTol: 1e-9
-    MIPGap: 0.001
+    MIPGap: 0
+    MIPGapAbs: 0
+    Heuristics: 0.0            # 厳密性優先：ヒューリスティクスを切る
+    Cuts: 2                    # 適度に強化（数値が揺れるなら 1）
+    Presolve: 2                # 強めの前処理（数値不安なら 1）
+    NumericFocus: 1            # 数値安定優先（重くなる）
+    FeasibilityTol: 1e-9
+    OptimalityTol: 1e-9
+    BarConvTol: 1e-12          # バリア収束を厳しく
+    Method: 2                  # Barrier（根緩和の安定性重視）
 
+# 計算効率 & “良い局所解”探索寄りプロファイル
+# solver_options:
+#   knitro:
+#     outlev: 2
+#     nlp_algorithm: 1             # まずはInterior-point
+#     hessopt: 6                   # L-BFGS（大規模・初期収束が軽い）
+#     lmsize: 30
+#     linsolver: auto
+#     scale: 1
+#     presolve: 1
+#     feastol: 1e-6
+#     opttol: 1e-6
+#     xtol: 1e-8
+#     maxit: 10000
+#     maxtime_real: 300
+#     numthreads: 8                # 効率重視
+#     ms_enable: 1
+#     ms_maxsolves: 5              # まずは少数で幅を取る（ASHAで良個体に再配分）
+#     ms_maxtime: 60               # 各サブソルブの上限（短時間タッチ）
+#     bar_murule: 4
+#     # 進まないときに切替用テンプレ（実行側でプロファイルBとして用意）
+#     # nlp_algorithm: 2           # Active-set
+#     # hessopt: 4                 # SR1
+
+#   ipopt:
+#     tol: 1e-6
+#     acceptable_tol: 1e-4
+#     acceptable_iter: 5
+#     max_iter: 50000
+#     max_cpu_time: 300
+#     mu_strategy: adaptive
+#     nlp_scaling_method: gradient-based
+#     hessian_approximation: limited-memory
+#     limited_memory_max_history: 20
+#     linear_solver: mumps
+#     watchdog_shortened_iter_trigger: 10
+#     warm_start_init_point: yes
+#     bound_push: 1e-8
+#     bound_frac: 1e-8
+#     print_level: 4
+
+#   gurobi:
+#     NonConvex: 2
+#     Threads: 8
+#     TimeLimit: 300
+#     OutputFlag: 1
+#     MIPGap: 1e-3                 # まずは早めに切る
+#     Heuristics: 0.2              # 近似解の獲得を促進
+#     Cuts: 1
+#     Presolve: -1                 # 自動
+#     Method: -1                   # 自動選択（状況に応じて切替）
+#     Seed: 0
+#     FeasibilityTol: 1e-8
+#     OptimalityTol: 1e-8
 
 #cd ~/VScode/GraduationResearch 
 #python DFL_Portfolio_Optimization2/experiments/run.py --config DFL_Portfolio_Optimization2/configs/experiment.yaml
 
-
-# === Start: model=dual, solver=ipopt ===
-# N=1000, d=5, snr=0.001, rho=0.5, sigma=0.0125, res=100, delta=1.0, runs=10,lambda_theta=0.0
-# solver_options={'tol': '1e-6', 'acceptable_tol': '1e-5', 'max_iter': 30000, 'linear_solver': 'mumps', 'hessian_approximation': 'limited-memory', 'limited_memory_max_history': 20, 'mu_strategy': 'adaptive', 'watchdog_shortened_iter_trigger': 10}
-# Set parameter Username
-# Set parameter LicenseID to value 2687478
-# Academic license - for non-commercial use only - expires 2026-07-11
-# [R2-corr²] mean_corr² = 0.002363
-# [1/10] seed=100  cost_test_vtrue=-1.288831  r2=0.002363  rows=450  fail=0.00%  rt=6.32s
-# [R2-corr²] mean_corr² = 0.003644
-# [2/10] seed=101  cost_test_vtrue=0.552182  r2=0.003644  rows=450  fail=0.00%  rt=5.61s
-# [R2-corr²] mean_corr² = 0.002507
-# [3/10] seed=102  cost_test_vtrue=0.721699  r2=0.002507  rows=450  fail=0.00%  rt=10.16s
-# [R2-corr²] mean_corr² = 0.005813
-# [4/10] seed=103  cost_test_vtrue=-0.480644  r2=0.005813  rows=450  fail=0.00%  rt=16.45s
-# [R2-corr²] mean_corr² = 0.000562
-# [5/10] seed=104  cost_test_vtrue=-0.080114  r2=0.000562  rows=450  fail=0.00%  rt=13.96s
-# [R2-corr²] mean_corr² = 0.002949
-# [6/10] seed=105  cost_test_vtrue=0.788627  r2=0.002949  rows=450  fail=0.00%  rt=8.36s
-# [R2-corr²] mean_corr² = 0.002034
-# [7/10] seed=106  cost_test_vtrue=-0.489777  r2=0.002034  rows=450  fail=0.00%  rt=13.33s
-# [R2-corr²] mean_corr² = 0.001587
-# [8/10] seed=107  cost_test_vtrue=-3.444786  r2=0.001587  rows=450  fail=0.00%  rt=10.15s
-# [R2-corr²] mean_corr² = 0.001724
-# [9/10] seed=108  cost_test_vtrue=-1.930048  r2=0.001724  rows=450  fail=0.00%  rt=10.48s
-# [R2-corr²] mean_corr² = 0.003616
-# [10/10] seed=109  cost_test_vtrue=-1.667529  r2=0.003616  rows=450  fail=0.00%  rt=5.84s
-
-# [INFO] trials=10, successes=10, skipped=0
-
-# ==== Summary ====
-#   Mean MVO Cost (test, Vtrue): -0.731922 (SE 0.429486, 95% CI [-1.573716, 0.109871], n=10)
-#   Mean R^2 (test)            : 0.002680  (SE 0.0005, 95% CI [0.0018, 0.0036], n=10)
-#   Mean R^2 (train)           : 0.003695
-#   Train mean MVO (Vtrue)     : -2.568177
-#   Train mean MVO (Vhat)      : -2.568176
-#   Test  mean MVO (Vhat)      : -0.731922
-#   Avg eval rows              : 450.0
-#   Avg fail rate              : 0.00%
-#   Total time                 : 108.20 sec
-#   Avg/run time               : 10.07 sec
-
-
-# === Start: model=ols, solver=ipopt ===
-# N=1000, d=5, snr=0.001, rho=0.5, sigma=0.0125, res=100, delta=1.0, runs=10, lambda_theta=0.1
-# solver_options={'tol': '1e-6', 'acceptable_tol': '1e-5', 'max_iter': 30000, 'linear_solver': 'mumps', 'hessian_approximation': 'limited-memory', 'limited_memory_max_history': 20, 'mu_strategy': 'adaptive', 'watchdog_shortened_iter_trigger': 10}
-# Set parameter Username
-# Set parameter LicenseID to value 2687478
-# Academic license - for non-commercial use only - expires 2026-07-11
-# [R2-corr²] mean_corr² = 0.002363
-# [1/10] seed=100  cost_test_vtrue=-1.109894  r2=0.002363  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.003644
-# [2/10] seed=101  cost_test_vtrue=-0.125774  r2=0.003644  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.002507
-# [3/10] seed=102  cost_test_vtrue=1.384970  r2=0.002507  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.005813
-# [4/10] seed=103  cost_test_vtrue=-0.713635  r2=0.005813  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.000562
-# [5/10] seed=104  cost_test_vtrue=0.164005  r2=0.000562  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.002949
-# [6/10] seed=105  cost_test_vtrue=1.095542  r2=0.002949  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.002034
-# [7/10] seed=106  cost_test_vtrue=-1.357460  r2=0.002034  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.001587
-# [8/10] seed=107  cost_test_vtrue=-3.248187  r2=0.001587  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.001724
-# [9/10] seed=108  cost_test_vtrue=-2.010929  r2=0.001724  rows=450  fail=0.00%  rt=0.00s
-# [R2-corr²] mean_corr² = 0.003616
-# [10/10] seed=109  cost_test_vtrue=-1.769706  r2=0.003616  rows=450  fail=0.00%  rt=0.00s
-
-# [INFO] trials=10, successes=10, skipped=0
-
-# ==== Summary ====
-#   Mean MVO Cost (test, Vtrue): -0.769107 (SE 0.454069, 95% CI [-1.659082, 0.120868], n=10)
-#   Mean R^2 (test)            : 0.002680  (SE 0.0005, 95% CI [0.0018, 0.0036], n=10)
-#   Mean R^2 (train)           : 0.003695
-#   Train mean MVO (Vtrue)     : -1.379034
-#   Train mean MVO (Vhat)      : -1.379033
-#   Test  mean MVO (Vhat)      : -0.769106
-#   Avg eval rows              : 450.0
-#   Avg fail rate              : 0.00%
-#   Total time                 : 7.07 sec
-#   Avg/run time               : 0.00 sec
-
-# === Start: model=dual, solver=ipopt ===
-# N=1000, d=5, snr=0.01, rho=0.5, sigma=0.0125, res=100, delta=1.0, runs=50, lambda_theta=0.0
-# solver_options={'tol': '1e-6', 'acceptable_tol': '1e-5', 'max_iter': 30000, 'linear_solver': 'mumps', 'hessian_approximation': 'limited-memory', 'limited_memory_max_history': 20, 'mu_strategy': 'adaptive', 'watchdog_shortened_iter_trigger': 10}
-# # ==== Summary ====
-#   Mean MVO Cost (test, Vtrue): -1.024423 (SE 0.090143, 95% CI [-1.201104, -0.847743], n=50)
-#   Mean R^2 (test)            : 0.012324  (SE 0.0006, 95% CI [0.0112, 0.0135], n=50)
-#   Mean R^2 (train)           : 0.012160
-#   Train mean MVO (Vtrue)     : -1.548955
-#   Train mean MVO (Vhat)      : -1.548955
-#   Test  mean MVO (Vhat)      : -1.024425
-#   Avg eval rows              : 450.0
-#   Avg fail rate              : 0.00%
-#   Total time                 : 709.56 sec
-#   Avg/run time               : 13.48 sec
-
-# === Start: model=ols, solver=ipopt ===
-# N=1000, d=5, snr=0.01, rho=0.5, sigma=0.0125, res=100, delta=1.0, runs=50, lambda_theta=0.0
-# solver_options={'tol': '1e-6', 'acceptable_tol': '1e-5', 'max_iter': 30000, 'linear_solver': 'mumps', 'hessian_approximation': 'limited-memory', 'limited_memory_max_history': 20, 'mu_strategy': 'adaptive', 'watchdog_shortened_iter_trigger': 10}
-# # ==== Summary ====
-#   Mean MVO Cost (test, Vtrue): -1.043745 (SE 0.095567, 95% CI [-1.231056, -0.856434], n=50)
-#   Mean R^2 (test)            : 0.012324  (SE 0.0006, 95% CI [0.0112, 0.0135], n=50)
-#   Mean R^2 (train)           : 0.012160
-#   Train mean MVO (Vtrue)     : -1.115295
-#   Train mean MVO (Vhat)      : -1.115295
-#   Test  mean MVO (Vhat)      : -1.043746
-#   Avg eval rows              : 450.0
-#   Avg fail rate              : 0.00%
-#   Total time                 : 36.14 sec
-#   Avg/run time               : 0.00 sec
-
-# === Start: model=dual, solver=ipopt ===
-# N=1000, d=5, snr=0.01, rho=0.5, sigma=0.0125, res=100, delta=1.0, runs=50, lambda_theta=0.0001
-# solver_options={'tol': '1e-6', 'acceptable_tol': '1e-5', 'max_iter': 30000, 'linear_solver': 'mumps', 'hessian_approximation': 'limited-memory', 'limited_memory_max_history': 20, 'mu_strategy': 'adaptive', 'watchdog_shortened_iter_trigger': 10}
-# ==== Summary ====
-#   Mean MVO Cost (test, Vtrue): -1.015484 (SE 0.091551, 95% CI [-1.194924, -0.836043], n=50)
-#   Mean R^2 (test)            : 0.012324  (SE 0.0006, 95% CI [0.0112, 0.0135], n=50)
-#   Mean R^2 (train)           : 0.012160
-#   Train mean MVO (Vtrue)     : -1.555059
-#   Train mean MVO (Vhat)      : -1.555059
-#   Test  mean MVO (Vhat)      : -1.015485
-#   Avg eval rows              : 450.0
-#   Avg fail rate              : 0.00%
-#   Total time                 : 938.21 sec
-#   Avg/run time               : 18.04 sec
-
-# === Start: model=dual, solver=ipopt ===
-# N=1000, d=5, snr=0.01, rho=0.5, sigma=0.0125, res=100, delta=1.0, runs=50, lambda_theta=0.01
-# solver_options={'tol': '1e-6', 'acceptable_tol': '1e-5', 'max_iter': 30000, 'linear_solver': 'mumps', 'hessian_approximation': 'limited-memory', 'limited_memory_max_history': 20, 'mu_strategy': 'adaptive', 'watchdog_shortened_iter_trigger': 10}
-# Set parameter Username
-# ==== Summary ====
-#   Mean MVO Cost (test, Vtrue): -1.004079 (SE 0.086994, 95% CI [-1.174587, -0.833570], n=50)
-#   Mean R^2 (test)            : 0.012324  (SE 0.0006, 95% CI [0.0112, 0.0135], n=50)
-#   Mean R^2 (train)           : 0.012160
-#   Train mean MVO (Vtrue)     : -1.549441
-#   Train mean MVO (Vhat)      : -1.549442
-#   Test  mean MVO (Vhat)      : -1.004080
-#   Avg eval rows              : 450.0
-#   Avg fail rate              : 0.00%
-#   Total time                 : 947.65 sec
-#   Avg/run time               : 18.23 sec
+#GraduationResearch % KNITRO_LICENSE_FILE=/Users/kensei/knitro/licenses/knitro.lic \
+# ARTELYS_LICENSE_FILE=/Users/kensei/knitro/licenses/knitro.lic \
+# python DFL_Portfolio_Optimization2/experiments/run.py --config DFL_Portfolio_Optimization2/configs/experiment.yaml

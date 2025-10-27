@@ -1,6 +1,7 @@
 # python -m experiments.test_equivalence_unconstrained
 import numpy as np
-from data.synthetic import generate_simulation1_dataset
+# from data.synthetic import generate_simulation1_dataset
+from data_stress.synthetic import generate_simulation1_dataset
 from models.ols import train_ols
 
 def dfl_obj_unconstrained(theta, X, Y, V, idx, delta=1.0):

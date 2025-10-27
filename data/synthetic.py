@@ -78,6 +78,7 @@ def generate_simulation1_dataset(
         eps = rng.multivariate_normal(mean=np.zeros(d), cov=V_true, size=N)
 
     # --- 目的変数 Y を生成: Y = X ⊙ θ_0 + τ ε ---
-    Y = X * theta_0 + tau * eps                # shape: (N, d)
+    Y = X * theta_0
+    # Y = X * theta_0 + tau * eps                # shape: (N, d)
 
     return X, Y, V_true, theta_0, tau

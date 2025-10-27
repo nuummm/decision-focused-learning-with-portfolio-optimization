@@ -8,6 +8,7 @@ from pyomo.environ import *
 
 # ★ 追加：共通ソルバ工場
 from optimization.solvers import make_pyomo_solver
+from models.ols import train_ols
 
 
 def _solver_metadata(res, solver_name: str) -> dict:
@@ -89,23 +90,28 @@ def fit_dfl_p1_pyomo_ipopt(
     m.V     = pyo.Param(m.T, m.J, m.J, initialize=V_ini)
 
     # --- 変数 ---
-    m.theta = pyo.Var(m.J, bounds=(-10, 10))
+    m.theta = pyo.Var(m.J)
     m.z     = pyo.Var(m.T, m.J, domain=pyo.NonNegativeReals)
     m.lam   = pyo.Var(m.T, m.J, domain=pyo.NonNegativeReals)
     m.mu    = pyo.Var(m.T)
 
     # --- 初期値 ---
-    if theta_init is not None:
+    theta_vec = None
+    if theta_init is None:
+        theta_vec = None
+    elif isinstance(theta_init, str) and theta_init.lower() == "ols":
+        theta_vec = train_ols(X, Y)
+    else:
+        theta_vec = np.asarray(theta_init, dtype=float)
+
+    if theta_vec is not None:
         for j in m.J:
-            m.theta[j].value = float(theta_init[int(j)])
+            m.theta[j].value = float(theta_vec[int(j)])
     else:
         for j in m.J:
             m.theta[j].value = 0.0
-    for t in m.T:
-        for j in m.J:
-            m.z[t, j].value   = 1.0 / d
-            m.lam[t, j].value = 0.0
-        m.mu[t].value = 0.0
+
+
 
     # ---------- 3) 制約 ----------
     # (1) 予算： sum_j z[t,j] = 1
@@ -123,7 +129,7 @@ def fit_dfl_p1_pyomo_ipopt(
     # (3) 相補性： z_{t,j} * lam_{t,j} = 0（非凸QCQP）
     def comp_rule(m, t, j):
         return m.z[t, j] * m.lam[t, j] == 0
-    m.comp = pyo.Constraint(m.T, m.J, rule=comp_rule)
+    m.comp = pyo.Constraint(m.T, m.J, rule=lambda m,t,j: m.z[t,j]*m.lam[t,j] == 0)
 
     # ---------- 4) 目的関数 ----------
     def obj_rule(m):
@@ -132,8 +138,7 @@ def fit_dfl_p1_pyomo_ipopt(
             lin  = sum(m.y[t, j] * m.z[t, j] for j in m.J)
             quad = sum(m.z[t, j] * sum(m.V[t, j, k] * m.z[t, k] for k in m.J) for j in m.J)
             cost += -lin + 0.5 * m.delta * quad
-        reg = 0.5 * float(reg_theta_l2) * sum(m.theta[j]**2 for j in m.J)  # ★追加
-        return cost / float(T) + reg
+        return cost / float(T) 
     m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
 
     # ---------- 5) ソルバ（共通ファクトリ経由） ----------
