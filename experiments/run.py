@@ -19,7 +19,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from experiments.registry import get_trainer, SolverSpec, available_models
 from data.synthetic import generate_simulation1_dataset
-#from data_stress.synthetic import generate_simulation1_dataset
+# from data_stress.synthetic import generate_simulation1_dataset
 from models.covariance import estimate_epscov_rolling
 from models.ols import train_ols, predict_yhat
 from models.ols_gurobi import solve_series_mvo_gurobi
@@ -55,7 +55,9 @@ def run_once(
     use_true_cov: bool = False,
     flex_options: Optional[dict] = None,
     theta_fixed: Optional[np.ndarray] = None,
-) -> Tuple[float, float, int, float, float, float, float, float, float, float, float, float, float, float, float, float, float, float, float, np.ndarray]:
+    allow_gurobi_partial: bool = False,
+    gurobi_max_gap: Optional[float] = None,
+) -> Tuple[Any, ...]:
 
     # ----- データ生成 -----
     X, Y, V_true, theta_0, tau = generate_simulation1_dataset(
@@ -86,7 +88,7 @@ def run_once(
     # idx = list(range(burn_in, N))
     # Vhats = [V_true.copy() for _ in idx]  # V̂ を常に真の共分散にする
 
-    if len(Vhats) == 0:
+    def empty_result() -> Tuple[Any, ...]:
         return (
             np.nan, np.nan, 0, 1.0,
             np.nan, np.nan, np.nan, 0.0,
@@ -94,21 +96,21 @@ def run_once(
             np.nan, np.nan, np.nan, np.nan,
             np.nan, np.nan, np.nan, np.nan,
             np.full(d, np.nan),
+            "", "", np.nan, "", "fixed" if theta_fixed is not None else "trained",
+        np.nan, np.nan, np.nan, np.nan, np.nan,
+        np.nan, np.nan, np.nan,
+        np.nan, np.nan, np.nan,
+        np.nan,
+    )
 
-        )
+    if len(Vhats) == 0:
+        return empty_result()
 
     # ----- 学習区間（train: burn_in .. burn_in+n_tr-1） -----
     train_pairs = [(i, V) for i, V in zip(idx, Vhats)
                    if burn_in <= i < burn_in + n_tr]
     if not train_pairs:
-        return (
-            np.nan, np.nan, 0, 1.0,
-            np.nan, np.nan, np.nan, 0.0,
-            np.nan, np.nan, np.nan,
-            np.nan, np.nan, np.nan, np.nan,
-            np.nan, np.nan, np.nan, np.nan,
-            np.full(d, np.nan),
-        )
+        return empty_result()
     start_train, end_train = train_pairs[0][0], train_pairs[-1][0]
     used_train_idx = [i for i, _ in train_pairs]
     Vhats_train = [V for _, V in train_pairs]
@@ -117,6 +119,17 @@ def run_once(
     Yhat_all_from_trainer = None
     info: Dict[str, Any] = {}
     elapsed = 0.0
+    solver_status = ""
+    solver_term = ""
+    solver_time: float | str = np.nan
+    solver_message = ""
+    theta_source = "fixed"
+    budget_violation = np.nan
+    nonneg_violation = np.nan
+    stationarity_violation = np.nan
+    complementarity_violation = np.nan
+    strong_duality_violation = np.nan
+    gurobi_gap = np.nan
 
     if theta_fixed is not None:
         theta_hat = np.asarray(theta_fixed, dtype=float)
@@ -179,6 +192,31 @@ def run_once(
         if len(trainer_ret) >= 7:
             Yhat_all_from_trainer = trainer_ret[6]
 
+        solver_status = (info or {}).get("status", solver_status)
+        solver_term = (info or {}).get("termination_condition", solver_term)
+        solver_time = (info or {}).get("solver_time", solver_time)
+        solver_message = (info or {}).get("message", solver_message)
+        solver_status = "" if solver_status is None else str(solver_status)
+        solver_term = "" if solver_term is None else str(solver_term)
+        solver_message = "" if solver_message is None else str(solver_message)
+
+        solver_name_lower = str((solver_spec.name or "")).lower()
+
+        raw_gap = None
+        if isinstance(info, dict):
+            raw_gap = info.get("gurobi_mip_gap", info.get("mip_gap", info.get("gap")))
+        if raw_gap is not None and raw_gap != "":
+            try:
+                gurobi_gap = float(raw_gap)
+            except (TypeError, ValueError):
+                gurobi_gap = np.nan
+        gap_within_threshold = (
+            solver_name_lower == "gurobi"
+            and gurobi_max_gap is not None
+            and np.isfinite(gurobi_gap)
+            and gurobi_gap <= float(gurobi_max_gap)
+        )
+
         tc  = str((info or {}).get("termination_condition", "")).lower()
         st  = str((info or {}).get("status", "")).lower()
         msg = str((info or {}).get("message", "") or "").lower()
@@ -187,14 +225,23 @@ def run_once(
             "maxiterations", "maxtimelimit", "max_time_limit",
             "max_time", "maxcputime", "error", "infeasible"
         }
-        if (tc in bad_tc) or ("maximum cpu time exceeded" in msg) or (st in {"max_iter","max_cpu_time","timeout"}):
+        time_limit_like = (tc in bad_tc) or ("maximum cpu time exceeded" in msg) or (st in {"max_iter","max_cpu_time","timeout"})
+        partial_allowed = (
+            solver_name_lower == "gurobi"
+            and allow_gurobi_partial
+            and time_limit_like
+        )
+        if time_limit_like and not (partial_allowed or gap_within_threshold):
             raise RuntimeError(f"solver_stopped:{tc or st or 'time_limit'}")
 
         try:
             max_cpu_time_opt = solver_spec.options.get("max_cpu_time", None)
             if max_cpu_time_opt is not None:
                 max_cpu_time = float(max_cpu_time_opt)
-                if max_cpu_time > 0 and elapsed >= 0.95 * max_cpu_time:
+            if max_cpu_time > 0 and elapsed >= 0.95 * max_cpu_time:
+                if solver_name_lower == "gurobi" and (allow_gurobi_partial or gap_within_threshold):
+                    pass
+                else:
                     raise RuntimeError("solver_stopped:approx_max_cpu_time")
         except Exception:
             pass
@@ -267,6 +314,23 @@ def run_once(
             np.nan, np.nan, np.nan, np.nan,
             np.nan, np.nan, np.nan, np.nan,
             np.array(theta_hat, copy=True),
+            solver_status,
+            solver_term,
+            solver_time,
+            solver_message,
+            theta_source,
+            budget_violation,
+            nonneg_violation,
+            stationarity_violation,
+            complementarity_violation,
+            strong_duality_violation,
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            np.nan,
+            gurobi_gap,
         )
 
     used_test_idx = [i for i, _ in test_pairs]
@@ -406,6 +470,28 @@ def run_once(
                 pve_cols_tr.append(1.0 - np.mean((yj - yhj)**2) / var_y)
         train_pve_mean = float(np.nanmean(pve_cols_tr))
 
+    returns_test = None
+    mean_return_test = np.nan
+    std_return_test = np.nan
+    sharpe_test = np.nan
+    if len(Z_eval) > 0:
+        returns_test = np.sum(Z_eval * Y_eval, axis=1)
+        mean_return_test = float(np.mean(returns_test))
+        std_return_test = float(np.std(returns_test, ddof=1))
+        if std_return_test > 1e-12:
+            sharpe_test = mean_return_test / std_return_test
+
+    returns_train = None
+    mean_return_train = np.nan
+    std_return_train = np.nan
+    sharpe_train = np.nan
+    if theta_fixed is None and Z_tr_eval is not None and len(Z_tr_eval) > 0:
+        returns_train = np.sum(Z_tr_eval * Y_tr_eval, axis=1)
+        mean_return_train = float(np.mean(returns_train))
+        std_return_train = float(np.std(returns_train, ddof=1))
+        if std_return_train > 1e-12:
+            sharpe_train = mean_return_train / std_return_train
+
     return (
         mean_cost_true,           # 1
         mean_r2_corrsq,           # 2 (test corr^2)
@@ -427,6 +513,23 @@ def run_once(
         decision_error_test,      # 18 (test decision error)
         decision_error_train,     # 19 (train decision error)
         np.array(theta_hat, copy=True),  # 20 (theta)
+        solver_status,
+        solver_term,
+        solver_time,
+        solver_message,
+        theta_source,
+        budget_violation,
+        nonneg_violation,
+        stationarity_violation,
+        complementarity_violation,
+        strong_duality_violation,
+        mean_return_test,
+        std_return_test,
+        sharpe_test,
+        mean_return_train,
+        std_return_train,
+        sharpe_train,
+        gurobi_gap,
     )
 def main():
     p = argparse.ArgumentParser(description="Unified runner for DFL experiments (KKT/DUAL) with pluggable solvers")
@@ -459,6 +562,8 @@ def main():
     p.add_argument("--ipopt-max-cpu-time", type=float, default=None)
     p.add_argument("--ipopt-max-iter", type=int, default=None)
     p.add_argument("--use-true-cov", action="store_true", help="共分散を推定せず V_true をそのまま使用する")
+    p.add_argument("--allow-gurobi-partial", action="store_true", help="(Gurobi only) accept time-limit solutions instead of skipping.")
+    p.add_argument("--gurobi-max-gap", type=float, default=None, help="(Gurobi only) accept runs whose final relative MIP gap is at or below this value.")
 
     # flex model 専用オプション（未使用モデルでは無視される）
     p.add_argument("--flex-formulation", type=str, default="dual",
@@ -568,6 +673,17 @@ def main():
     pve_list, tr_pve_list = [], []
     best_cost_opt_list, tr_best_cost_opt_list = [], []
     decision_error_test_list, decision_error_train_list = [], []
+    solver_status_list, solver_term_list = [], []
+    solver_time_list, solver_message_list = [], []
+    theta_source_list = []
+    budget_violation_list = []
+    nonneg_violation_list = []
+    stationarity_violation_list = []
+    complementarity_violation_list = []
+    strong_duality_violation_list = []
+    returns_test_list, std_return_test_list, sharpe_test_list = [], [], []
+    returns_train_list, std_return_train_list, sharpe_train_list = [], [], []
+    gurobi_gap_list = []
     theta_records: List[np.ndarray] = []
 
     print(f"=== Start: model={model_key}, solver={solver_name} ===")
@@ -593,7 +709,14 @@ def main():
              mse, tr_mse,
              pve, tr_pve,
              best_cost_opt, tr_best_cost_opt,
-             dec_err_test, dec_err_train, theta_vec) = run_once(
+             dec_err_test, dec_err_train, theta_vec,
+             solver_status, solver_term, solver_time, solver_message, theta_source_run,
+             budget_violation, nonneg_violation,
+             stationarity_violation, complementarity_violation,
+             strong_duality_violation,
+             mean_return_test, std_return_test, sharpe_test,
+             mean_return_train, std_return_train, sharpe_train,
+             gurobi_gap) = run_once(
                 model_key=model_key,
                 solver_spec=solver_spec,
                 seed=s,
@@ -604,6 +727,8 @@ def main():
                 reg_theta_l2=lambda_theta,
                 flex_options=flex_options,
                 theta_fixed=theta_fixed_vec,
+                allow_gurobi_partial=args.allow_gurobi_partial,
+                gurobi_max_gap=args.gurobi_max_gap,
             )
         except RuntimeError as e:
             msg = str(e)
@@ -639,6 +764,23 @@ def main():
         pve_list.append(pve); tr_pve_list.append(tr_pve)
         best_cost_opt_list.append(best_cost_opt); tr_best_cost_opt_list.append(tr_best_cost_opt)
         decision_error_test_list.append(dec_err_test); decision_error_train_list.append(dec_err_train)
+        solver_status_list.append(solver_status)
+        solver_term_list.append(solver_term)
+        solver_time_list.append(float(solver_time) if isinstance(solver_time, (int, float)) else (np.nan if solver_time in ("", None) else solver_time))
+        solver_message_list.append(solver_message)
+        theta_source_list.append(theta_source_run)
+        budget_violation_list.append(budget_violation)
+        nonneg_violation_list.append(nonneg_violation)
+        stationarity_violation_list.append(stationarity_violation)
+        complementarity_violation_list.append(complementarity_violation)
+        strong_duality_violation_list.append(strong_duality_violation)
+        returns_test_list.append(mean_return_test)
+        std_return_test_list.append(std_return_test)
+        sharpe_test_list.append(sharpe_test)
+        returns_train_list.append(mean_return_train)
+        std_return_train_list.append(std_return_train)
+        sharpe_train_list.append(sharpe_train)
+        gurobi_gap_list.append(gurobi_gap)
         theta_records.append(np.asarray(theta_vec, dtype=float))
         successes += 1
 
@@ -683,6 +825,15 @@ def main():
     tr_best_cost_mean, tr_best_cost_se, tr_best_cost_ci, _ = summarize(np.array(tr_best_cost_opt_list))
     dec_err_mean, dec_err_se, dec_err_ci, _ = summarize(np.array(decision_error_test_list))
     tr_dec_err_mean, tr_dec_err_se, tr_dec_err_ci, _ = summarize(np.array(decision_error_train_list))
+    mean_return_test_mean, mean_return_test_se, mean_return_test_ci, _ = summarize(np.array(returns_test_list))
+    std_return_test_mean, std_return_test_se, std_return_test_ci, _ = summarize(np.array(std_return_test_list))
+    sharpe_test_mean, sharpe_test_se, sharpe_test_ci, _ = summarize(np.array(sharpe_test_list))
+    mean_return_train_mean, mean_return_train_se, mean_return_train_ci, _ = summarize(np.array(returns_train_list))
+    std_return_train_mean, std_return_train_se, std_return_train_ci, _ = summarize(np.array(std_return_train_list))
+    sharpe_train_mean, sharpe_train_se, sharpe_train_ci, _ = summarize(np.array(sharpe_train_list))
+    gurobi_gap_mean = np.nan
+    if gurobi_gap_list:
+        gurobi_gap_mean = float(np.nanmean(gurobi_gap_list))
 
     print("\n==== Summary ====")
     print(f"  Mean MVO Cost (test, Vtrue): {cost_mean:.6f} (SE {cost_se:.6f}, 95% CI [{cost_ci[0]:.6f}, {cost_ci[1]:.6f}], n={n_cost})")
@@ -702,10 +853,20 @@ def main():
     print(f"  Train mean MVO (Vtrue)     : {tr_true_mean:.6f}")
     print(f"  Train mean MVO (Vhat)      : {tr_vhat_mean:.6f}")
     print(f"  Test  mean MVO (Vhat)      : {te_vhat_mean:.6f}")
+    if returns_test_list:
+        print(f"  Mean Return (test)         : {mean_return_test_mean:.6f}")
+        print(f"  Std Return (test)          : {std_return_test_mean:.6f}")
+        print(f"  Sharpe Ratio (test)        : {sharpe_test_mean:.6f}")
+    if returns_train_list:
+        print(f"  Mean Return (train)        : {mean_return_train_mean:.6f}")
+        print(f"  Std Return (train)         : {std_return_train_mean:.6f}")
+        print(f"  Sharpe Ratio (train)       : {sharpe_train_mean:.6f}")
     print(f"  Avg eval rows              : {np.nanmean(Te_list):.1f}")
     print(f"  Avg fail rate              : {np.nanmean(fail_list)*100:.2f}%")
     print(f"  Total time                 : {total_elapsed:.2f} sec")
     print(f"  Avg/run time               : {np.nanmean(run_times):.2f} sec")
+    if gurobi_gap_list:
+        print(f"  Mean Gurobi MIP Gap        : {gurobi_gap_mean:.6f}")
 
     # ===== 保存 =====
     outdir = Path(args.outdir)
@@ -753,6 +914,23 @@ def main():
         "decision_error_test":   decision_error_test_list,
         "decision_error_train":  decision_error_train_list,
         "theta":                 theta_strings,
+        "solver_status":         solver_status_list,
+        "solver_termination":    solver_term_list,
+        "solver_time":           solver_time_list,
+        "solver_message":        solver_message_list,
+        "theta_source":          theta_source_list,
+        "budget_violation_train": budget_violation_list,
+        "nonneg_violation_train": nonneg_violation_list,
+        "stationarity_violation_train": stationarity_violation_list,
+        "complementarity_violation_train": complementarity_violation_list,
+        "strong_duality_violation_train": strong_duality_violation_list,
+        "mean_return_test":      returns_test_list,
+        "std_return_test":       std_return_test_list,
+        "sharpe_ratio_test":     sharpe_test_list,
+        "mean_return_train":     returns_train_list,
+        "std_return_train":      std_return_train_list,
+        "sharpe_ratio_train":    sharpe_train_list,
+        "gurobi_mip_gap":        gurobi_gap_list,
     })
     run_csv = str(base) + "_runs.csv"
     run_df.to_csv(run_csv, index=False)
@@ -779,6 +957,7 @@ def main():
         "mean_cost_test_vhat": float(te_vhat_mean),
         "train_cost_vtrue": float(tr_true_mean),
         "train_cost_vhat": float(tr_vhat_mean),
+        "mean_gurobi_mip_gap": float(gurobi_gap_mean) if not np.isnan(gurobi_gap_mean) else np.nan,
 
         # （注意）ここまでは “基本” 指標だけ
     }
@@ -834,6 +1013,30 @@ def main():
         "mean_regret_test_se": float(regret_se),
         "mean_regret_test_ci_lo": float(regret_ci[0]),
         "mean_regret_test_ci_hi": float(regret_ci[1]),
+        "mean_return_test": float(mean_return_test_mean),
+        "mean_return_test_se": float(mean_return_test_se),
+        "mean_return_test_ci_lo": float(mean_return_test_ci[0]),
+        "mean_return_test_ci_hi": float(mean_return_test_ci[1]),
+        "std_return_test": float(std_return_test_mean),
+        "std_return_test_se": float(std_return_test_se),
+        "std_return_test_ci_lo": float(std_return_test_ci[0]),
+        "std_return_test_ci_hi": float(std_return_test_ci[1]),
+        "sharpe_ratio_test": float(sharpe_test_mean),
+        "sharpe_ratio_test_se": float(sharpe_test_se),
+        "sharpe_ratio_test_ci_lo": float(sharpe_test_ci[0]),
+        "sharpe_ratio_test_ci_hi": float(sharpe_test_ci[1]),
+        "mean_return_train": float(mean_return_train_mean),
+        "mean_return_train_se": float(mean_return_train_se),
+        "mean_return_train_ci_lo": float(mean_return_train_ci[0]),
+        "mean_return_train_ci_hi": float(mean_return_train_ci[1]),
+        "std_return_train": float(std_return_train_mean),
+        "std_return_train_se": float(std_return_train_se),
+        "std_return_train_ci_lo": float(std_return_train_ci[0]),
+        "std_return_train_ci_hi": float(std_return_train_ci[1]),
+        "sharpe_ratio_train": float(sharpe_train_mean),
+        "sharpe_ratio_train_se": float(sharpe_train_se),
+        "sharpe_ratio_train_ci_lo": float(sharpe_train_ci[0]),
+        "sharpe_ratio_train_ci_hi": float(sharpe_train_ci[1]),
 
         # 既存の運用系メタ情報
         "avg_eval_T": float(np.nanmean(Te_list)),

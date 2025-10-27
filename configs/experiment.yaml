@@ -17,7 +17,7 @@ data:
   runs: 1
   seed0: 100
 regularization:
-  theta_l2: 1e-3   # まずは 0, 1e-6, 1e-5, 1e-4, 1e-3,... をログ刻みで
+  theta_l2: 0   # まずは 0, 1e-6, 1e-5, 1e-4, 1e-3,... をログ刻みで
 
 # 厳密性（再現性・厳しめの可行性/最適性）重視プロファイル
 solver_options:
@@ -62,7 +62,7 @@ solver_options:
     NonConvex: 2
     Threads: 1
     Seed: 0
-    TimeLimit: 600
+    TimeLimit: 1200          # 24時間
     OutputFlag: 1
     MIPGap: 0
     MIPGapAbs: 0

@@ -11,13 +11,13 @@ from optimization.solvers import make_pyomo_solver
 from models.ols import train_ols
 
 
-def _solver_metadata(res, solver_name: str) -> dict:
+def _solver_metadata(opt, res, solver_name: str) -> dict:
     solver_info = getattr(res, "solver", None)
     term = getattr(solver_info, "termination_condition", None) if solver_info else None
     status = getattr(solver_info, "status", None) if solver_info else None
     solver_time = getattr(solver_info, "time", None) if solver_info else None
     message = getattr(solver_info, "message", None) if solver_info else None
-    return {
+    meta = {
         "solver": solver_name,
         "termination_condition": term,
         "termination_condition_str": str(term) if term is not None else None,
@@ -26,6 +26,17 @@ def _solver_metadata(res, solver_name: str) -> dict:
         "solver_time": solver_time,
         "message": message,
     }
+    try:
+        if solver_name and str(solver_name).lower() == "gurobi":
+            solver_model = getattr(opt, "_solver_model", None)
+            if solver_model is not None:
+                meta["gurobi_obj_val"] = getattr(solver_model, "ObjVal", None)
+                meta["gurobi_obj_bound"] = getattr(solver_model, "ObjBound", None)
+                meta["gurobi_mip_gap"] = getattr(solver_model, "MIPGap", None)
+                meta["gurobi_runtime"] = getattr(solver_model, "Runtime", None)
+    except Exception:
+        pass
+    return meta
 
 def fit_dfl_p1_pyomo_ipopt(
     X, Y, Vhats, idx,
@@ -144,7 +155,7 @@ def fit_dfl_p1_pyomo_ipopt(
     # ---------- 5) ソルバ（共通ファクトリ経由） ----------
     opt = make_pyomo_solver(m, solver=solver, tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
-    meta = _solver_metadata(res, solver)
+    meta = _solver_metadata(opt, res, solver)
 
     # ---------- 6) 解の取り出し ----------
     theta_hat = np.array([pyo.value(m.theta[j]) for j in m.J])

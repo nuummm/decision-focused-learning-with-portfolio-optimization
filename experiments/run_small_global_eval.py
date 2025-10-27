@@ -264,25 +264,46 @@ def run_model(
         raise SystemExit(0)
 
     print(f"[INFO] Running {model} with solver={solver} seed={seed}")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    stdout_lines: List[str] = []
 
     if log_handle is not None:
         log_handle.write("=" * 80 + "\n")
         log_handle.write(f"CMD: {' '.join(cmd)}\n")
-        log_handle.write(proc.stdout)
-        if proc.stderr:
-            log_handle.write("\n[STDERR]\n")
-            log_handle.write(proc.stderr)
+        log_handle.flush()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        stdout_lines.append(line)
+        print(line, end="")
+        if log_handle is not None:
+            log_handle.write(line)
+            log_handle.flush()
+
+    proc.wait()
+
+    if log_handle is not None:
         log_handle.write("\n")
         log_handle.flush()
 
     if proc.returncode != 0:
-        msg = proc.stderr.strip() or "run.py terminated with non-zero status"
+        msg = "".join(stdout_lines).strip() or "run.py terminated with non-zero status"
         raise RuntimeError(f"run.py failed for model={model}, solver={solver}: {msg}")
+
+    stdout_text = "".join(stdout_lines)
 
     summary_path = None
     runs_path = None
-    for line in proc.stdout.splitlines():
+    for line in stdout_text.splitlines():
         match_summary = SUMMARY_PATH_RE.search(line)
         if match_summary:
             summary_path = Path(match_summary.group("path")).resolve()
@@ -676,4 +697,4 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 # python GraduationResearch/DFL_Portfolio_Optimization2/experiments/run_small_global_eval.py \
-#   --runs 1 --seed0 100 --N 50 --d 3 --res 10 --snr 1e+6 --rho 0.5 --delta 1.0
+#   --runs 1 --seed0 100 --N 50 --d 3 --res 10 --snr 1e+6 --rho 0.5 --delta 1.0 --no-ensemble

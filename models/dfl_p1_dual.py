@@ -10,14 +10,14 @@ from models.ols import train_ols
 
 
 
-def _solver_metadata(res, solver_name: str) -> dict:
+def _solver_metadata(opt, res, solver_name: str) -> dict:
     """Extract minimal, run.py-compatible metadata from a Pyomo result object."""
     solver_info = getattr(res, "solver", None)
     term = getattr(solver_info, "termination_condition", None) if solver_info else None
     status = getattr(solver_info, "status", None) if solver_info else None
     solver_time = getattr(solver_info, "time", None) if solver_info else None
     message = getattr(solver_info, "message", None) if solver_info else None
-    return {
+    meta = {
         "solver": solver_name,
         "termination_condition": term,
         "termination_condition_str": str(term) if term is not None else None,
@@ -26,6 +26,17 @@ def _solver_metadata(res, solver_name: str) -> dict:
         "solver_time": solver_time,
         "message": message,
     }
+    try:
+        if solver_name and str(solver_name).lower() == "gurobi":
+            solver_model = getattr(opt, "_solver_model", None)
+            if solver_model is not None:
+                meta["gurobi_obj_val"] = getattr(solver_model, "ObjVal", None)
+                meta["gurobi_obj_bound"] = getattr(solver_model, "ObjBound", None)
+                meta["gurobi_mip_gap"] = getattr(solver_model, "MIPGap", None)
+                meta["gurobi_runtime"] = getattr(solver_model, "Runtime", None)
+    except Exception:
+        pass
+    return meta
 
 def fit_dfl_p1_dual_pyomo(
     X, Y, Vhats, idx,
@@ -148,5 +159,5 @@ def fit_dfl_p1_dual_pyomo(
     MU = np.array([pyo.value(m.mu[t])      for t in m.T])
     LAM= np.array([[pyo.value(m.lam[t, j]) for j in m.J] for t in m.T])
 
-    meta = _solver_metadata(res, solver)
+    meta = _solver_metadata(opt, res, solver)
     return theta_hat, Z, MU, LAM, used_idx, meta
