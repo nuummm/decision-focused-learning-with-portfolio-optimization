@@ -12,7 +12,11 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 # モデル本体（重複インポートを整理）
 from models.dfl_p1_kkt import fit_dfl_p1_pyomo_ipopt as _fit_kkt
 from models.dfl_p1_dual import fit_dfl_p1_dual_pyomo as _fit_dual
+from models.dfl_p1_flex import fit_dfl_p1_flex as _fit_flex, SolverMeta as _FlexMeta
 from models.ols_baseline import fit_ols_baseline
+from models.ipo_closed_form import fit_ipo_closed_form
+from models.ipo_nn_h import fit_ipo_nn
+from models.ipo_nn_qp import fit_ipo_nn_qp
 
 # 型エイリアス（分かりやすさ用）
 NDArray = Any
@@ -35,7 +39,7 @@ TrainerFn = Callable[
 # --- デフォルトのソルバー仕様（必要に応じて run.py から上書き） ---
 KNITRO_DEFAULTS = {
     "outlev": 4,          # 4 にすると詳細ログ
-    "algorithm": 1,       # 1=Barrier
+    "nlp_algorithm": 1,   # 1=Barrier（旧 algorithm パラメータの代替）
     "maxtime_real": 300,
     "maxit": 3000,
 }
@@ -132,6 +136,122 @@ def _wrap_dual(spec: SolverSpec) -> TrainerFn:
         raise RuntimeError("fit_dual returned unexpected format")
     return _runner
 
+
+def _wrap_flex(spec: SolverSpec) -> TrainerFn:
+    spec = _merge_defaults(spec)
+
+    def _runner(
+        X: NDArray, Y: NDArray, Vhats: List[NDArray], idx: List[int],
+        start_index: Optional[int] = None, end_index: Optional[int] = None,
+        delta: float = 1.0, theta_init: Optional[NDArray] = None,
+        tee: bool = False,
+        solver: str = "",
+        solver_options: Optional[Dict[str, Any]] = None,
+        **kw,
+    ):
+        use_solver = (solver or spec.name)
+        use_opts = dict(spec.options)
+        if solver_options:
+            use_opts.update(solver_options)
+        local_tee = bool(tee or spec.tee)
+
+        ret = _fit_flex(
+            X, Y, Vhats, idx,
+            start_index=start_index, end_index=end_index,
+            delta=delta, theta_init=theta_init,
+            solver=use_solver, solver_options=use_opts,
+            tee=local_tee,
+            **kw,
+        )
+
+        if isinstance(ret, (list, tuple)) and len(ret) >= 6:
+            ret_list = list(ret)
+            meta = ret_list[5]
+            if isinstance(meta, _FlexMeta):
+                ret_list[5] = {
+                    "solver": meta.solver,
+                    "termination_condition": meta.termination_condition,
+                    "termination_condition_str": meta.termination_condition_str,
+                    "status": meta.status,
+                    "status_str": meta.status_str,
+                    "solver_time": meta.solver_time,
+                    "message": meta.message,
+                }
+            return tuple(ret_list)
+        raise RuntimeError("fit_flex returned unexpected format")
+
+    return _runner
+
+def _wrap_ipo(spec: SolverSpec) -> TrainerFn:
+    # Analytic solution: ignore solver/spec options, but keep interface
+    def _runner(
+        X: NDArray, Y: NDArray, Vhats: List[NDArray], idx: List[int],
+        start_index: Optional[int] = None, end_index: Optional[int] = None,
+        delta: float = 1.0, theta_init: Optional[NDArray] = None,
+        tee: bool = False,
+        solver: str = "analytic",
+        solver_options: Optional[Dict[str, Any]] = None,
+        **kw,
+    ):
+        mode = kw.pop("ipo_mode", "budget")
+        psd_eps = kw.pop("ipo_psd_eps", 1e-12)
+        ridge_theta = kw.pop("ipo_ridge_theta", 1e-10)
+        ret = fit_ipo_closed_form(
+            X, Y, Vhats, idx,
+            start_index=start_index, end_index=end_index,
+            delta=delta, mode=mode, psd_eps=psd_eps,
+            ridge_theta=ridge_theta, tee=tee,
+        )
+        return ret
+
+    return _runner
+
+
+def _wrap_ipo_nn(spec: SolverSpec) -> TrainerFn:
+    def _runner(
+        X: NDArray, Y: NDArray, Vhats: List[NDArray], idx: List[int],
+        start_index: Optional[int] = None, end_index: Optional[int] = None,
+        delta: float = 1.0, theta_init: Optional[NDArray] = None,
+        tee: bool = False,
+        solver: str = "ipo_nn",
+        solver_options: Optional[Dict[str, Any]] = None,
+        **kw,
+    ):
+        local_kw = dict(kw)
+        local_kw.pop("reg_theta_l2", None)
+        return fit_ipo_nn(
+            X, Y, Vhats, idx,
+            start_index=start_index, end_index=end_index,
+            delta=delta,
+            tee=tee,
+            **local_kw,
+        )
+
+    return _runner
+
+
+def _wrap_ipo_nn_qp(spec: SolverSpec) -> TrainerFn:
+    def _runner(
+        X: NDArray, Y: NDArray, Vhats: List[NDArray], idx: List[int],
+        start_index: Optional[int] = None, end_index: Optional[int] = None,
+        delta: float = 1.0, theta_init: Optional[NDArray] = None,
+        tee: bool = False,
+        solver: str = "ipo_nn_qp",
+        solver_options: Optional[Dict[str, Any]] = None,
+        **kw,
+    ):
+        local_kw = dict(kw)
+        local_kw.pop("reg_theta_l2", None)
+        return fit_ipo_nn_qp(
+            X, Y, Vhats, idx,
+            start_index=start_index, end_index=end_index,
+            delta=delta,
+            tee=tee,
+            **local_kw,
+        )
+
+    return _runner
+
 # レジストリ本体
 def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
     key = model_key.lower()
@@ -139,6 +259,8 @@ def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
         return _wrap_kkt(solver_spec)
     if key in ("dual", "dfl_p1_dual", "dfl-dual", "dual-strong"):
         return _wrap_dual(solver_spec)
+    if key in ("flex", "dfl_flex", "dfl_p1_flex"):
+        return _wrap_flex(solver_spec)
     if key in ("ols", "vanilla", "baseline"):
         # OLS は Pyomo を使わないのでラッパー不要
         def _runner(
@@ -159,6 +281,12 @@ def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
                 return theta_hat, Z, MU, LAM, used_idx, info
             return ret
         return _runner
+    if key in ("ipo", "ipo_closed_form", "ipo-analytic"):
+        return _wrap_ipo(solver_spec)
+    if key in ("ipo_nn", "ipo-nn", "ipo_nn_h", "ipo_nn_linear"):
+        return _wrap_ipo_nn(solver_spec)
+    if key in ("ipo_nn_qp", "ipo-nn-qp"):
+        return _wrap_ipo_nn_qp(solver_spec)
     raise KeyError(f"Unknown model_key: {model_key}. Use one of: kkt, dual, ols")
 
 def available_models() -> Dict[str, Callable]:
@@ -166,5 +294,12 @@ def available_models() -> Dict[str, Callable]:
     return {
         "kkt": _fit_kkt,
         "dual": _fit_dual,
+        "flex": _fit_flex,
         "ols": fit_ols_baseline,
+        "ipo": fit_ipo_closed_form,
+        "ipo_nn": fit_ipo_nn,
+        "ipo_nn_qp": fit_ipo_nn_qp,
+        "ensemble_avg": fit_ols_baseline,
+        "ensemble_weighted": fit_ols_baseline,
+        "ensemble_normalized": fit_ols_baseline,
     }
