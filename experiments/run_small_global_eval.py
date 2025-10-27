@@ -120,6 +120,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Image format for metric plots (default: png)",
     )
     parser.add_argument("--dryrun", action="store_true", help="Print commands only")
+    parser.add_argument(
+        "--no-ensemble",
+        action="store_true",
+        help="Disable ensemble models (average/weighted/normalized).",
+    )
     return parser.parse_args(argv)
 
 
@@ -135,8 +140,8 @@ class RunOutcome:
 
 
 DEFAULT_SOLVERS: Dict[str, str] = {
-    "dual": "knitro",
-    "kkt": "knitro",
+    "dual": "gurobi",
+    "kkt": "gurobi",
     "ols": "analytic",
     "ipo": "analytic",
     "ensemble_avg": "analytic",
@@ -155,6 +160,12 @@ SUMMARY_METRIC_MAP = {
     "mean_corr2_train": "mean_corr2_train",
     "mean_r2_train": "mean_r2_train",
     "mse_train": "mse_train",
+    "mean_return_test": "mean_return_test",
+    "std_return_test": "std_return_test",
+    "sharpe_ratio_test": "sharpe_ratio_test",
+    "mean_return_train": "mean_return_train",
+    "std_return_train": "std_return_train",
+    "sharpe_ratio_train": "sharpe_ratio_train",
 }
 
 
@@ -449,6 +460,12 @@ def plot_metrics(
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
+    enabled_solvers: Dict[str, str] = dict(DEFAULT_SOLVERS)
+    if args.no_ensemble:
+        for key in ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"]:
+            enabled_solvers.pop(key, None)
+    run_ensemble = all(k in enabled_solvers for k in ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"])
+
     target = int(args.runs)
     if target <= 0:
         print("[WARN] runs must be positive; nothing to do")
@@ -464,7 +481,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     log_path = exp_dir / "experiment.log"
 
     shared_seeds: List[int] = []
-    per_model_rows: Dict[str, List[Dict[str, str]]] = {key: [] for key in DEFAULT_SOLVERS}
+    per_model_rows: Dict[str, List[Dict[str, str]]] = {key: [] for key in enabled_solvers}
     next_seed = int(args.seed0)
 
     with open(log_path, "w", encoding="utf-8") as log_handle:
@@ -472,7 +489,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             # --- Step 1: dual ---
             dual_outcome = run_model(
                 "dual",
-                DEFAULT_SOLVERS["dual"],
+                enabled_solvers["dual"],
                 args,
                 seed=next_seed,
                 outdir=raw_dir,
@@ -485,7 +502,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             # --- Step 2: kkt on the same seed ---
             kkt_outcome = run_model(
                 "kkt",
-                DEFAULT_SOLVERS["kkt"],
+                enabled_solvers["kkt"],
                 args,
                 seed=dual_seed,
                 outdir=raw_dir,
@@ -505,7 +522,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             # --- Step 3: ols with the same seed ---
             ols_outcome = run_model(
                 "ols",
-                DEFAULT_SOLVERS["ols"],
+                enabled_solvers["ols"],
                 args,
                 seed=dual_seed,
                 outdir=raw_dir,
@@ -524,7 +541,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
             ipo_outcome = run_model(
                 "ipo",
-                DEFAULT_SOLVERS["ipo"],
+                enabled_solvers["ipo"],
                 args,
                 seed=dual_seed,
                 outdir=raw_dir,
@@ -541,6 +558,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 next_seed = max(dual_seed, ipo_outcome.seed) + 1
                 continue
             per_model_rows["ipo"].append({**ipo_outcome.run_row, "model": "ipo", "solver": ipo_outcome.solver})
+
+            if not run_ensemble:
+                shared_seeds.append(dual_seed)
+                next_seed = dual_seed + 1
+                print(f"[INFO] Accepted seed {dual_seed}; total collected {len(shared_seeds)}/{target}")
+                continue
 
             theta_dual_vec = parse_theta(per_model_rows["dual"][-1])
             theta_kkt_vec = parse_theta(per_model_rows["kkt"][-1])
@@ -567,7 +590,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 try:
                     outcome = run_model(
                         ens_model,
-                        DEFAULT_SOLVERS[ens_model],
+                        enabled_solvers[ens_model],
                         args,
                         seed=dual_seed,
                         outdir=raw_dir,
@@ -621,7 +644,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         metrics = summarise_metrics(rows, SUMMARY_METRIC_MAP.keys())
         summary_row = {
             "model": model,
-            "solver": DEFAULT_SOLVERS[model],
+            "solver": enabled_solvers.get(model, DEFAULT_SOLVERS.get(model, "")),
             "n_seeds": str(len(rows)),
             "seeds": seeds_to_string(rows),
         }

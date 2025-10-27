@@ -1,0 +1,2 @@
+timestamp,formulation,solver,N,d,snr,rho,sigma,res,alpha,lambda_ret,runs,dfl_cost_test_cvar_mean,dfl_cost_test_cvar_se,dfl_cost_test_cvar_ci_lo,dfl_cost_test_cvar_ci_hi,ols_cost_test_cvar_mean,ols_cost_test_cvar_se,ols_cost_test_cvar_ci_lo,ols_cost_test_cvar_ci_hi,dfl_runtime_avg,ols_runtime_avg
+20251018-185010,dual,ipopt,1000,3,0.01,0.5,0.0125,50,0.95,1.0,20,-23546.230524963394,20641.94555827566,-64004.44381918369,16911.9827692569,-1746.2430185294913,1665.2688561087157,-5010.169976502574,1517.6839394435913,394.80802244991065,13.124894674948882
