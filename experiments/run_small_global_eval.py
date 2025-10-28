@@ -466,7 +466,7 @@ def plot_metrics(
                 except (TypeError, ValueError):
                     continue
             series = [values_by_seed.get(seed, math.nan) for seed in seeds]
-            plt.plot(seeds, series, marker="o", label=model)
+            plt.scatter(seeds, series, label=model)
 
         plt.xlabel("seed")
         plt.ylabel(metric)

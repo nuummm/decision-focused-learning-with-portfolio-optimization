@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import itertools
 import re
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -118,6 +119,7 @@ class SweepConfig:
     no_ensemble: bool
     continue_on_error: bool
     report_name: str
+    info_only: bool
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -128,7 +130,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed0", type=int, default=100, help="Initial seed forwarded to run_small_global_eval.")
     parser.add_argument("--N", type=int, nargs="+", default=[50], help="Sample sizes to evaluate.", metavar="N")
     parser.add_argument("--d", type=int, nargs="+", default=[3], help="Asset dimensions to evaluate.", metavar="D")
-    parser.add_argument("--res", type=int, nargs="+", default=[10], help="Rolling window lengths to evaluate.", metavar="RES")
+    parser.add_argument("--res", type=int, nargs="+", default=[0], help="Rolling window lengths to evaluate.", metavar="RES")
     parser.add_argument("--snr", type=float, nargs="+", default=[0.1], help="Signal-to-noise ratios to evaluate.", metavar="SNR")
     parser.add_argument("--rho", type=float, nargs="+", default=[0.5], help="Correlation parameters to evaluate.", metavar="RHO")
     parser.add_argument("--delta", type=float, nargs="+", default=[1.0], help="Risk-aversion parameters to evaluate.", metavar="DELTA")
@@ -160,6 +162,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default="global_summary.csv",
         help="Expected report file name to capture in the sweep index.",
     )
+    parser.add_argument(
+        "--info-only",
+        action="store_true",
+        help="Only echo stdout lines containing status tags (INFO/WARN/ERROR) from child runs.",
+    )
     return parser.parse_args(argv)
 
 
@@ -179,6 +186,7 @@ def build_sweep_config(args: argparse.Namespace) -> SweepConfig:
         no_ensemble=args.no_ensemble,
         continue_on_error=args.continue_on_error,
         report_name=args.report_name,
+        info_only=args.info_only,
     )
 
 
@@ -257,14 +265,33 @@ def run_configuration(
     if sweep_cfg.no_ensemble:
         run_args.append("--no-ensemble")
 
+    output_buffer = io.StringIO()
+    system_exit_exc: SystemExit | None = None
+    result: int | None = None
+
     with override_solvers(solver_map):
         try:
-            return small_eval.main(run_args)
+            with redirect_stdout(output_buffer):
+                result = small_eval.main(run_args)
         except SystemExit as exc:
-            # run_small_global_eval triggers SystemExit on --dryrun
-            if sweep_cfg.dryrun and (exc.code is None or exc.code == 0):
-                return 0
-            raise
+            system_exit_exc = exc
+            result = exc.code if isinstance(exc.code, int) else None
+
+    captured = output_buffer.getvalue()
+    if sweep_cfg.info_only:
+        for line in captured.splitlines():
+            if any(tag in line for tag in ("[INFO]", "[WARN]", "[ERROR]")):
+                print(line)
+    else:
+        if captured:
+            sys.stdout.write(captured)
+
+    if system_exit_exc is not None:
+        if sweep_cfg.dryrun and (system_exit_exc.code is None or system_exit_exc.code == 0):
+            return 0
+        raise system_exit_exc
+
+    return int(result) if isinstance(result, int) else 0
 
 
 def write_index(
@@ -349,6 +376,7 @@ if __name__ == "__main__":
 # python GraduationResearch/DFL_Portfolio_Optimization2/experiments/run_large_global_eval.py \
 #   --runs 30 --seed0 100 \
 #   --N 50 100 --d 3 5 10 --res 0 \
-#   --snr 0.1 0.01 0.001 --rho 0.5  --delta 1.0 \
-#   --solver dual=gurobi,knitro,ipopt --solver kkt=gurobi,knitro,ipopt \
-#   --no-ensemble --tee
+#   --snr 0.1 0.01 0.001 --rho 0.5 --delta 1.0 \
+#   --solver dual=knitro,ipopt --solver kkt=knitro,ipopt \
+#   --no-ensemble \
+#   --info-only

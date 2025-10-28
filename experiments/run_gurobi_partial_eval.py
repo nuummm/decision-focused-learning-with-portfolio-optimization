@@ -38,10 +38,15 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--seeds",
         type=str,
         nargs="+",
-        required=True,
         help="Seeds to evaluate. Accepts space-separated integers or comma-separated lists, e.g. '100 105' or '100,101,102'.",
     )
-    parser.add_argument("--runs", type=int, default=None, help="Legacy compatibility; ignored when seeds are provided.")
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="dual,kkt,ols,ipo",
+        help="Comma-separated list of models to run (subset of dual,kkt,ols,ipo,ensemble_*). Order determines execution.",
+    )
+    parser.add_argument("--runs", type=int, default=None, help="Number of successful seeds required when --seeds is omitted.")
     parser.add_argument("--seed0", type=int, default=100, help="Fallback initial seed (unused when --seeds supplied).")
     parser.add_argument("--N", type=int, default=50, help="Number of samples.")
     parser.add_argument("--d", type=int, default=3, help="Asset dimension.")
@@ -253,31 +258,67 @@ def float_or_nan(value: str) -> float:
         return math.nan
 
 
+BASE_MODELS = ["dual", "kkt", "ols", "ipo"]
+
+
+def parse_models_arg(text: str) -> List[str]:
+    tokens = [token.strip().lower() for token in text.split(",") if token.strip()]
+    if not tokens:
+        return list(BASE_MODELS)
+    unknown = [token for token in tokens if token not in BASE_MODELS]
+    if unknown:
+        raise SystemExit(f"[ERROR] Unknown model(s) in --models: {', '.join(unknown)}")
+    # Preserve order while removing duplicates
+    seen = set()
+    ordered: List[str] = []
+    for token in tokens:
+        if token not in seen:
+            ordered.append(token)
+            seen.add(token)
+    return ordered
+
+
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
     if isinstance(args.python, str):
         args.python = Path(args.python)
 
-    raw_seed_tokens: List[str] = []
-    for entry in args.seeds:
-        parts = str(entry).split(",")
-        raw_seed_tokens.extend(part.strip() for part in parts if part.strip())
-    if not raw_seed_tokens:
-        print("[WARN] No seeds provided; nothing to do.")
-        return 0
-    try:
-        seeds = sorted(set(int(token) for token in raw_seed_tokens))
-    except ValueError as exc:
-        raise SystemExit(f"[ERROR] Failed to parse seeds: {exc}")
-    if not seeds:
-        print("[WARN] No seeds provided; nothing to do.")
-        return 0
+    models = parse_models_arg(args.models)
 
-    enabled_solvers: Dict[str, str] = dict(small.DEFAULT_SOLVERS)
-    if args.no_ensemble:
+    defaults = dict(small.DEFAULT_SOLVERS)
+    enabled_solvers: Dict[str, str] = {model: defaults[model] for model in models}
+
+    run_ensemble = (
+        not args.no_ensemble
+        and "dual" in enabled_solvers
+        and "kkt" in enabled_solvers
+    )
+    if run_ensemble:
         for key in ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"]:
-            enabled_solvers.pop(key, None)
-    run_ensemble = all(k in enabled_solvers for k in ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"])
+            enabled_solvers[key] = defaults[key]
+
+    seeds: List[int] = []
+    explicit_seeds = bool(args.seeds)
+    if explicit_seeds:
+        raw_seed_tokens: List[str] = []
+        for entry in args.seeds or []:
+            parts = str(entry).split(",")
+            raw_seed_tokens.extend(part.strip() for part in parts if part.strip())
+        if not raw_seed_tokens:
+            print("[WARN] No seeds provided; nothing to do.")
+            return 0
+        try:
+            seeds = sorted(set(int(token) for token in raw_seed_tokens))
+        except ValueError as exc:
+            raise SystemExit(f"[ERROR] Failed to parse seeds: {exc}")
+        if not seeds:
+            print("[WARN] No seeds provided; nothing to do.")
+            return 0
+        target_successes = len(seeds)
+    else:
+        if args.runs is None or args.runs <= 0:
+            raise SystemExit("[ERROR] --runs must be a positive integer when --seeds is omitted.")
+        target_successes = int(args.runs)
 
     base_outdir: Path = args.outdir
     base_outdir.mkdir(parents=True, exist_ok=True)
@@ -289,159 +330,139 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     log_path = exp_dir / "experiment.log"
 
     shared_seeds: List[int] = []
-    per_model_rows: Dict[str, List[Dict[str, str]]] = {key: [] for key in enabled_solvers}
+    per_model_rows: Dict[str, List[Dict[str, str]]] = {model: [] for model in models}
+    if run_ensemble:
+        for key in ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"]:
+            per_model_rows[key] = []
+
+    primary_model = models[0]
 
     with open(log_path, "w", encoding="utf-8") as log_handle:
-        for requested_seed in seeds:
-            current_seed = int(requested_seed)
-            try:
-                dual_outcome = run_model(
-                    "dual",
-                    enabled_solvers["dual"],
-                    args,
-                    seed=current_seed,
-                    outdir=raw_dir,
-                    log_handle=log_handle,
-                    keep_raw=args.keep_raw,
-                )
-            except RuntimeError as exc:
-                print(f"[WARN] dual failed for seed={current_seed}: {exc}")
-                continue
-            dual_seed = dual_outcome.seed
-            if dual_seed != current_seed:
-                print(f"[WARN] dual deviated to seed={dual_seed} (expected {current_seed}); skipping")
-                continue
-            per_model_rows["dual"].append({**dual_outcome.run_row, "model": "dual", "solver": dual_outcome.solver})
+        seed_index = 0
+        next_seed_candidate = int(args.seed0)
+        attempts = 0
+        MAX_EXTRA = 1000
 
-            try:
-                kkt_outcome = run_model(
-                    "kkt",
-                    enabled_solvers["kkt"],
-                    args,
-                    seed=current_seed,
-                    outdir=raw_dir,
-                    log_handle=log_handle,
-                    keep_raw=args.keep_raw,
-                )
-            except RuntimeError as exc:
-                print(f"[WARN] kkt failed for seed={current_seed}: {exc}")
-                per_model_rows["dual"].pop()
-                continue
-            if kkt_outcome.seed != current_seed:
-                print(f"[WARN] kkt deviated to seed={kkt_outcome.seed} (expected {current_seed}); skipping")
-                per_model_rows["dual"].pop()
-                continue
-            per_model_rows["kkt"].append({**kkt_outcome.run_row, "model": "kkt", "solver": kkt_outcome.solver})
+        while True:
+            if explicit_seeds:
+                if seed_index >= len(seeds):
+                    break
+                current_seed = seeds[seed_index]
+                seed_index += 1
+            else:
+                if len(shared_seeds) >= target_successes:
+                    break
+                if attempts >= target_successes + MAX_EXTRA:
+                    print(f"[WARN] Reached attempt limit without collecting {target_successes} successes.")
+                    break
+                current_seed = next_seed_candidate
+                next_seed_candidate += 1
+                attempts += 1
 
-            try:
-                ols_outcome = run_model(
-                    "ols",
-                    enabled_solvers["ols"],
-                    args,
-                    seed=current_seed,
-                    outdir=raw_dir,
-                    log_handle=log_handle,
-                    keep_raw=args.keep_raw,
-                )
-            except RuntimeError as exc:
-                print(f"[WARN] ols failed for seed={current_seed}: {exc}")
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                continue
-            per_model_rows["ols"].append({**ols_outcome.run_row, "model": "ols", "solver": ols_outcome.solver})
+            outcomes_by_model: Dict[str, small.RunOutcome] = {}
+            success = True
+            primary_actual_seed: Optional[int] = None
 
-            try:
-                ipo_outcome = run_model(
-                    "ipo",
-                    enabled_solvers["ipo"],
-                    args,
-                    seed=current_seed,
-                    outdir=raw_dir,
-                    log_handle=log_handle,
-                    keep_raw=args.keep_raw,
-                )
-            except RuntimeError as exc:
-                print(f"[WARN] ipo failed for seed={current_seed}: {exc}")
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                per_model_rows["ols"].pop()
-                continue
-            if ipo_outcome.seed != current_seed:
-                print(f"[WARN] ipo deviated to seed={ipo_outcome.seed} (expected {current_seed}); skipping")
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                per_model_rows["ols"].pop()
-                continue
-            per_model_rows["ipo"].append({**ipo_outcome.run_row, "model": "ipo", "solver": ipo_outcome.solver})
-
-            if args.log_gaps:
-                for model_name in ["dual", "kkt"]:
-                    gap_str = per_model_rows[model_name][-1].get("gurobi_mip_gap", "")
-                    print(f"[INFO] seed={current_seed} model={model_name} gap={gap_str}")
-
-            if not run_ensemble:
-                shared_seeds.append(current_seed)
-                print(f"[INFO] Accepted seed {current_seed}; total collected {len(shared_seeds)}/{len(seeds)}")
-                continue
-
-            theta_dual_vec = small.parse_theta(per_model_rows["dual"][-1])
-            theta_kkt_vec = small.parse_theta(per_model_rows["kkt"][-1])
-            if theta_dual_vec is None or theta_kkt_vec is None:
-                print(f"[WARN] Failed to parse theta for ensemble on seed={current_seed}; skipping")
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                per_model_rows["ols"].pop()
-                per_model_rows["ipo"].pop()
-                continue
-
-            ensembles = {
-                "ensemble_avg": 0.5 * (theta_dual_vec + theta_kkt_vec),
-                "ensemble_weighted": (
-                    np.linalg.norm(theta_dual_vec) * theta_dual_vec
-                    + np.linalg.norm(theta_kkt_vec) * theta_kkt_vec
-                )
-                / (np.linalg.norm(theta_dual_vec) + np.linalg.norm(theta_kkt_vec) + 1e-12),
-                "ensemble_normalized": 0.5
-                * (small.normalize_theta(theta_dual_vec) + small.normalize_theta(theta_kkt_vec)),
-            }
-
-            ensemble_results = {}
-            ensemble_fail = False
-            for ens_model, theta_vec in ensembles.items():
-                theta_tmp = raw_dir / f"{ens_model}_seed{current_seed}.npy"
-                np.save(theta_tmp, theta_vec)
+            for model_name in models:
+                solver_name = enabled_solvers[model_name]
                 try:
                     outcome = run_model(
-                        ens_model,
-                        enabled_solvers[ens_model],
+                        model_name,
+                        solver_name,
                         args,
                         seed=current_seed,
                         outdir=raw_dir,
                         log_handle=log_handle,
                         keep_raw=args.keep_raw,
-                        fixed_theta=theta_tmp,
                     )
                 except RuntimeError as exc:
-                    print(f"[WARN] {ens_model} failed for seed={current_seed}: {exc}; skipping")
-                    ensemble_fail = True
+                    print(f"[WARN] {model_name} failed for seed={current_seed}: {exc}")
+                    success = False
                     break
-                finally:
-                    if not args.keep_raw and theta_tmp.exists():
-                        theta_tmp.unlink()
-                ensemble_results[ens_model] = outcome
+                actual_seed = outcome.seed
+                if primary_actual_seed is None:
+                    primary_actual_seed = actual_seed
+                elif actual_seed != primary_actual_seed:
+                    print(
+                        f"[WARN] {model_name} deviated to seed={actual_seed} (expected {primary_actual_seed}); skipping"
+                    )
+                    success = False
+                    break
+                outcomes_by_model[model_name] = outcome
 
-            if ensemble_fail:
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                per_model_rows["ols"].pop()
-                per_model_rows["ipo"].pop()
+            if not success:
                 continue
 
-            for ens_model, outcome in ensemble_results.items():
-                per_model_rows[ens_model].append({**outcome.run_row, "model": ens_model, "solver": outcome.solver})
+            ensemble_results: Dict[str, small.RunOutcome] = {}
+            if run_ensemble:
+                if "dual" not in outcomes_by_model or "kkt" not in outcomes_by_model:
+                    print("[WARN] Missing dual/kkt outcomes for ensemble computation; skipping seed")
+                    continue
+                theta_dual_vec = small.parse_theta(outcomes_by_model["dual"].run_row)
+                theta_kkt_vec = small.parse_theta(outcomes_by_model["kkt"].run_row)
+                if theta_dual_vec is None or theta_kkt_vec is None:
+                    print("[WARN] Failed to parse theta for ensemble; skipping seed")
+                    continue
 
-            shared_seeds.append(current_seed)
-            print(f"[INFO] Accepted seed {current_seed}; total collected {len(shared_seeds)}/{len(seeds)}")
+                ensembles = {
+                    "ensemble_avg": 0.5 * (theta_dual_vec + theta_kkt_vec),
+                    "ensemble_weighted": (
+                        np.linalg.norm(theta_dual_vec) * theta_dual_vec
+                        + np.linalg.norm(theta_kkt_vec) * theta_kkt_vec
+                    )
+                    / (np.linalg.norm(theta_dual_vec) + np.linalg.norm(theta_kkt_vec) + 1e-12),
+                    "ensemble_normalized": 0.5
+                    * (small.normalize_theta(theta_dual_vec) + small.normalize_theta(theta_kkt_vec)),
+                }
+
+                ensemble_fail = False
+                for ens_model, theta_vec in ensembles.items():
+                    theta_tmp = raw_dir / f"{ens_model}_seed{primary_actual_seed}.npy"
+                    np.save(theta_tmp, theta_vec)
+                    try:
+                        outcome = run_model(
+                            ens_model,
+                            enabled_solvers[ens_model],
+                            args,
+                            seed=current_seed,
+                            outdir=raw_dir,
+                            log_handle=log_handle,
+                            keep_raw=args.keep_raw,
+                            fixed_theta=theta_tmp,
+                        )
+                    except RuntimeError as exc:
+                        print(f"[WARN] {ens_model} failed for seed={current_seed}: {exc}; skipping")
+                        ensemble_fail = True
+                        break
+                    finally:
+                        if not args.keep_raw and theta_tmp.exists():
+                            theta_tmp.unlink()
+                    ensemble_results[ens_model] = outcome
+
+                if ensemble_fail:
+                    continue
+
+            for model_name, outcome in outcomes_by_model.items():
+                per_model_rows[model_name].append(
+                    {**outcome.run_row, "model": model_name, "solver": outcome.solver}
+                )
+                if args.log_gaps and model_name in {"dual", "kkt"}:
+                    gap_str = outcome.run_row.get("gurobi_mip_gap", "")
+                    print(f"[INFO] seed={primary_actual_seed} model={model_name} gap={gap_str}")
+
+            for ens_model, outcome in ensemble_results.items():
+                per_model_rows[ens_model].append(
+                    {**outcome.run_row, "model": ens_model, "solver": outcome.solver}
+                )
+
+            shared_seeds.append(primary_actual_seed if primary_actual_seed is not None else current_seed)
+            if explicit_seeds:
+                print(f"[INFO] Accepted seed {shared_seeds[-1]}; total collected {len(shared_seeds)}/{len(seeds)}")
+            else:
+                print(f"[INFO] Accepted seed {shared_seeds[-1]}; total collected {len(shared_seeds)}/{target_successes}")
+
+            if not explicit_seeds and len(shared_seeds) >= target_successes:
+                break
 
     detail_rows: List[Dict[str, str]] = []
     for model, rows in per_model_rows.items():
@@ -499,7 +520,12 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 # python GraduationResearch/DFL_Portfolio_Optimization2/experiments/run_gurobi_partial_eval.py \
-#   --seeds 100,101,102,103,106,107,108,109,111,113,116,118,119,120,121,123,124,126,127,128,129,130,131,133,134,137,138,139,140,141 \
+#   --N 50 --d 3 --res 0 \
+#   --snr 0.01 --rho 0.5 --delta 1.0 \
+#   --runs 100\
+#   --models kkt,ols,ipo \
 #   --gurobi-accept-time-limit \
 #   --gurobi-max-gap 0.01 \
 #   --no-ensemble --tee
+
+#   --seeds 100,101,102,103,106,107,108,109,111,113,116,118,119,120,121,123,124,126,127,128,129,130,131,133,134,137,138,139,140,141 \

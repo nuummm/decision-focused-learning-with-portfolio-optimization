@@ -33,7 +33,7 @@ solver_options:
     xtol: 1e-10
     honorbnds: 1              # 境界遵守を優先
     maxit: 20000
-    maxtime_real: 600
+    maxtime_real: 1200
     numthreads: 1             # 再現性重視
     ms_enable: 0              # 局所探索のばらつきを抑える（探索は別プロファイルで）
     bar_initmu: 1e-1          # 初期バリア小さめ（数値が悪ければ 1e0→1e-1 調整）
@@ -48,7 +48,7 @@ solver_options:
     constr_viol_tol: 1e-8
     compl_inf_tol: 1e-8
     max_iter: 200000
-    max_cpu_time: 600
+    max_cpu_time: 1200
     mu_strategy: adaptive
     nlp_scaling_method: gradient-based
     hessian_approximation: exact        # 可能なら exact（デフォルト）。無理なら limited-memory
@@ -62,7 +62,7 @@ solver_options:
     NonConvex: 2
     Threads: 1
     Seed: 0
-    TimeLimit: 1200          # 24時間
+    TimeLimit: 1200          
     OutputFlag: 1
     MIPGap: 0
     MIPGapAbs: 0

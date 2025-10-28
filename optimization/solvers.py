@@ -6,42 +6,51 @@ import pyomo.environ as pyo
 def _make_gurobi(model, tee: bool, options: dict | None):
     opt = pyo.SolverFactory('gurobi_persistent')
     opt.set_instance(model)
-    # 代表的な既定値
-    opt.set_gurobi_param('OutputFlag', 1 if tee else 0)
+    # 代表的な既定値（後から options で上書き可）
+    defaults = {
+        'NonConvex': 2,
+        'Threads': 1,
+        'Seed': 0,
+        'TimeLimit': 1200,
+        'OutputFlag': 1,
+        'MIPGap': 0,
+        'MIPGapAbs': 0,
+        'Heuristics': 0.0,
+        'Cuts': 2,
+        'Presolve': 2,
+        'NumericFocus': 1,
+        'FeasibilityTol': 1e-9,
+        'OptimalityTol': 1e-9,
+        'BarConvTol': 1e-12,
+        'Method': 2,
+    }
+    for key, value in defaults.items():
+        opt.set_gurobi_param(key, value)
+
     if options:
         for k, v in options.items():
             opt.set_gurobi_param(k, v)
-    # 非凸QCQPを許可
-    opt.set_gurobi_param('NonConvex', 2)
-    opt.set_gurobi_param('TimeLimit', 300)
-    opt.set_gurobi_param('Threads', 8)             # 実コア数に合わせる
-    # 数値安定寄り（必要に応じて）
-    opt.set_gurobi_param('BarQCPConvTol', 1e-9)    # QCP収束許容
-    opt.set_gurobi_param('FeasibilityTol', 1e-8)
-    opt.set_gurobi_param('OptimalityTol', 1e-8)
-    opt.set_gurobi_param('Presolve', 2)
-    opt.set_gurobi_param('NumericFocus', 1)        # 1〜3で調整。まずは1から
-    # 連続問題なら barrier を優先したい場合（任意）
-    # opt.set_gurobi_param('Method', 2)            # 2=Barrier
-    # opt.set_gurobi_param('Crossover', 0)         # 連続で内点解のまま出す場合
     return opt
 
 def _make_ipopt(model, tee: bool, options: dict | None):
     opt = pyo.SolverFactory('ipopt')
     # 代表的な既定値（必要なら上書き）
     base = {
-        "tol": 1e-6,
-        "acceptable_tol": 1e-5,
-        "max_iter": 5000,
-        "linear_solver": "mumps",
+        "tol": 1e-8,
+        "acceptable_tol": 1e-6,
+        "dual_inf_tol": 1e-8,
+        "constr_viol_tol": 1e-8,
+        "compl_inf_tol": 1e-8,
+        "max_iter": 200000,
+        "max_cpu_time": 1200,
         "mu_strategy": "adaptive",
-        "line_search_method": "filter",
         "nlp_scaling_method": "gradient-based",
-        "bound_push": 1e-6,
-        "bound_relax_factor": 1e-8,
-        "compl_inf_tol": 1e-6,
-        "hessian_approximation": "limited-memory",
+        "hessian_approximation": "exact",
+        "linear_solver": "ma57",
+        "bound_push": 1e-12,
+        "bound_frac": 1e-12,
         "warm_start_init_point": "yes",
+        "print_level": 5,
     }
     if options:
         base.update(options)
@@ -55,10 +64,23 @@ def _make_knitro(model, tee: bool, options: dict | None):
     opt.options['solver'] = 'knitro'
 
     base = {
-        "outlev": 4 if tee else 2,
-        # "algorithm": 1,  # ← 非推奨。nlp_algorithm を使うのでコメントアウト推奨
-        "maxtime_real": 300,
-        "maxit": 3000,
+        "outlev": 3,
+        "nlp_algorithm": 1,
+        "hessopt": 2,
+        "linsolver": 3,  # 3 = MA57 in Knitro option coding
+        "scale": 1,
+        "presolve": 1,
+        "feastol": 1e-8,
+        "opttol": 1e-8,
+        "xtol": 1e-10,
+        "honorbnds": 1,
+        "maxit": 20000,
+        "maxtime_real": 1200,
+        "numthreads": 1,
+        "ms_enable": 0,
+        "bar_initmu": 1e-1,
+        "bar_murule": 4,
+        "outmode": 1,
     }
 
     KNOWN = {
@@ -78,13 +100,17 @@ def _make_knitro(model, tee: bool, options: dict | None):
         # ヘッセ関連
         "hessopt","lmsize","hessian_no_f",
         # スケーリング等
-        "scale","scale_vars",
+        "scale","scale_vars","presolve",
         # 線形ソルバ（必要なら）
         "linsolver","linsolver_numthreads",
         # 初期点
         "bar_initpt","initpt_strategy",
         # 収束許容
-        "feastol","feastol_abs","opttol","opttol_abs",
+        "feastol","feastol_abs","opttol","opttol_abs","xtol",
+        # バリア関連
+        "bar_initmu","bar_murule",
+        # その他
+        "honorbnds",
     }
 
     if options:
