@@ -49,9 +49,13 @@ def cmd_for(params: dict, python_exec: str) -> list[str]:
         cmd.extend([
             "--flex-formulation", params.get("flex_formulation", "dual"),
             "--flex-lambda-theta-anchor", str(params.get("flex_lambda_theta_anchor", 0.0)),
+            "--flex-lambda-theta-anchor-l1", str(params.get("flex_lambda_theta_anchor_l1", 0.0)),
+            "--flex-lambda-theta-iso", str(params.get("flex_lambda_theta_iso", 0.0)),
             "--flex-lambda-w-anchor", str(params.get("flex_lambda_w_anchor", 0.0)),
+            "--flex-lambda-w-anchor-l1", str(params.get("flex_lambda_w_anchor_l1", 0.0)),
             "--flex-lambda-w-iso", str(params.get("flex_lambda_w_iso", 0.0)),
-            "--flex-dro-rho", str(params.get("flex_dro_rho", 0.0)),
+            "--flex-theta-anchor-mode", params.get("flex_theta_anchor_mode", "none"),
+            "--flex-w-anchor-mode", params.get("flex_w_anchor_mode", "ols"),
         ])
     return cmd
 
@@ -67,9 +71,13 @@ def tag_for(params: dict) -> str:
         base += (
             f"_form{params.get('flex_formulation','dual')}"
             f"_lth{f(params.get('flex_lambda_theta_anchor',0.0))}"
+            f"_lth1{f(params.get('flex_lambda_theta_anchor_l1',0.0))}"
+            f"_lthi{f(params.get('flex_lambda_theta_iso',0.0))}"
             f"_lwa{f(params.get('flex_lambda_w_anchor',0.0))}"
+            f"_lwa1{f(params.get('flex_lambda_w_anchor_l1',0.0))}"
             f"_lwi{f(params.get('flex_lambda_w_iso',0.0))}"
-            f"_dro{f(params.get('flex_dro_rho',0.0))}"
+            f"_tmode{params.get('flex_theta_anchor_mode','none')}"
+            f"_wmode{params.get('flex_w_anchor_mode','ols')}"
         )
     return base
 
@@ -115,9 +123,15 @@ def main():
     ap.add_argument("--flex_formulations", type=comma_strs, default=comma_strs("dual"),
                     help='flex formulations, e.g. "dual,kkt"')
     ap.add_argument("--flex_lambda_theta_anchor_list", type=comma_floats, default=comma_floats("0.0"))
+    ap.add_argument("--flex_lambda_theta_anchor_l1_list", type=comma_floats, default=comma_floats("0.0"))
+    ap.add_argument("--flex_lambda_theta_iso_list", type=comma_floats, default=comma_floats("0.0"))
     ap.add_argument("--flex_lambda_w_anchor_list", type=comma_floats, default=comma_floats("0.0"))
+    ap.add_argument("--flex_lambda_w_anchor_l1_list", type=comma_floats, default=comma_floats("0.0"))
     ap.add_argument("--flex_lambda_w_iso_list", type=comma_floats, default=comma_floats("0.0"))
-    ap.add_argument("--flex_dro_rho_list", type=comma_floats, default=comma_floats("0.0"))
+    ap.add_argument("--flex_theta_anchor_modes", type=comma_strs, default=comma_strs("none"),
+                    help='Theta anchor modes (e.g. "none,ols").')
+    ap.add_argument("--flex_w_anchor_modes", type=comma_strs, default=comma_strs("ols"),
+                    help='w anchor modes (e.g. "ols,none").')
 
     # 実行制御
     ap.add_argument("--workers", type=int, default=4, help="並列実行スレッド数（-1 or 0 で全コア）")
@@ -144,9 +158,13 @@ def main():
     args.lambda_list = _uniq_sorted(args.lambda_list)
     args.flex_formulations = _uniq_sorted(args.flex_formulations)
     args.flex_lambda_theta_anchor_list = _uniq_sorted(args.flex_lambda_theta_anchor_list)
+    args.flex_lambda_theta_anchor_l1_list = _uniq_sorted(args.flex_lambda_theta_anchor_l1_list)
+    args.flex_lambda_theta_iso_list = _uniq_sorted(args.flex_lambda_theta_iso_list)
     args.flex_lambda_w_anchor_list = _uniq_sorted(args.flex_lambda_w_anchor_list)
+    args.flex_lambda_w_anchor_l1_list = _uniq_sorted(args.flex_lambda_w_anchor_l1_list)
     args.flex_lambda_w_iso_list = _uniq_sorted(args.flex_lambda_w_iso_list)
-    args.flex_dro_rho_list = _uniq_sorted(args.flex_dro_rho_list)
+    args.flex_theta_anchor_modes = _uniq_sorted(args.flex_theta_anchor_modes)
+    args.flex_w_anchor_modes = _uniq_sorted(args.flex_w_anchor_modes)
     if args.delta_list:
         args.delta_list = _uniq_sorted(args.delta_list)
     else:
@@ -186,8 +204,9 @@ def main():
         writer.writerow([
             "tag", "model", "solver", "snr", "N", "res", "rho", "lambda_theta",
             "d", "sigma", "delta", "runs", "seed0",
-            "flex_formulation", "flex_lambda_theta_anchor", "flex_lambda_w_anchor",
-            "flex_lambda_w_iso", "flex_dro_rho",
+            "flex_formulation", "flex_lambda_theta_anchor", "flex_lambda_theta_anchor_l1",
+            "flex_lambda_theta_iso", "flex_lambda_w_anchor", "flex_lambda_w_anchor_l1",
+            "flex_lambda_w_iso", "flex_theta_anchor_mode", "flex_w_anchor_mode",
             "returncode", "log_path", "cmd"
         ])
 
@@ -212,13 +231,17 @@ def main():
             if model == "ols":
                 continue
             if model == "flex":
-                for solver, lam, form, lam_t, lam_w, lam_iso, dro in itertools.product(
+                for solver, lam, form, lam_t, lam_t_l1, lam_t_iso, lam_w, lam_w_l1, lam_w_iso, t_mode, w_mode in itertools.product(
                         args.solvers, args.lambda_list,
                         args.flex_formulations,
                         args.flex_lambda_theta_anchor_list,
+                        args.flex_lambda_theta_anchor_l1_list,
+                        args.flex_lambda_theta_iso_list,
                         args.flex_lambda_w_anchor_list,
+                        args.flex_lambda_w_anchor_l1_list,
                         args.flex_lambda_w_iso_list,
-                        args.flex_dro_rho_list):
+                        args.flex_theta_anchor_modes,
+                        args.flex_w_anchor_modes):
                     jobs.append({
                         "model": model,
                         "solver": solver,
@@ -230,9 +253,13 @@ def main():
                         "tee": args.tee, "no_plots": args.no_plots,
                         "flex_formulation": form,
                         "flex_lambda_theta_anchor": lam_t,
+                        "flex_lambda_theta_anchor_l1": lam_t_l1,
+                        "flex_lambda_theta_iso": lam_t_iso,
                         "flex_lambda_w_anchor": lam_w,
-                        "flex_lambda_w_iso": lam_iso,
-                        "flex_dro_rho": dro,
+                        "flex_lambda_w_anchor_l1": lam_w_l1,
+                        "flex_lambda_w_iso": lam_w_iso,
+                        "flex_theta_anchor_mode": t_mode,
+                        "flex_w_anchor_mode": w_mode,
                     })
             else:
                 for solver, lam in itertools.product(args.solvers, args.lambda_list):
@@ -284,12 +311,16 @@ def main():
                     flex_vals = [
                         params.get("flex_formulation", ""),
                         params.get("flex_lambda_theta_anchor", ""),
+                        params.get("flex_lambda_theta_anchor_l1", ""),
+                        params.get("flex_lambda_theta_iso", ""),
                         params.get("flex_lambda_w_anchor", ""),
+                        params.get("flex_lambda_w_anchor_l1", ""),
                         params.get("flex_lambda_w_iso", ""),
-                        params.get("flex_dro_rho", ""),
+                        params.get("flex_theta_anchor_mode", ""),
+                        params.get("flex_w_anchor_mode", ""),
                     ]
                 else:
-                    flex_vals = ["", "", "", "", ""]
+                    flex_vals = ["", "", "", "", "", "", "", "", ""]
                 writer.writerow([
                     tag, params["model"], params["solver"],
                     params["snr"], params["N"], params["res"], params["rho"], params["lambda_theta"],
@@ -336,10 +367,36 @@ python DFL_Portfolio_Optimization2/experiments/sweep.py \
     --d 3 \
     --flex_formulations "dual, kkt" \
     --flex_lambda_theta_anchor_list "0.0" \
-    --flex_lambda_w_anchor_list " 0.0" \
+    --flex_lambda_theta_anchor_l1_list "0.0" \
+    --flex_lambda_theta_iso_list "0.0" \
+    --flex_lambda_w_anchor_list "0.0" \
+    --flex_lambda_w_anchor_l1_list "0.0" \
     --flex_lambda_w_iso_list "0.0" \
-    --flex_dro_rho_list " 0.0" \
     --runs 10 \
     --seed0 100 \
+
+    
+python GraduationResearch/DFL_Portfolio_Optimization2/experiments/sweep.py \
+  --snr_list "0.1" \
+  --N_list "50" \
+  --res_list "0" \
+  --rho_list "0.5" \
+  --delta_list "1" \
+  --models "flex,ols" \
+  --solvers "knitro, ipopt" \
+  --d 3 \
+  --runs 5 \
+  --seed0 100 \
+  --lambda_list "0.0" \
+  --flex_formulations "dual, kkt" \
+  --flex_lambda_theta_anchor_list "0.0" \
+  --flex_lambda_theta_anchor_l1_list "0.0" \
+  --flex_lambda_theta_iso_list "0.0" \
+  --flex_lambda_w_anchor_list "0.0" \
+  --flex_lambda_w_anchor_l1_list "0.0" \
+  --flex_lambda_w_iso_list "0.0" \
+  --outdir /Users/kensei/VScode/GraduationResearch/results/exp_flex_sweep \
+  --logdir /Users/kensei/VScode/GraduationResearch/results/sweep_logs \
+  --workers 4
 
 """

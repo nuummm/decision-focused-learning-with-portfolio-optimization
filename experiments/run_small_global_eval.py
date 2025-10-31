@@ -125,6 +125,81 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable ensemble models (average/weighted/normalized).",
     )
+    parser.add_argument(
+        "--disable-dual",
+        action="store_true",
+        help="Skip the dual model in the shared-seed evaluation.",
+    )
+    parser.add_argument(
+        "--disable-kkt",
+        action="store_true",
+        help="Skip the kkt model in the shared-seed evaluation.",
+    )
+    parser.add_argument(
+        "--enable-flex",
+        action="store_true",
+        help="Include the flex model in the shared-seed evaluation pipeline.",
+    )
+    parser.add_argument(
+        "--flex-solver",
+        type=str,
+        default="gurobi",
+        help="Solver to use for the flex model when enabled.",
+    )
+    parser.add_argument(
+        "--flex-formulation",
+        type=str,
+        default="dual",
+        help="Flex formulation to forward to run.py (dual or kkt).",
+    )
+    parser.add_argument(
+        "--flex-lambda-theta-anchor",
+        type=float,
+        default=0.0,
+        help="Flex lambda for L2 anchoring on theta.",
+    )
+    parser.add_argument(
+        "--flex-lambda-theta-anchor-l1",
+        type=float,
+        default=0.0,
+        help="Flex lambda for L1 anchoring on theta.",
+    )
+    parser.add_argument(
+        "--flex-lambda-theta-iso",
+        type=float,
+        default=0.0,
+        help="Flex lambda for isotropic L2 regularisation on theta.",
+    )
+    parser.add_argument(
+        "--flex-lambda-w-anchor",
+        type=float,
+        default=0.0,
+        help="Flex lambda for L2 anchoring on portfolio weights.",
+    )
+    parser.add_argument(
+        "--flex-lambda-w-anchor-l1",
+        type=float,
+        default=0.0,
+        help="Flex lambda for L1 anchoring on portfolio weights.",
+    )
+    parser.add_argument(
+        "--flex-lambda-w-iso",
+        type=float,
+        default=0.0,
+        help="Flex lambda for isotropic L2 regularisation on portfolio weights.",
+    )
+    parser.add_argument(
+        "--flex-theta-anchor-mode",
+        type=str,
+        default="none",
+        help="Automatic theta anchor selection strategy for flex (e.g., none or ols).",
+    )
+    parser.add_argument(
+        "--flex-w-anchor-mode",
+        type=str,
+        default="ols",
+        help="Automatic weight anchor selection strategy for flex (e.g., ols).",
+    )
     return parser.parse_args(argv)
 
 
@@ -142,6 +217,7 @@ class RunOutcome:
 DEFAULT_SOLVERS: Dict[str, str] = {
     "dual": "knitro",
     "kkt": "knitro",
+    "flex": "gurobi",
     "ols": "analytic",
     "ipo": "analytic",
     "ensemble_avg": "analytic",
@@ -170,7 +246,7 @@ SUMMARY_METRIC_MAP = {
 
 
 def build_cmd(
-    model: str,
+    model_key: str,
     solver: str,
     args: argparse.Namespace,
     *,
@@ -178,11 +254,12 @@ def build_cmd(
     outdir: Path,
     fixed_theta: Optional[Path] = None,
 ) -> List[str]:
+    base_model = base_model_key(model_key)
     cmd = [
         str(args.python),
         str(RUNPY),
         "--model",
-        model,
+        base_model,
         "--solver",
         solver,
         "--N",
@@ -210,6 +287,32 @@ def build_cmd(
         "--log-every",
         "1",
     ]
+    if base_model in {"dual", "kkt", "flex"}:
+        cmd.append("--no-auto-baseline")
+    if base_model == "flex":
+        flex_form = flex_variant_form(model_key, args)
+        cmd.extend(
+            [
+                "--flex-formulation",
+                flex_form,
+                "--flex-lambda-theta-anchor",
+                str(getattr(args, "flex_lambda_theta_anchor", 0.0)),
+                "--flex-lambda-theta-anchor-l1",
+                str(getattr(args, "flex_lambda_theta_anchor_l1", 0.0)),
+                "--flex-lambda-theta-iso",
+                str(getattr(args, "flex_lambda_theta_iso", 0.0)),
+                "--flex-lambda-w-anchor",
+                str(getattr(args, "flex_lambda_w_anchor", 0.0)),
+                "--flex-lambda-w-anchor-l1",
+                str(getattr(args, "flex_lambda_w_anchor_l1", 0.0)),
+                "--flex-lambda-w-iso",
+                str(getattr(args, "flex_lambda_w_iso", 0.0)),
+                "--flex-theta-anchor-mode",
+                str(getattr(args, "flex_theta_anchor_mode", "none")).lower(),
+                "--flex-w-anchor-mode",
+                str(getattr(args, "flex_w_anchor_mode", "ols")).lower(),
+            ]
+        )
     if args.no_plots:
         cmd.append("--no-plots")
     if not args.estimate_cov:
@@ -248,7 +351,7 @@ def cleanup_file(path: Path, stop_dir: Path) -> None:
 
 
 def run_model(
-    model: str,
+    model_key: str,
     solver: str,
     args: argparse.Namespace,
     *,
@@ -258,12 +361,13 @@ def run_model(
     keep_raw: bool,
     fixed_theta: Optional[Path] = None,
 ) -> RunOutcome:
-    cmd = build_cmd(model, solver, args, seed=seed, outdir=outdir, fixed_theta=fixed_theta)
+    cmd = build_cmd(model_key, solver, args, seed=seed, outdir=outdir, fixed_theta=fixed_theta)
     if args.dryrun:
         print("[DRYRUN]", " ".join(cmd))
         raise SystemExit(0)
 
-    print(f"[INFO] Running {model} with solver={solver} seed={seed}")
+    display_model = model_display_name(model_key, args)
+    print(f"[INFO] Running {display_model} (key={model_key}) with solver={solver} seed={seed}")
 
     stdout_lines: List[str] = []
 
@@ -297,7 +401,7 @@ def run_model(
 
     if proc.returncode != 0:
         msg = "".join(stdout_lines).strip() or "run.py terminated with non-zero status"
-        raise RuntimeError(f"run.py failed for model={model}, solver={solver}: {msg}")
+        raise RuntimeError(f"run.py failed for model={model_key}, solver={solver}: {msg}")
 
     stdout_text = "".join(stdout_lines)
 
@@ -334,7 +438,7 @@ def run_model(
     actual_seed = int(run_row.get("seed", seed))
 
     outcome = RunOutcome(
-        model=model,
+        model=model_key,
         solver=solver,
         seed=actual_seed,
         summary_csv=summary_path,
@@ -350,12 +454,20 @@ def run_model(
     return outcome
 
 
-def write_csv(path: Path, rows: List[Dict[str, str]]) -> None:
+def write_csv(path: Path, rows: List[Dict[str, str]], fieldnames: Optional[List[str]] = None) -> None:
     if not rows:
         print(f"[WARN] No data to write for {path}")
         return
     ensure_parent(path)
-    fieldnames = list(rows[0].keys())
+    if fieldnames is None:
+        fieldnames = list(rows[0].keys())
+    else:
+        extra: List[str] = []
+        for row in rows:
+            for key in row.keys():
+                if key not in fieldnames and key not in extra:
+                    extra.append(key)
+        fieldnames = list(fieldnames) + extra
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -393,15 +505,22 @@ def seeds_to_string(rows: List[Dict[str, str]]) -> str:
     return ",".join(seeds)
 
 
+def parse_vector_string(text: str) -> Optional[np.ndarray]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        cleaned = cleaned[1:-1]
+    if not cleaned.strip():
+        return None
+    vec = np.fromstring(cleaned, sep=",")
+    if vec.size == 0:
+        return None
+    return vec
+
+
 def parse_theta(row: Dict[str, str]) -> Optional[np.ndarray]:
-    theta_str = (row.get("theta") or "").strip()
-    if not theta_str:
-        return None
-    if theta_str.startswith("[") and theta_str.endswith("]"):
-        theta_str = theta_str[1:-1]
-    if not theta_str.strip():
-        return None
-    return np.fromstring(theta_str, sep=",")
+    return parse_vector_string(row.get("theta", ""))
 
 
 def normalize_theta(vec: np.ndarray) -> np.ndarray:
@@ -411,20 +530,12 @@ def normalize_theta(vec: np.ndarray) -> np.ndarray:
     return vec / total
 
 
-def average_theta(rows: List[Dict[str, str]]) -> str:
+def average_vector(rows: List[Dict[str, str]], key: str) -> str:
     vectors: List[np.ndarray] = []
     for row in rows:
-        theta_str = (row.get("theta") or "").strip()
-        if not theta_str:
-            continue
-        cleaned = theta_str.strip()
-        cleaned = cleaned[1:-1] if cleaned.startswith("[") and cleaned.endswith("]") else cleaned
-        if not cleaned:
-            continue
-        vec = np.fromstring(cleaned, sep=",")
-        if vec.size == 0:
-            continue
-        vectors.append(vec)
+        vec = parse_vector_string(row.get(key, ""))
+        if vec is not None:
+            vectors.append(vec)
     if not vectors:
         return ""
     lengths = {vec.size for vec in vectors}
@@ -436,11 +547,38 @@ def average_theta(rows: List[Dict[str, str]]) -> str:
     return "[" + ", ".join(f"{val:.6g}" for val in mean_vec) + "]"
 
 
+def average_theta(rows: List[Dict[str, str]]) -> str:
+    return average_vector(rows, "theta")
+
+
+def base_model_key(model_key: str) -> str:
+    if model_key.startswith("flex:"):
+        return "flex"
+    return model_key
+
+
+def flex_variant_form(model_key: str, args: argparse.Namespace) -> str:
+    if model_key.startswith("flex:"):
+        _, form = model_key.split(":", 1)
+        return form.strip().lower() or "dual"
+    value = str(getattr(args, "flex_formulation", "dual") or "dual")
+    return value.strip().lower() or "dual"
+
+
+def model_display_name(model_key: str, args: argparse.Namespace) -> str:
+    base = base_model_key(model_key)
+    if base == "flex":
+        formulation = flex_variant_form(model_key, args)
+        return f"{formulation}(flex)"
+    return model_key
+
+
 def plot_metrics(
     per_model_rows: Dict[str, List[Dict[str, str]]],
     metrics: List[str],
     exp_dir: Path,
     fig_format: str,
+    args: argparse.Namespace,
 ) -> None:
     if plt is None:
         print("[WARN] matplotlib unavailable; skipping metric plots")
@@ -466,7 +604,7 @@ def plot_metrics(
                 except (TypeError, ValueError):
                     continue
             series = [values_by_seed.get(seed, math.nan) for seed in seeds]
-            plt.scatter(seeds, series, label=model)
+            plt.scatter(seeds, series, label=model_display_name(model, args))
 
         plt.xlabel("seed")
         plt.ylabel(metric)
@@ -482,10 +620,42 @@ def plot_metrics(
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
     enabled_solvers: Dict[str, str] = dict(DEFAULT_SOLVERS)
+    if args.disable_dual:
+        enabled_solvers.pop("dual", None)
+    if args.disable_kkt:
+        enabled_solvers.pop("kkt", None)
+    flex_variant_keys: List[str] = []
+    flex_forms: List[str] = []
+    if args.enable_flex:
+        raw_spec = str(getattr(args, "flex_formulation", "dual") or "dual")
+        flex_forms = comma_split(raw_spec)
+        if not flex_forms:
+            cleaned = raw_spec.strip().lower()
+            flex_forms = [cleaned] if cleaned else ["dual"]
+        # remove duplicates while preserving order
+        flex_forms = list(dict.fromkeys(flex_forms))
+        if not flex_forms:
+            flex_forms = ["dual"]
+        enabled_solvers.pop("flex", None)
+        for form in flex_forms:
+            key = f"flex:{form}"
+            flex_variant_keys.append(key)
+            enabled_solvers[key] = str(args.flex_solver or "gurobi")
+    else:
+        enabled_solvers.pop("flex", None)
+    setattr(args, "_flex_forms", flex_forms)
+    ensemble_keys = ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"]
     if args.no_ensemble:
-        for key in ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"]:
+        for key in ensemble_keys:
             enabled_solvers.pop(key, None)
-    run_ensemble = all(k in enabled_solvers for k in ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"])
+    has_ensemble = all(key in enabled_solvers for key in ensemble_keys)
+    can_ensemble = "dual" in enabled_solvers and "kkt" in enabled_solvers
+    run_ensemble = has_ensemble and can_ensemble
+    if not run_ensemble:
+        for key in ensemble_keys:
+            enabled_solvers.pop(key, None)
+    else:
+        run_ensemble = True
 
     target = int(args.runs)
     if target <= 0:
@@ -505,96 +675,77 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     per_model_rows: Dict[str, List[Dict[str, str]]] = {key: [] for key in enabled_solvers}
     next_seed = int(args.seed0)
 
+    core_sequence: List[str] = []
+    for base in ["dual", "kkt"]:
+        if base in enabled_solvers:
+            core_sequence.append(base)
+    core_sequence.extend(flex_variant_keys)
+    for base in ["ols", "ipo"]:
+        if base in enabled_solvers:
+            core_sequence.append(base)
+    if not core_sequence:
+        print("[ERROR] No predictive model enabled (dual/kkt/flex/ols/ipo); aborting.")
+        return 1
+
+    def pop_attempt_rows(models: List[str]) -> None:
+        for model in models:
+            rows = per_model_rows.get(model)
+            if rows:
+                rows.pop()
+
     with open(log_path, "w", encoding="utf-8") as log_handle:
         while len(shared_seeds) < target:
-            # --- Step 1: dual ---
-            dual_outcome = run_model(
-                "dual",
-                enabled_solvers["dual"],
-                args,
-                seed=next_seed,
-                outdir=raw_dir,
-                log_handle=log_handle,
-                keep_raw=args.keep_raw,
-            )
-            dual_seed = dual_outcome.seed
-            per_model_rows["dual"].append({**dual_outcome.run_row, "model": "dual", "solver": dual_outcome.solver})
+            attempt_models: List[str] = []
+            anchor_seed: Optional[int] = None
+            failed = False
 
-            # --- Step 2: kkt on the same seed ---
-            kkt_outcome = run_model(
-                "kkt",
-                enabled_solvers["kkt"],
-                args,
-                seed=dual_seed,
-                outdir=raw_dir,
-                log_handle=log_handle,
-                keep_raw=args.keep_raw,
-            )
-            if kkt_outcome.seed != dual_seed:
-                print(
-                    f"[WARN] kkt could not solve seed={dual_seed} (used {kkt_outcome.seed}); discarding and continuing"
+            for model in core_sequence:
+                request_seed = next_seed if anchor_seed is None else anchor_seed
+                outcome = run_model(
+                    model,
+                    enabled_solvers[model],
+                    args,
+                    seed=request_seed,
+                    outdir=raw_dir,
+                    log_handle=log_handle,
+                    keep_raw=args.keep_raw,
                 )
-                # remove dual entry since pair failed
-                per_model_rows["dual"].pop()
-                next_seed = max(kkt_outcome.seed, dual_seed) + 1
-                continue
-            per_model_rows["kkt"].append({**kkt_outcome.run_row, "model": "kkt", "solver": kkt_outcome.solver})
+                model_seed = outcome.seed
+                if anchor_seed is None:
+                    anchor_seed = model_seed
+                elif model_seed != anchor_seed:
+                    print(
+                        f"[WARN] {model} deviated to seed={model_seed} (expected {anchor_seed}); discarding"
+                    )
+                    pop_attempt_rows(attempt_models)
+                    next_seed = max(model_seed, anchor_seed) + 1
+                    failed = True
+                    break
 
-            # --- Step 3: ols with the same seed ---
-            ols_outcome = run_model(
-                "ols",
-                enabled_solvers["ols"],
-                args,
-                seed=dual_seed,
-                outdir=raw_dir,
-                log_handle=log_handle,
-                keep_raw=args.keep_raw,
-            )
-            if ols_outcome.seed != dual_seed:
-                print(
-                    f"[WARN] ols deviated to seed={ols_outcome.seed} (expected {dual_seed}); discarding"
-                )
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                next_seed = max(dual_seed, ols_outcome.seed) + 1
-                continue
-            per_model_rows["ols"].append({**ols_outcome.run_row, "model": "ols", "solver": ols_outcome.solver})
+                display_model = model_display_name(model, args)
+                per_model_rows[model].append({**outcome.run_row, "model": display_model, "solver": outcome.solver})
+                attempt_models.append(model)
 
-            ipo_outcome = run_model(
-                "ipo",
-                enabled_solvers["ipo"],
-                args,
-                seed=dual_seed,
-                outdir=raw_dir,
-                log_handle=log_handle,
-                keep_raw=args.keep_raw,
-            )
-            if ipo_outcome.seed != dual_seed:
-                print(
-                    f"[WARN] ipo deviated to seed={ipo_outcome.seed} (expected {dual_seed}); discarding"
-                )
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                per_model_rows["ols"].pop()
-                next_seed = max(dual_seed, ipo_outcome.seed) + 1
+            if failed:
                 continue
-            per_model_rows["ipo"].append({**ipo_outcome.run_row, "model": "ipo", "solver": ipo_outcome.solver})
+
+            if anchor_seed is None:
+                print("[WARN] No valid seed collected; advancing seed cursor")
+                next_seed += 1
+                continue
 
             if not run_ensemble:
-                shared_seeds.append(dual_seed)
-                next_seed = dual_seed + 1
-                print(f"[INFO] Accepted seed {dual_seed}; total collected {len(shared_seeds)}/{target}")
+                shared_seeds.append(anchor_seed)
+                next_seed = anchor_seed + 1
+                print(f"[INFO] Accepted seed {anchor_seed}; total collected {len(shared_seeds)}/{target}")
                 continue
 
-            theta_dual_vec = parse_theta(per_model_rows["dual"][-1])
-            theta_kkt_vec = parse_theta(per_model_rows["kkt"][-1])
+            theta_dual_vec = parse_theta(per_model_rows["dual"][-1]) if "dual" in per_model_rows else None
+            theta_kkt_vec = parse_theta(per_model_rows["kkt"][-1]) if "kkt" in per_model_rows else None
             if theta_dual_vec is None or theta_kkt_vec is None:
                 print("[WARN] Failed to parse theta for ensemble; discarding seed")
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                per_model_rows["ols"].pop()
-                per_model_rows["ipo"].pop()
-                next_seed = dual_seed + 1
+                pop_attempt_rows(attempt_models)
+                next_seed = anchor_seed + 1
                 continue
 
             ensembles = {
@@ -606,21 +757,21 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             ensemble_results = {}
             ensemble_fail = False
             for ens_model, theta_vec in ensembles.items():
-                theta_tmp = raw_dir / f"{ens_model}_seed{dual_seed}.npy"
+                theta_tmp = raw_dir / f"{ens_model}_seed{anchor_seed}.npy"
                 np.save(theta_tmp, theta_vec)
                 try:
                     outcome = run_model(
                         ens_model,
                         enabled_solvers[ens_model],
                         args,
-                        seed=dual_seed,
+                        seed=anchor_seed,
                         outdir=raw_dir,
                         log_handle=log_handle,
                         keep_raw=args.keep_raw,
                         fixed_theta=theta_tmp,
                     )
                 except RuntimeError as exc:
-                    print(f"[WARN] {ens_model} failed for seed={dual_seed}: {exc}; discarding")
+                    print(f"[WARN] {ens_model} failed for seed={anchor_seed}: {exc}; discarding")
                     ensemble_fail = True
                     break
                 finally:
@@ -631,31 +782,79 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 ensemble_results[ens_model] = outcome
 
             if ensemble_fail:
-                per_model_rows["dual"].pop()
-                per_model_rows["kkt"].pop()
-                per_model_rows["ols"].pop()
-                per_model_rows["ipo"].pop()
-                next_seed = dual_seed + 1
+                pop_attempt_rows(attempt_models)
+                next_seed = anchor_seed + 1
                 continue
 
             for ens_model, outcome in ensemble_results.items():
                 per_model_rows[ens_model].append({**outcome.run_row, "model": ens_model, "solver": outcome.solver})
 
-            shared_seeds.append(dual_seed)
-            next_seed = dual_seed + 1
-            print(f"[INFO] Accepted seed {dual_seed}; total collected {len(shared_seeds)}/{target}")
+            shared_seeds.append(anchor_seed)
+            next_seed = anchor_seed + 1
+            print(f"[INFO] Accepted seed {anchor_seed}; total collected {len(shared_seeds)}/{target}")
 
     # --- Prepare CSV outputs ---
     detail_rows: List[Dict[str, str]] = []
     for model, rows in per_model_rows.items():
+        display_model = model_display_name(model, args)
         for row in rows:
             row = dict(row)
-            row.setdefault("seed", "")
-            row.setdefault("model", model)
+            row["model"] = row.get("model") or display_model
+            row["solver"] = row.get("solver") or enabled_solvers.get(model, DEFAULT_SOLVERS.get(model, ""))
+            if "seed" in row:
+                try:
+                    row["seed"] = str(int(round(float(row["seed"]))))
+                except Exception:
+                    row["seed"] = str(row.get("seed", ""))
+            else:
+                row["seed"] = ""
             detail_rows.append(row)
 
+    detail_field_order = [
+        "model",
+        "solver",
+        "runtime_sec",
+        "eval_rows",
+        "mean_cost_test_vtrue",
+        "mean_cost_test_vhat",
+        "train_cost_vtrue",
+        "train_cost_vhat",
+        "optimal_cost_test_vtrue",
+        "optimal_cost_train_vtrue",
+        "regret_test",
+        "decision_error_test",
+        "decision_error_train",
+        "mean_r2_test",
+        "mean_r2_train",
+        "mean_corr2_test",
+        "mean_corr2_train",
+        "mse_test",
+        "mse_train",
+        "mean_return_test",
+        "std_return_test",
+        "sharpe_ratio_test",
+        "mean_return_train",
+        "std_return_train",
+        "sharpe_ratio_train",
+        "avg_weight_test",
+        "avg_weight_train",
+        "theta",
+        "solver_status",
+        "solver_termination",
+        "solver_time",
+        "solver_message",
+        "theta_source",
+        "gurobi_mip_gap",
+        "budget_violation_train",
+        "nonneg_violation_train",
+        "stationarity_violation_train",
+        "complementarity_violation_train",
+        "strong_duality_violation_train",
+        "seed",
+    ]
+
     detail_csv = exp_dir / "global_details.csv"
-    write_csv(detail_csv, detail_rows)
+    write_csv(detail_csv, detail_rows, fieldnames=detail_field_order)
 
     summary_metrics = list(SUMMARY_METRIC_MAP.keys())
     summary_rows: List[Dict[str, str]] = []
@@ -664,7 +863,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             continue
         metrics = summarise_metrics(rows, SUMMARY_METRIC_MAP.keys())
         summary_row = {
-            "model": model,
+            "model": model_display_name(model, args),
             "solver": enabled_solvers.get(model, DEFAULT_SOLVERS.get(model, "")),
             "n_seeds": str(len(rows)),
             "seeds": seeds_to_string(rows),
@@ -673,12 +872,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             value = metrics.get(src, math.nan)
             summary_row[dst] = f"{value:.10g}" if not math.isnan(value) else ""
         summary_row["theta"] = average_theta(rows)
+        summary_row["avg_weight_test"] = average_vector(rows, "avg_weight_test")
+        summary_row["avg_weight_train"] = average_vector(rows, "avg_weight_train")
         summary_rows.append(summary_row)
 
     summary_csv = exp_dir / args.report_csv.name
     write_csv(summary_csv, summary_rows)
 
-    plot_metrics(per_model_rows, summary_metrics, exp_dir, args.fig_format)
+    plot_metrics(per_model_rows, summary_metrics, exp_dir, args.fig_format, args)
 
     for row in summary_rows:
         model = row["model"]
@@ -698,3 +899,29 @@ if __name__ == "__main__":
     raise SystemExit(main())
 # python GraduationResearch/DFL_Portfolio_Optimization2/experiments/run_small_global_eval.py \
 #   --runs 1 --seed0 100 --N 50 --d 3 --res 10 --snr 1e+6 --rho 0.5 --delta 1.0 --no-ensemble
+
+'''
+python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/experiments/run_small_global_eval.py \
+  --N 50 \
+  --d 3 \
+  --snr 0.1 \
+  --rho 0.5 \
+  --sigma 0.0125 \
+  --res 0 \
+  --delta 1.0 \
+  --runs 1 \
+  --seed0 200 \
+  --enable-flex \
+  --flex-solver gurobi \
+  --flex-formulation 'kkt,dual' \
+  --flex-lambda-theta-anchor 0.0 \
+  --flex-lambda-w-anchor 0.0 \
+  --flex-lambda-theta-iso 0.0 \
+  --flex-lambda-w-iso 0.0 \
+  --flex-theta-anchor-mode ols \
+  --flex-w-anchor-mode ols \
+  --no-ensemble \
+  --disable-dual \
+  --disable-kkt
+
+'''

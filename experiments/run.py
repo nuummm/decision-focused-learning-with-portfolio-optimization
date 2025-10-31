@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -146,11 +147,28 @@ def run_once(
             flex_kwargs = dict(flex_options or {})
             flex_kwargs.setdefault("formulation", "dual")
             lam_theta_anchor = float(flex_kwargs.get("lambda_theta_anchor", 0.0) or 0.0)
-            if lam_theta_anchor > 0.0:
-                flex_kwargs["theta_anchor"] = np.asarray(theta_init, float)
+            lam_theta_anchor_l1 = float(flex_kwargs.get("lambda_theta_anchor_l1", 0.0) or 0.0)
+            lam_theta_iso = float(flex_kwargs.get("lambda_theta_iso", 0.0) or 0.0)
             lam_w_anchor = float(flex_kwargs.get("lambda_w_anchor", 0.0) or 0.0)
-            if lam_w_anchor > 0.0:
-                Yhat_anchor_all = predict_yhat(X, theta_init)
+            lam_w_anchor_l1 = float(flex_kwargs.get("lambda_w_anchor_l1", 0.0) or 0.0)
+            lam_w_iso = float(flex_kwargs.get("lambda_w_iso", 0.0) or 0.0)
+
+            theta_anchor_mode = flex_kwargs.pop("theta_anchor_mode", "none").lower()
+            w_anchor_mode = flex_kwargs.pop("w_anchor_mode", "ols").lower()
+
+            theta_init_vec = np.asarray(theta_init, float)
+            if "theta_anchor" not in flex_kwargs:
+                if theta_anchor_mode == "ols":
+                    flex_kwargs["theta_anchor"] = theta_init_vec
+                elif theta_anchor_mode not in {"none"}:
+                    raise ValueError(f"Unsupported flex theta_anchor_mode: {theta_anchor_mode}")
+
+            need_w_anchor = (
+                "w_anchor" not in flex_kwargs
+                and (lam_w_anchor > 0.0 or lam_w_anchor_l1 > 0.0 or w_anchor_mode == "ols")
+            )
+            if need_w_anchor:
+                Yhat_anchor_all = predict_yhat(X, theta_init_vec)
                 w_anchor_mat = solve_series_mvo_gurobi(
                     Yhat_all=Yhat_anchor_all,
                     Vhats=Vhats_train,
@@ -161,9 +179,13 @@ def run_once(
                     start_index=None,
                 )
                 flex_kwargs["w_anchor"] = w_anchor_mat
-            if "dro_rho" not in flex_kwargs:
-                flex_kwargs["dro_rho"] = 0.0
-
+            # remove unused lambda values to keep printing consistent
+            flex_kwargs["lambda_theta_anchor"] = lam_theta_anchor
+            flex_kwargs["lambda_theta_anchor_l1"] = lam_theta_anchor_l1
+            flex_kwargs["lambda_theta_iso"] = lam_theta_iso
+            flex_kwargs["lambda_w_anchor"] = lam_w_anchor
+            flex_kwargs["lambda_w_anchor_l1"] = lam_w_anchor_l1
+            flex_kwargs["lambda_w_iso"] = lam_w_iso
         trainer_kwargs: Dict[str, Any] = dict(
             X=X,
             Y=Y,
@@ -252,6 +274,7 @@ def run_once(
     train_best_cost_true_mean = np.nan
     train_best_cost_vhat_mean = np.nan
     decision_error_train = np.nan
+    Z_tr_eval = np.empty((0, d))
 
     if train_pairs:
         Y_hat_all = predict_yhat(X, theta_hat)
@@ -308,11 +331,22 @@ def run_once(
                   if burn_in + n_tr <= i < N]
     if not test_pairs:
         return (
-            np.nan, np.nan, 0, 1.0,
-            train_cost_true_mean, train_cost_vhat_mean, np.nan, elapsed,
-            np.nan, np.nan, np.nan,
-            np.nan, np.nan, np.nan, np.nan,
-            np.nan, np.nan, np.nan, np.nan,
+            np.nan,
+            np.nan,
+            0,
+            train_cost_true_mean,
+            train_cost_vhat_mean,
+            np.nan,
+            elapsed,
+            train_r2_corrsq,
+            np.nan,
+            train_r2_sklearn,
+            np.nan,
+            train_mse_mean,
+            np.nan,
+            train_best_cost_true_mean,
+            np.nan,
+            decision_error_train,
             np.array(theta_hat, copy=True),
             solver_status,
             solver_term,
@@ -327,10 +361,12 @@ def run_once(
             np.nan,
             np.nan,
             np.nan,
-            np.nan,
-            np.nan,
-            np.nan,
+            mean_return_train,
+            std_return_train,
+            sharpe_train,
             gurobi_gap,
+            np.full(d, np.nan),
+            np.full(d, np.nan),
         )
 
     used_test_idx = [i for i, _ in test_pairs]
@@ -356,7 +392,6 @@ def run_once(
     mask_pred = ~np.isnan(Z_test).any(axis=1)
     mask_opt = ~np.isnan(Z_test_opt).any(axis=1)
     mask = mask_pred & mask_opt
-    fail_rate = 1.0 - (np.sum(mask_pred) / len(Z_test)) if len(Z_test) > 0 else 1.0
     Z_eval = Z_test[mask]
     Y_eval = Y_used[mask]
     Yhat_eval = Yhat_used[mask]
@@ -410,24 +445,10 @@ def run_once(
     # --- MSE（全資産・全時点平均）
     mse_mean = float(np.mean((Y_eval - Yhat_eval)**2))
 
-    # --- PVE（論文定義：分散は不偏ではなく母分散扱い＝ddof=0）
-    pve_cols = []
-    for j in range(d):
-        yj, yhj = Y_eval[:, j], Yhat_eval[:, j]
-        var_y = np.var(yj)  # ddof=0
-        if var_y < 1e-18:
-            pve_cols.append(0.0)
-        else:
-            pve_cols.append(1.0 - np.mean((yj - yhj)**2) / var_y)
-    mean_pve = float(np.nanmean(pve_cols))
-
-    # fail_rate は mask_pred 基準で算出済み
-
     # ----- 学習区間の指標 -----
     train_r2_corrsq = np.nan
     train_r2_sklearn = np.nan
     train_mse_mean = np.nan
-    train_pve_mean = np.nan
 
     if len(Z_tr_eval) > 0:
         if use_direct_yhat and Yhat_all_from_trainer is not None:
@@ -459,17 +480,6 @@ def run_once(
         # MSE
         train_mse_mean = float(np.mean((Y_tr_eval - Yhat_tr_eval)**2))
 
-        # PVE
-        pve_cols_tr = []
-        for j in range(d):
-            yj, yhj = Y_tr_eval[:, j], Yhat_tr_eval[:, j]
-            var_y = np.var(yj)
-            if var_y < 1e-18:
-                pve_cols_tr.append(0.0)
-            else:
-                pve_cols_tr.append(1.0 - np.mean((yj - yhj)**2) / var_y)
-        train_pve_mean = float(np.nanmean(pve_cols_tr))
-
     returns_test = None
     mean_return_test = np.nan
     std_return_test = np.nan
@@ -492,27 +502,32 @@ def run_once(
         if std_return_train > 1e-12:
             sharpe_train = mean_return_train / std_return_train
 
+    avg_weight_test = np.full(d, np.nan)
+    if len(Z_eval) > 0:
+        avg_weight_test = np.mean(Z_eval, axis=0)
+
+    avg_weight_train = np.full(d, np.nan)
+    if len(Z_tr_eval) > 0:
+        avg_weight_train = np.mean(Z_tr_eval, axis=0)
+
     return (
         mean_cost_true,           # 1
         mean_r2_corrsq,           # 2 (test corr^2)
         len(Z_eval),              # 3
-        fail_rate,                # 4
-        train_cost_true_mean,     # 5
-        train_cost_vhat_mean,     # 6
-        mean_cost_vhat,           # 7
-        elapsed,                  # 8
-        train_r2_corrsq,          # 9 (train corr^2)
-        mean_r2_sklearn,          # 10 (test R^2)
-        train_r2_sklearn,         # 11 (train R^2)
-        mse_mean,                 # 12 (test MSE)
-        train_mse_mean,           # 13 (train MSE)
-        mean_pve,                 # 14 (test PVE)
-        train_pve_mean,           # 15 (train PVE)
-        best_cost_true_mean,      # 16 (test optimal cost)
-        train_best_cost_true_mean,# 17 (train optimal cost)
-        decision_error_test,      # 18 (test decision error)
-        decision_error_train,     # 19 (train decision error)
-        np.array(theta_hat, copy=True),  # 20 (theta)
+        train_cost_true_mean,     # 4
+        train_cost_vhat_mean,     # 5
+        mean_cost_vhat,           # 6
+        elapsed,                  # 7
+        train_r2_corrsq,          # 8 (train corr^2)
+        mean_r2_sklearn,          # 9 (test R^2)
+        train_r2_sklearn,         # 10 (train R^2)
+        mse_mean,                 # 11 (test MSE)
+        train_mse_mean,           # 12 (train MSE)
+        best_cost_true_mean,      # 13 (test optimal cost)
+        train_best_cost_true_mean,# 14 (train optimal cost)
+        decision_error_test,      # 15 (test decision error)
+        decision_error_train,     # 16 (train decision error)
+        np.array(theta_hat, copy=True),  # 17 (theta)
         solver_status,
         solver_term,
         solver_time,
@@ -530,6 +545,8 @@ def run_once(
         std_return_train,
         sharpe_train,
         gurobi_gap,
+        avg_weight_test,
+        avg_weight_train,
     )
 def main():
     p = argparse.ArgumentParser(description="Unified runner for DFL experiments (KKT/DUAL) with pluggable solvers")
@@ -564,17 +581,30 @@ def main():
     p.add_argument("--use-true-cov", action="store_true", help="共分散を推定せず V_true をそのまま使用する")
     p.add_argument("--allow-gurobi-partial", action="store_true", help="(Gurobi only) accept time-limit solutions instead of skipping.")
     p.add_argument("--gurobi-max-gap", type=float, default=None, help="(Gurobi only) accept runs whose final relative MIP gap is at or below this value.")
+    p.add_argument("--no-auto-baseline", action="store_true", help="Disable automatic baseline (OLS/IPO) runs for flex/dual/kkt.")
 
     # flex model 専用オプション（未使用モデルでは無視される）
     p.add_argument("--flex-formulation", type=str, default="dual",
                    help="flex モデルで dual/kkt を切り替える")
-    p.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0)
-    p.add_argument("--flex-lambda-w-anchor", type=float, default=0.0)
-    p.add_argument("--flex-lambda-w-iso", type=float, default=0.0)
-    p.add_argument("--flex-dro-rho", type=float, default=0.0,
-                   help="L2 DRO radius (0 で無効)")
+    p.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0,
+                   help="L2 anchor regularisation for theta.")
+    p.add_argument("--flex-lambda-theta-anchor-l1", type=float, default=0.0,
+                   help="L1 anchor regularisation for theta.")
+    p.add_argument("--flex-lambda-theta-iso", type=float, default=0.0,
+                   help="Isotropic L2 regularisation for theta.")
+    p.add_argument("--flex-lambda-w-anchor", type=float, default=0.0,
+                   help="L2 anchor regularisation for w.")
+    p.add_argument("--flex-lambda-w-anchor-l1", type=float, default=0.0,
+                   help="L1 anchor regularisation for w.")
+    p.add_argument("--flex-lambda-w-iso", type=float, default=0.0,
+                   help="Isotropic L2 regularisation for w.")
+    p.add_argument("--flex-theta-anchor-mode", type=str, default="none",
+                   help='Theta anchor source (e.g. "ols" or "none").')
+    p.add_argument("--flex-w-anchor-mode", type=str, default="ols",
+                   help='w anchor source (e.g. "ols" or "none").')
 
     args = p.parse_args()
+    auto_baseline = not args.no_auto_baseline
 
     # ===== YAML 読み込み & マージ =====
     if args.config:
@@ -631,9 +661,13 @@ def main():
         flex_options = {
             "formulation": (args.flex_formulation or "dual").lower(),
             "lambda_theta_anchor": float(getattr(args, "flex_lambda_theta_anchor", 0.0) or 0.0),
+            "lambda_theta_anchor_l1": float(getattr(args, "flex_lambda_theta_anchor_l1", 0.0) or 0.0),
+            "lambda_theta_iso": float(getattr(args, "flex_lambda_theta_iso", 0.0) or 0.0),
             "lambda_w_anchor": float(getattr(args, "flex_lambda_w_anchor", 0.0) or 0.0),
+            "lambda_w_anchor_l1": float(getattr(args, "flex_lambda_w_anchor_l1", 0.0) or 0.0),
             "lambda_w_iso": float(getattr(args, "flex_lambda_w_iso", 0.0) or 0.0),
-            "dro_rho": float(getattr(args, "flex_dro_rho", 0.0) or 0.0),
+            "theta_anchor_mode": (getattr(args, "flex_theta_anchor_mode", "none") or "none").lower(),
+            "w_anchor_mode": (getattr(args, "flex_w_anchor_mode", "ols") or "ols").lower(),
         }
 
     # ここで solver_options を一回だけ作る
@@ -663,14 +697,13 @@ def main():
 
     # 成功分だけためる
     seeds_kept = []
-    cost_list, r2_list, Te_list, fail_list, run_times = [], [], [], [], []
+    cost_list, r2_list, Te_list, run_times = [], [], [], []
     opt_cost_list, regret_list = [], []
     train_true_list, train_vhat_list, test_vhat_list, train_r2_list = [], [], [], []
 
     # 追加リスト
     r2_sklearn_list, tr_r2_sklearn_list = [], []
     mse_list, tr_mse_list = [], []
-    pve_list, tr_pve_list = [], []
     best_cost_opt_list, tr_best_cost_opt_list = [], []
     decision_error_test_list, decision_error_train_list = [], []
     solver_status_list, solver_term_list = [], []
@@ -685,6 +718,8 @@ def main():
     returns_train_list, std_return_train_list, sharpe_train_list = [], [], []
     gurobi_gap_list = []
     theta_records: List[np.ndarray] = []
+    avg_weight_test_records: List[np.ndarray] = []
+    avg_weight_train_records: List[np.ndarray] = []
 
     print(f"=== Start: model={model_key}, solver={solver_name} ===")
     print(f"N={N}, d={d}, snr={snr}, rho={rho}, sigma={sigma}, res={res}, delta={delta}, runs={runs}, lambda_theta={lambda_theta}")
@@ -702,21 +737,22 @@ def main():
         s = int(seed0 + trials)
         trials += 1
         try:
-            (mc_true, r2_corr, Te, fr,
-             tr_true, tr_vhat, te_vhat, rt,
-             tr_r2_corr,
-             r2_skl, tr_r2_skl,
-             mse, tr_mse,
-             pve, tr_pve,
-             best_cost_opt, tr_best_cost_opt,
-             dec_err_test, dec_err_train, theta_vec,
-             solver_status, solver_term, solver_time, solver_message, theta_source_run,
-             budget_violation, nonneg_violation,
-             stationarity_violation, complementarity_violation,
-             strong_duality_violation,
-             mean_return_test, std_return_test, sharpe_test,
-             mean_return_train, std_return_train, sharpe_train,
-             gurobi_gap) = run_once(
+            (
+                mc_true, r2_corr, Te,
+                tr_true, tr_vhat, te_vhat, rt,
+                tr_r2_corr,
+                r2_skl, tr_r2_skl,
+                mse, tr_mse,
+                best_cost_opt, tr_best_cost_opt,
+                dec_err_test, dec_err_train, theta_vec,
+                solver_status, solver_term, solver_time, solver_message, theta_source_run,
+                budget_violation, nonneg_violation,
+                stationarity_violation, complementarity_violation,
+                strong_duality_violation,
+                mean_return_test, std_return_test, sharpe_test,
+                mean_return_train, std_return_train, sharpe_train,
+                gurobi_gap, avg_weight_test_vec, avg_weight_train_vec,
+            ) = run_once(
                 model_key=model_key,
                 solver_spec=solver_spec,
                 seed=s,
@@ -755,13 +791,12 @@ def main():
         if np.isfinite(mc_true) and np.isfinite(best_cost_opt):
             regret_list.append(mc_true - best_cost_opt)
         r2_list.append(r2_corr)           # corr^2
-        Te_list.append(Te); fail_list.append(fr)
+        Te_list.append(Te)
         train_true_list.append(tr_true); train_vhat_list.append(tr_vhat); test_vhat_list.append(te_vhat)
         train_r2_list.append(tr_r2_corr); run_times.append(rt)
 
         r2_sklearn_list.append(r2_skl); tr_r2_sklearn_list.append(tr_r2_skl)
         mse_list.append(mse); tr_mse_list.append(tr_mse)
-        pve_list.append(pve); tr_pve_list.append(tr_pve)
         best_cost_opt_list.append(best_cost_opt); tr_best_cost_opt_list.append(tr_best_cost_opt)
         decision_error_test_list.append(dec_err_test); decision_error_train_list.append(dec_err_train)
         solver_status_list.append(solver_status)
@@ -782,18 +817,24 @@ def main():
         sharpe_train_list.append(sharpe_train)
         gurobi_gap_list.append(gurobi_gap)
         theta_records.append(np.asarray(theta_vec, dtype=float))
+        avg_weight_test_records.append(np.asarray(avg_weight_test_vec, dtype=float))
+        avg_weight_train_records.append(np.asarray(avg_weight_train_vec, dtype=float))
         successes += 1
 
         if (successes % max(1, log_every)) == 0:
-            print(f"[{successes}/{runs}] seed={s}  "
-                  f"cost_test_vtrue={mc_true:.6f} cost_train_vtrue={tr_true:.6f} mean_regret_test(%)={((mc_true - best_cost_opt) / abs(best_cost_opt) * 100) if np.isfinite(best_cost_opt) and abs(best_cost_opt) > 1e-12 else np.nan:.4f}% mean_regret_train(%)={((tr_true - tr_best_cost_opt) / abs(tr_best_cost_opt) * 100) if np.isfinite(tr_best_cost_opt) and abs(tr_best_cost_opt) > 1e-12 else np.nan:.4f}%  "
-                  f"corr2={r2_corr:.4f} R2={r2_skl:.4f} PVE={pve:.4f}  "
-                  f"train_corr2={tr_r2_corr:.4f} train_R2={tr_r2_skl:.4f} train_PVE={tr_pve:.4f} "
-                  f"mse={mse:.4e} train_mse={tr_mse:.4e} "
-                  f"opt_cost={best_cost_opt:.6f} dec_err={dec_err_test:.4f} "
-                  f"train_opt_cost={tr_best_cost_opt:.6f} train_dec_err={dec_err_train:.4f} "
-                  f"rows={Te} fail={fr:.2%} rt={rt:.2f}s "
-                  f"theta={np.array2string(np.asarray(theta_vec), precision=4, suppress_small=True)}")
+            print(
+                f"[{successes}/{runs}] seed={s}  "
+                f"cost_test_vtrue={mc_true:.6f} cost_train_vtrue={tr_true:.6f} "
+                f"mean_regret_test(%)={((mc_true - best_cost_opt) / abs(best_cost_opt) * 100) if np.isfinite(best_cost_opt) and abs(best_cost_opt) > 1e-12 else np.nan:.4f}% "
+                f"mean_regret_train(%)={((tr_true - tr_best_cost_opt) / abs(tr_best_cost_opt) * 100) if np.isfinite(tr_best_cost_opt) and abs(tr_best_cost_opt) > 1e-12 else np.nan:.4f}%  "
+                f"corr2={r2_corr:.4f} R2={r2_skl:.4f} "
+                f"train_corr2={tr_r2_corr:.4f} train_R2={tr_r2_skl:.4f} "
+                f"mse={mse:.4e} train_mse={tr_mse:.4e} "
+                f"opt_cost={best_cost_opt:.6f} dec_err={dec_err_test:.4f} "
+                f"train_opt_cost={tr_best_cost_opt:.6f} train_dec_err={dec_err_train:.4f} "
+                f"rows={Te} rt={rt:.2f}s "
+                f"theta={np.array2string(np.asarray(theta_vec), precision=4, suppress_small=True)}"
+            )
 
     total_elapsed = time.perf_counter() - T0
     print(f"\n[INFO] trials={trials}, successes={successes}, skipped={trials - successes}")
@@ -811,7 +852,6 @@ def main():
     # 追加
     r2sk_mean, r2sk_se, r2sk_ci, _ = summarize(np.array(r2_sklearn_list))
     mse_mean, mse_se, mse_ci, _     = summarize(np.array(mse_list))
-    pve_mean, pve_se, pve_ci, _     = summarize(np.array(pve_list))
 
     tr_true_mean, _, _, _ = summarize(np.array(train_true_list))
     tr_vhat_mean, _, _, _ = summarize(np.array(train_vhat_list))
@@ -820,7 +860,6 @@ def main():
 
     tr_r2sk_mean, _, _, _ = summarize(np.array(tr_r2_sklearn_list))
     tr_mse_mean, _, _, _  = summarize(np.array(tr_mse_list))
-    tr_pve_mean, _, _, _  = summarize(np.array(tr_pve_list))
     best_cost_mean, best_cost_se, best_cost_ci, _ = summarize(np.array(best_cost_opt_list))
     tr_best_cost_mean, tr_best_cost_se, tr_best_cost_ci, _ = summarize(np.array(tr_best_cost_opt_list))
     dec_err_mean, dec_err_se, dec_err_ci, _ = summarize(np.array(decision_error_test_list))
@@ -840,14 +879,12 @@ def main():
     print(f"  Mean corr^2 (test)         : {r2_mean:.6f} (SE {r2_se:.4f}, 95% CI [{r2_ci[0]:.4f}, {r2_ci[1]:.4f}], n={n_r2})")
     print(f"  Mean R^2 (test, sklearn)   : {r2sk_mean:.6f} (SE {r2sk_se:.4f}, 95% CI [{r2sk_ci[0]:.4f}, {r2sk_ci[1]:.4f}])")
     print(f"  Mean MSE (test)            : {mse_mean:.6e} (SE {mse_se:.2e}, 95% CI [{mse_ci[0]:.2e}, {mse_ci[1]:.2e}])")
-    print(f"  Mean PVE (test)            : {pve_mean:.6f} (SE {pve_se:.4f}, 95% CI [{pve_ci[0]:.4f}, {pve_ci[1]:.4f}])")
     print(f"  Optimal MVO Cost (test)    : {best_cost_mean:.6f} (SE {best_cost_se:.6f}, 95% CI [{best_cost_ci[0]:.6f}, {best_cost_ci[1]:.6f}])")
     print(f"  Mean Regret (test)         : {regret_mean:.6f} (SE {regret_se:.6f}, 95% CI [{regret_ci[0]:.6f}, {regret_ci[1]:.6f}], n={n_regret})")
     print(f"  Decision Error (test)      : {dec_err_mean:.6f} (SE {dec_err_se:.6f}, 95% CI [{dec_err_ci[0]:.6f}, {dec_err_ci[1]:.6f}])")
     print(f"  Mean corr^2 (train)        : {tr_r2_mean:.6f}")
     print(f"  Mean R^2 (train, sklearn)  : {tr_r2sk_mean:.6f}")
     print(f"  Mean MSE (train)           : {tr_mse_mean:.6e}")
-    print(f"  Mean PVE (train)           : {tr_pve_mean:.6f}")
     print(f"  Optimal MVO Cost (train)   : {tr_best_cost_mean:.6f}")
     print(f"  Decision Error (train)     : {tr_dec_err_mean:.6f}")
     print(f"  Train mean MVO (Vtrue)     : {tr_true_mean:.6f}")
@@ -862,23 +899,22 @@ def main():
         print(f"  Std Return (train)         : {std_return_train_mean:.6f}")
         print(f"  Sharpe Ratio (train)       : {sharpe_train_mean:.6f}")
     print(f"  Avg eval rows              : {np.nanmean(Te_list):.1f}")
-    print(f"  Avg fail rate              : {np.nanmean(fail_list)*100:.2f}%")
     print(f"  Total time                 : {total_elapsed:.2f} sec")
     print(f"  Avg/run time               : {np.nanmean(run_times):.2f} sec")
     if gurobi_gap_list:
         print(f"  Mean Gurobi MIP Gap        : {gurobi_gap_mean:.6f}")
 
     # ===== 保存 =====
-    outdir = Path(args.outdir)
-    day_dir = outdir / datetime.now().strftime("%Y%m%d")
+    save_root = outdir
+    day_dir = save_root / datetime.now().strftime("%Y%m%d")
     day_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     tag = (
-        f"{args.model}_{args.solver}"
-        f"_N{args.N}_d{args.d}_res{args.res}"
-        f"_snr{args.snr}_rho{args.rho}_sigma{args.sigma}"
-        f"_delta{args.delta}_{ts}"
+        f"{model_key}_{solver_name}"
+        f"_N{N}_d{d}_res{res}"
+        f"_snr{snr}_rho{rho}_sigma{sigma}"
+        f"_delta{delta}_{ts}"
         f"_lambda{lambda_theta}"
         f"_runs{successes}"
 
@@ -886,10 +922,42 @@ def main():
     base = day_dir / tag
 
     # 1) per-run（成功シードのみ）
+    def vector_to_string(vec: Optional[np.ndarray]) -> str:
+        if vec is None:
+            return ""
+        arr = np.asarray(vec, dtype=float).reshape(-1)
+        if arr.size == 0:
+            return ""
+        return np.array2string(arr, precision=6, separator=",")
+
+    def compute_vector_mean(vectors: List[np.ndarray]) -> Optional[np.ndarray]:
+        if not vectors:
+            return None
+        filtered: List[np.ndarray] = []
+        ref_len: Optional[int] = None
+        for vec in vectors:
+            if vec is None:
+                continue
+            arr = np.asarray(vec, dtype=float).reshape(-1)
+            if arr.size == 0:
+                continue
+            if ref_len is None:
+                ref_len = arr.size
+            if arr.size != ref_len:
+                continue
+            filtered.append(arr)
+        if not filtered:
+            return None
+        with np.errstate(invalid="ignore"):
+            mean_vec = np.nanmean(np.vstack(filtered), axis=0)
+        return mean_vec
+
     theta_strings = [
         np.array2string(theta_vec, precision=6, separator=",")
         for theta_vec in theta_records
     ]
+    avg_weight_test_strings = [vector_to_string(vec) for vec in avg_weight_test_records]
+    avg_weight_train_strings = [vector_to_string(vec) for vec in avg_weight_train_records]
 
     run_df = pd.DataFrame({
         "seed": list(map(int, seeds_kept)),
@@ -904,16 +972,15 @@ def main():
         "mean_r2_train":        tr_r2_sklearn_list,
         "mse_test":             mse_list,
         "mse_train":            tr_mse_list,
-        "pve_test":             pve_list,
-        "pve_train":            tr_pve_list,
         "regret_test":          regret_list,
         "eval_rows":            Te_list,
-        "fail_rate":            fail_list,
         "runtime_sec":          run_times,
         "optimal_cost_train_vtrue": tr_best_cost_opt_list,
         "decision_error_test":   decision_error_test_list,
         "decision_error_train":  decision_error_train_list,
         "theta":                 theta_strings,
+        "avg_weight_test":       avg_weight_test_strings,
+        "avg_weight_train":      avg_weight_train_strings,
         "solver_status":         solver_status_list,
         "solver_termination":    solver_term_list,
         "solver_time":           solver_time_list,
@@ -938,10 +1005,10 @@ def main():
     # 2) summary
     summary_row = {
         "timestamp": ts,
-        "model": args.model,
-        "solver": args.solver,
-        "N": args.N, "d": args.d, "snr": args.snr, "rho": args.rho, "sigma": args.sigma,
-        "res": args.res, "delta": args.delta, "runs": int(successes),
+        "model": model_key,
+        "solver": solver_name,
+        "N": N, "d": d, "snr": snr, "rho": rho, "sigma": sigma,
+        "res": res, "delta": delta, "runs": int(successes),
         "mean_cost_test_vtrue": float(cost_mean),
         "mean_cost_test_vtrue_se": float(cost_se),
         "mean_cost_test_vtrue_ci_lo": float(cost_ci[0]),
@@ -984,13 +1051,6 @@ def main():
         "mse_test_ci_lo": float(mse_ci[0]),
         "mse_test_ci_hi": float(mse_ci[1]),
         "mse_train": float(tr_mse_mean),
-
-        # PVE（新規）
-        "pve_test": float(pve_mean),
-        "pve_test_se": float(pve_se),
-        "pve_test_ci_lo": float(pve_ci[0]),
-        "pve_test_ci_hi": float(pve_ci[1]),
-        "pve_train": float(tr_pve_mean),
 
         # Optimal costs & decision error（新規）
         "optimal_cost_test_vtrue": float(best_cost_mean),
@@ -1040,7 +1100,6 @@ def main():
 
         # 既存の運用系メタ情報
         "avg_eval_T": float(np.nanmean(Te_list)),
-        "avg_fail_rate": float(np.nanmean(fail_list)),
         "total_time_sec": float(total_elapsed),
         "avg_time_per_run_sec": float(np.nanmean(run_times)),
         "n_cost": int(n_cost),
@@ -1049,6 +1108,9 @@ def main():
         "trials": int(trials),
         "skipped": int(trials - successes),
     })
+
+    summary_row["avg_weight_test"] = vector_to_string(compute_vector_mean(avg_weight_test_records))
+    summary_row["avg_weight_train"] = vector_to_string(compute_vector_mean(avg_weight_train_records))
 
     if theta_records:
         theta_mean_vec = np.mean(np.vstack(theta_records), axis=0)
@@ -1065,51 +1127,78 @@ def main():
     header_needed = not log_path.exists()
     summary_df.to_csv(log_path, mode="a", header=header_needed, index=False)
 
+    if auto_baseline and theta_fixed_vec is None and model_key in {"flex", "dual", "kkt"}:
+        baselines = [("ols", "analytic"), ("ipo", "analytic")]
+        script_path = Path(__file__).resolve()
+        for base_model, base_solver in baselines:
+            cmd = [sys.executable, str(script_path),
+                   "--model", base_model,
+                   "--solver", base_solver,
+                   "--N", str(N),
+                   "--d", str(d),
+                   "--snr", str(snr),
+                   "--rho", str(rho),
+                   "--sigma", str(sigma),
+                   "--res", str(res),
+                   "--delta", str(delta),
+                   "--runs", str(runs),
+                   "--seed0", str(seed0),
+                   "--outdir", str(save_root),
+                   "--log-every", str(log_every),
+                   "--lambda-theta", str(lambda_theta),
+                   "--no-auto-baseline"]
+
+            if tee:
+                cmd.append("--tee")
+            if args.no_plots:
+                cmd.append("--no-plots")
+            if use_true_cov:
+                cmd.append("--use-true-cov")
+            if getattr(args, "allow_gurobi_partial", False):
+                cmd.append("--allow-gurobi-partial")
+            if getattr(args, "gurobi_max_gap", None) is not None:
+                cmd.extend(["--gurobi-max-gap", str(args.gurobi_max_gap)])
+
+            print(f"[AUTO] Running baseline model={base_model} solver={base_solver}")
+            subprocess.run(cmd, check=False)
+
     print("\n[Saved]")
     print(f"  per-run CSV : {run_csv}")
     print(f"  summary CSV : {summary_csv}")
     print(f"  summary log : {log_path}")
     if not args.no_plots:
-        print(f"  plots       : {outdir}/{tag}_*.png")
+        print(f"  plots       : {save_root}/{tag}_*.png")
 
 
 if __name__ == "__main__":
     main()
 
 
-# # 例1: KKT × Knitro（ログ表示）
-# cd ~/VScode/GraduationResearch
-# python DFL_Portfolio_Optimization2/experiments/run.py \
-#     --model kkt \
-#     --solver knitro \
-#     --tee \
-#     --N 2000 \
-#     --d 10 \
-#     --res 50 \
-#     --snr 0.01 \
-#     --rho 0.5 \
-#     --sigma 0.0125 \
-#     --delta 1.0 \
-#     --lambda 0.0 \
-#     --runs 10 \
-#     --seed0 100 \
-#     --outdir results/exp_unified \
-#     --log-every 1
+"""
+python GraduationResearch/DFL_Portfolio_Optimization2/experiments/run.py \
+  --model flex \
+  --solver knitro \
+  --N 50 \
+  --d 3 \
+  --snr 0.01 \
+  --rho 0.5 \
+  --sigma 0.0125 \
+  --res 0 \
+  --delta 1.0 \
+  --runs 5 \
+  --seed0 100 \
+  --use-true-cov \
+  --flex-formulation dual \
+  --flex-lambda-theta-anchor 0.0 \
+  --flex-lambda-theta-anchor-l1 0.0 \
+  --flex-lambda-theta-iso 0.0 \
+  --flex-lambda-w-anchor 0.0 \
+  --flex-lambda-w-anchor-l1 0.0 \
+  --flex-lambda-w-iso 0.0 \
+  --flex-theta-anchor-mode none \
+  --flex-w-anchor-mode none \
+  --lambda-theta 0.0 \
+  --outdir /Users/kensei/VScode/GraduationResearch/results/exp_flex_test \
+  --tee
 
-
-	# •	--model kkt → モデル選択（kkt or dual）
-	# •	--solver knitro → ソルバー選択（gurobi, ipopt, knitro）
-	# •	--tee → ソルバーのログをそのまま表示
-	# •	--N 2000 → サンプル数
-	# •	--d 10 → 資産数
-	# •	--res 50 → ローリング共分散のウィンドウサイズ（burn-inにも反映）
-	# •	--snr 0.01 → SNR
-	# •	--rho 0.5 → 相関係数
-	# •	--sigma 0.0125 → 各資産の標準偏差
-	# •	--delta 1.0 → リスク回避パラメータ
-	# •	--runs 10 → 繰り返し回数
-	# •	--seed0 100 → 乱数シードの開始値
-	# •	--outdir results/exp_unified → 保存先ディレクトリ
-	# •	--log-every 1 → 1試行ごとに途中ログを出力
-
-#test
+"""

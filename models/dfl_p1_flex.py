@@ -45,21 +45,33 @@ class SolverMeta:
     message: str | None
 
 
-def _solver_metadata(res, solver_name: str) -> SolverMeta:
+def _solver_metadata(opt, res, solver_name: str) -> dict:
+    """Extract minimal, run.py-compatible metadata from a Pyomo result object."""
     solver_info = getattr(res, "solver", None)
     term = getattr(solver_info, "termination_condition", None) if solver_info else None
     status = getattr(solver_info, "status", None) if solver_info else None
     solver_time = getattr(solver_info, "time", None) if solver_info else None
     message = getattr(solver_info, "message", None) if solver_info else None
-    return SolverMeta(
-        solver=solver_name,
-        termination_condition=term,
-        termination_condition_str=str(term) if term is not None else None,
-        status=status,
-        status_str=str(status) if status is not None else None,
-        solver_time=solver_time,
-        message=message,
-    )
+    meta = {
+        "solver": solver_name,
+        "termination_condition": term,
+        "termination_condition_str": str(term) if term is not None else None,
+        "status": status,
+        "status_str": str(status) if status is not None else None,
+        "solver_time": solver_time,
+        "message": message,
+    }
+    try:
+        if solver_name and str(solver_name).lower() == "gurobi":
+            solver_model = getattr(opt, "_solver_model", None)
+            if solver_model is not None:
+                meta["gurobi_obj_val"] = getattr(solver_model, "ObjVal", None)
+                meta["gurobi_obj_bound"] = getattr(solver_model, "ObjBound", None)
+                meta["gurobi_mip_gap"] = getattr(solver_model, "MIPGap", None)
+                meta["gurobi_runtime"] = getattr(solver_model, "Runtime", None)
+    except Exception:
+        pass
+    return meta
 
 
 def _prepare_pairs(
@@ -244,8 +256,6 @@ def fit_dfl_p1_flex(
             m.theta[j].value = 0.0
 
     w_init_mat: Optional[np.ndarray] = None
-    if theta_init_vec is not None and w_anchor_mat is not None:
-        w_init_mat = _align_matrix(w_anchor_mat, d, range(T_used), used_idx)
     if theta_init_vec is not None:
         try:
             yhat_all = predict_yhat(X, theta_init_vec)
@@ -359,7 +369,7 @@ def fit_dfl_p1_flex(
 
     opt = make_pyomo_solver(m, solver=solver, tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
-    meta = _solver_metadata(res, solver)
+    meta = _solver_metadata(opt, res, solver)
 
     theta_hat = np.array([pyo.value(m.theta[j]) for j in m.J], dtype=float)
     W = np.array([[pyo.value(m.w[t, j]) for j in m.J] for t in m.T], dtype=float)
