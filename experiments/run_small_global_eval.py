@@ -140,8 +140,8 @@ class RunOutcome:
 
 
 DEFAULT_SOLVERS: Dict[str, str] = {
-    "dual": "gurobi",
-    "kkt": "gurobi",
+    "dual": "knitro",
+    "kkt": "knitro",
     "ols": "analytic",
     "ipo": "analytic",
     "ensemble_avg": "analytic",

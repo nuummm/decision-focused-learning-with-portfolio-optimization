@@ -11,13 +11,11 @@ DFL-P1（ベースラインの dual 版と KKT 版）に対して、
 * θ のアンカー正則化:          例) θ を OLS 解に寄せる  (lambda_theta_anchor)
 * w のアンカー正則化:          例) w を OLS の w に寄せる (lambda_w_anchor)
 * w の等方 L2^2 正則化:        例) ||w||_2^2 で安定化     (lambda_w_iso)
-* DRO (L2-ball) 拡張:           例) sup_{||Δ||<=ρ} ( ... )   (dro_rho)
-
 各 λ(ラグランジュ係数) や ρ を 0 に設定すれば、その機能は無効化される。
 
 備考
 ----
-* 既存コード (dfl_p1_dual.py, dfl_p1_dual_reg.py, dfl_p1_dual_dro.py,
+* 既存コード (dfl_p1_dual.py, dfl_p1_dual_reg.py,
   dfl_p1_kkt.py) のロジックを統合したもの。
 * `formulation='dual'` を選べば強双対形式、`'kkt'` を選べば KKT 制約(補完条件)を使用。
 * 返り値は既存関数と揃えて `(theta_hat, W, MU, LAM, used_idx, meta)`。
@@ -26,12 +24,14 @@ DFL-P1（ベースラインの dual 版と KKT 版）に対して、
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, List, Union
+from typing import Optional, Sequence, Tuple, List
 
 import numpy as np
 import pyomo.environ as pyo
 
 from optimization.solvers import make_pyomo_solver
+from models.ols import train_ols, predict_yhat
+from models.ols_gurobi import solve_series_mvo_gurobi
 
 
 @dataclass
@@ -103,20 +103,6 @@ def _align_matrix(
     )
 
 
-def _make_rho_vector(rho: Union[float, Sequence[float]], length: int) -> np.ndarray:
-    if np.isscalar(rho):
-        val = float(rho)
-        if val < 0:
-            raise ValueError("rho must be non-negative")
-        return val * np.ones(length, dtype=float)
-    vec = np.asarray(rho, float).reshape(-1)
-    if (vec < 0).any():
-        raise ValueError("rho must be non-negative")
-    if vec.size != length:
-        raise ValueError(f"rho length mismatch: expected {length}, got {vec.size}")
-    return vec
-
-
 def fit_dfl_p1_flex(
     X: np.ndarray,
     Y: np.ndarray,
@@ -131,15 +117,15 @@ def fit_dfl_p1_flex(
     solver: str = "gurobi",
     solver_options: Optional[dict] = None,
     tee: bool = False,
-    theta_bounds: Tuple[float, float] = (-1000.0, 1000.0),
     # regularisation knobs
     lambda_theta_anchor: float = 0.0,
     theta_anchor: Optional[Sequence[float]] = None,
+    lambda_theta_anchor_l1: float = 0.0,
+    lambda_theta_iso: float = 0.0,
     lambda_w_anchor: float = 0.0,
+    lambda_w_anchor_l1: float = 0.0,
     w_anchor: Optional[np.ndarray] = None,
     lambda_w_iso: float = 0.0,
-    # DRO radius (0 disables)
-    dro_rho: Union[float, Sequence[float]] = 0.0,
 ):
     """
     DFL-P1 の柔軟な学習ルーチン。
@@ -155,20 +141,19 @@ def fit_dfl_p1_flex(
         θ の初期値 (OLS 解など)。None の場合は 0 初期化。
     solver, solver_options, tee :
         Pyomo のソルバー指定。既存の make_pyomo_solver に委譲。
-    theta_bounds :
-        θ の箱型制約 (デフォルト [-10,10])
 
     lambda_theta_anchor, theta_anchor :
         θ をアンカーに寄せる L2^2 正則化。
         0 なら無効。θ_anchor (d 次元) が必要。
-    lambda_w_anchor, w_anchor :
-        w をアンカーに寄せる L2^2 正則化。
+    lambda_theta_anchor_l1 :
+        θ とアンカーの L1 正則化（非ゼロで補助変数を導入）。
+    lambda_theta_iso :
+        θ の等方 L2^2 正則化 (||θ||_2^2)。
+    lambda_w_anchor, lambda_w_anchor_l1, w_anchor :
+        w をアンカーに寄せる L2^2 / L1 正則化。
         w_anchor は (T_used×d) もしくは全 idx の長さに対応。
     lambda_w_iso :
         w の等方的 L2^2 正則化 (||w||_2^2)。安定化目的。
-    dro_rho :
-        L2-ball DRO の半径。0 なら無効。
-        scalar か T_used 長の配列を許容。
 
     Returns
     -------
@@ -191,26 +176,27 @@ def fit_dfl_p1_flex(
     used_idx, V_list = _prepare_pairs(idx, Vhats, start_index, end_index)
     T_used = len(used_idx)
 
-    theta_lb, theta_ub = float(theta_bounds[0]), float(theta_bounds[1])
-
     # --- θアンカー正則化の準備 ---
-    lam_theta = float(lambda_theta_anchor)
+    lam_theta_l2 = float(lambda_theta_anchor)
+    lam_theta_l1 = float(lambda_theta_anchor_l1)
+    lam_theta_iso = float(lambda_theta_iso)
     theta_anchor_vec = None
-    if lam_theta > 0.0:
+    if lam_theta_l2 > 0.0 or lam_theta_l1 > 0.0:
         if theta_anchor is None:
-            raise ValueError("theta_anchor required when lambda_theta_anchor > 0")
+            raise ValueError("theta_anchor required when lambda_theta_anchor or lambda_theta_anchor_l1 > 0")
         theta_anchor_vec = np.asarray(theta_anchor, float).reshape(-1)
         if theta_anchor_vec.shape[0] != d:
             raise ValueError("theta_anchor must have length d")
 
     # --- wアンカー正則化の準備 ---
-    lam_w = float(lambda_w_anchor)
-    w_anchor_mat = _align_matrix(w_anchor, d, used_idx, idx) if lam_w > 0 else None
+    lam_w_l2 = float(lambda_w_anchor)
+    lam_w_l1 = float(lambda_w_anchor_l1)
+    w_anchor_mat = None
+    if lam_w_l2 > 0.0 or lam_w_l1 > 0.0:
+        w_anchor_mat = _align_matrix(w_anchor, d, used_idx, idx)
 
     # --- w 等方正則化 / DRO の準備 ---
     lam_w_iso = float(lambda_w_iso)
-    rho_vec = _make_rho_vector(dro_rho, T_used) if (np.asarray(dro_rho).any()) else None
-
     # ---------------------------------------------------------
     # Build Pyomo model
     # ---------------------------------------------------------
@@ -226,34 +212,64 @@ def fit_dfl_p1_flex(
     m.x = pyo.Param(m.T, m.J, initialize=x_ini)
     m.y = pyo.Param(m.T, m.J, initialize=y_ini)
     m.V = pyo.Param(m.T, m.J, m.J, initialize=V_ini)
-    if rho_vec is not None:
-        def rho_ini(m, t): return float(rho_vec[int(t)])
-        m.rho = pyo.Param(m.T, initialize=rho_ini)
-
-    m.theta = pyo.Var(m.J, bounds=(theta_lb, theta_ub))
+    m.theta = pyo.Var(m.J)
     m.w = pyo.Var(m.T, m.J, domain=pyo.NonNegativeReals)
     m.lam = pyo.Var(m.T, m.J, domain=pyo.NonNegativeReals)
+    if lam_theta_l1 > 0.0 and theta_anchor_vec is not None:
+        m.theta_dev = pyo.Var(m.J, domain=pyo.NonNegativeReals)
+    if lam_w_l1 > 0.0 and w_anchor_mat is not None:
+        m.w_dev = pyo.Var(m.T, m.J, domain=pyo.NonNegativeReals)
     m.mu = pyo.Var(m.T)
-    if rho_vec is not None:
-        m.s = pyo.Var(m.T, domain=pyo.NonNegativeReals)
 
+    theta_init_vec: Optional[np.ndarray] = None
+    theta_init_source = "none"
     if theta_init is not None:
-        init_vec = np.asarray(theta_init, float).reshape(-1)
-        if init_vec.shape[0] != d:
+        if isinstance(theta_init, str):
+            key = theta_init.lower().strip()
+            if key == "ols":
+                theta_init_vec = train_ols(X, Y)
+                theta_init_source = "ols"
+            else:
+                raise ValueError(f"Unsupported theta_init option: {theta_init}")
+        else:
+            theta_init_vec = np.asarray(theta_init, float).reshape(-1)
+            theta_init_source = "provided"
+
+        if theta_init_vec.shape[0] != d:
             raise ValueError("theta_init must have length d")
         for j in m.J:
-            m.theta[j].value = float(init_vec[int(j)])
+            m.theta[j].value = float(theta_init_vec[int(j)])
     else:
         for j in m.J:
             m.theta[j].value = 0.0
 
+    w_init_mat: Optional[np.ndarray] = None
+    if theta_init_vec is not None and w_anchor_mat is not None:
+        w_init_mat = _align_matrix(w_anchor_mat, d, range(T_used), used_idx)
+    if theta_init_vec is not None:
+        try:
+            yhat_all = predict_yhat(X, theta_init_vec)
+            w_init_candidate = solve_series_mvo_gurobi(
+                Yhat_all=yhat_all,
+                Vhats=V_list,
+                idx=used_idx,
+                delta=delta,
+                psd_eps=1e-12,
+                output=False,
+            )
+            if w_init_candidate.shape == (T_used, d) and np.all(np.isfinite(w_init_candidate)):
+                w_init_mat = w_init_candidate
+        except Exception:
+            w_init_mat = None
+
     for t in m.T:
         for j in m.J:
-            m.w[t, j].value = 1.0 / d
+            if w_init_mat is not None:
+                m.w[t, j].value = float(w_init_mat[int(t), int(j)])
+            else:
+                m.w[t, j].value = 1.0 / d
             m.lam[t, j].value = 0.0
         m.mu[t].value = 0.0
-        if rho_vec is not None:
-            m.s[t].value = 1.0
 
     def budget(m, t):
         return sum(m.w[t, j] for j in m.J) == 1.0
@@ -267,7 +283,7 @@ def fit_dfl_p1_flex(
     def strong_duality(m, t):
         quad = sum(m.w[t, j] * sum(m.V[t, j, k] * m.w[t, k] for k in m.J) for j in m.J)
         yhat_dot_w = sum(m.x[t, j] * m.theta[j] * m.w[t, j] for j in m.J)
-        return m.delta * quad - yhat_dot_w <= m.mu[t]
+        return m.delta * quad - yhat_dot_w == m.mu[t]
 
     def stationarity(m, t, j):
         yhat = m.x[t, j] * m.theta[j]
@@ -284,11 +300,6 @@ def fit_dfl_p1_flex(
         m.stationarity = pyo.Constraint(m.T, m.J, rule=stationarity)
         m.comp = pyo.Constraint(m.T, m.J, rule=complementarity)
 
-    if rho_vec is not None:
-        def soc(m, t):
-            return sum(m.w[t, j] ** 2 for j in m.J) <= m.s[t] ** 2
-        m.soc = pyo.Constraint(m.T, rule=soc)
-
     # Objective
     def obj_rule(m):
         total = 0.0
@@ -296,16 +307,24 @@ def fit_dfl_p1_flex(
             lin = sum(m.y[t, j] * m.w[t, j] for j in m.J)
             quad = sum(m.w[t, j] * sum(m.V[t, j, k] * m.w[t, k] for k in m.J) for j in m.J)
             total += -lin + 0.5 * m.delta * quad
-            if rho_vec is not None:
-                total += m.rho[t] * m.s[t]
         total = total / float(T_used)
 
-        if lam_theta > 0.0 and theta_anchor_vec is not None:
-            total += 0.5 * lam_theta * sum((m.theta[j] - float(theta_anchor_vec[int(j)])) ** 2 for j in m.J)
+        if lam_theta_l2 > 0.0 and theta_anchor_vec is not None:
+            total += 0.5 * lam_theta_l2 * sum((m.theta[j] - float(theta_anchor_vec[int(j)])) ** 2 for j in m.J)
+        if lam_theta_l1 > 0.0 and theta_anchor_vec is not None:
+            total += lam_theta_l1 * sum(m.theta_dev[j] for j in m.J)
 
-        if lam_w > 0.0 and w_anchor_mat is not None:
-            total += (lam_w / (2.0 * float(T_used))) * sum(
+        if lam_theta_iso > 0.0:
+            total += 0.5 * lam_theta_iso * sum(m.theta[j] ** 2 for j in m.J)
+
+        if lam_w_l2 > 0.0 and w_anchor_mat is not None:
+            total += (lam_w_l2 / (2.0 * float(T_used))) * sum(
                 sum((m.w[t, j] - float(w_anchor_mat[int(t), int(j)])) ** 2 for j in m.J)
+                for t in m.T
+            )
+        if lam_w_l1 > 0.0 and w_anchor_mat is not None:
+            total += (lam_w_l1 / float(T_used)) * sum(
+                sum(m.w_dev[t, j] for j in m.J)
                 for t in m.T
             )
 
@@ -317,6 +336,26 @@ def fit_dfl_p1_flex(
         return total
 
     m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+
+    if lam_theta_l1 > 0.0 and theta_anchor_vec is not None:
+        def theta_dev_pos(m, j):
+            return m.theta_dev[j] >= m.theta[j] - float(theta_anchor_vec[int(j)])
+
+        def theta_dev_neg(m, j):
+            return m.theta_dev[j] >= -(m.theta[j] - float(theta_anchor_vec[int(j)]))
+
+        m.theta_dev_pos = pyo.Constraint(m.J, rule=theta_dev_pos)
+        m.theta_dev_neg = pyo.Constraint(m.J, rule=theta_dev_neg)
+
+    if lam_w_l1 > 0.0 and w_anchor_mat is not None:
+        def w_dev_pos(m, t, j):
+            return m.w_dev[t, j] >= m.w[t, j] - float(w_anchor_mat[int(t), int(j)])
+
+        def w_dev_neg(m, t, j):
+            return m.w_dev[t, j] >= -(m.w[t, j] - float(w_anchor_mat[int(t), int(j)]))
+
+        m.w_dev_pos = pyo.Constraint(m.T, m.J, rule=w_dev_pos)
+        m.w_dev_neg = pyo.Constraint(m.T, m.J, rule=w_dev_neg)
 
     opt = make_pyomo_solver(m, solver=solver, tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
