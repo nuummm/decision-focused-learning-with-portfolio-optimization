@@ -144,7 +144,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--flex-solver",
         type=str,
         default="gurobi",
-        help="Solver to use for the flex model when enabled.",
+        help="Comma-separated list of solvers for flex (e.g., 'gurobi,knitro').",
     )
     parser.add_argument(
         "--flex-formulation",
@@ -567,17 +567,34 @@ def base_model_key(model_key: str) -> str:
 
 def flex_variant_form(model_key: str, args: argparse.Namespace) -> str:
     if model_key.startswith("flex:"):
-        _, form = model_key.split(":", 1)
-        return form.strip().lower() or "dual"
+        parts = model_key.split(":")
+        if len(parts) >= 3:
+            return parts[2].strip().lower() or "dual"
+        if len(parts) == 2:
+            return parts[1].strip().lower() or "dual"
     value = str(getattr(args, "flex_formulation", "dual") or "dual")
     return value.strip().lower() or "dual"
+
+
+def flex_solver_from_key(model_key: str, args: argparse.Namespace) -> str:
+    if model_key.startswith("flex:"):
+        parts = model_key.split(":")
+        if len(parts) >= 3:
+            return parts[1].strip() or DEFAULT_SOLVERS.get("flex", "gurobi")
+        if len(parts) == 2:
+            return DEFAULT_SOLVERS.get("flex", "gurobi")
+    solvers = getattr(args, "_flex_solvers", None)
+    if solvers:
+        return str(solvers[0])
+    return DEFAULT_SOLVERS.get("flex", "gurobi")
 
 
 def model_display_name(model_key: str, args: argparse.Namespace) -> str:
     base = base_model_key(model_key)
     if base == "flex":
         formulation = flex_variant_form(model_key, args)
-        return f"{formulation}(flex)"
+        solver = flex_solver_from_key(model_key, args)
+        return f"{formulation}(flex,{solver})"
     return model_key
 
 
@@ -634,6 +651,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         enabled_solvers.pop("kkt", None)
     flex_variant_keys: List[str] = []
     flex_forms: List[str] = []
+    flex_solvers: List[str] = []
     if args.enable_flex:
         raw_spec = str(getattr(args, "flex_formulation", "dual") or "dual")
         flex_forms = comma_split(raw_spec)
@@ -644,14 +662,23 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         flex_forms = list(dict.fromkeys(flex_forms))
         if not flex_forms:
             flex_forms = ["dual"]
+        raw_solver_spec = str(getattr(args, "flex_solver", "gurobi") or "gurobi")
+        flex_solvers = comma_split(raw_solver_spec)
+        if not flex_solvers:
+            cleaned_solver = raw_solver_spec.strip().lower()
+            flex_solvers = [cleaned_solver] if cleaned_solver else [DEFAULT_SOLVERS.get("flex", "gurobi")]
+        flex_solvers = list(dict.fromkeys(flex_solvers)) or [DEFAULT_SOLVERS.get("flex", "gurobi")]
         enabled_solvers.pop("flex", None)
-        for form in flex_forms:
-            key = f"flex:{form}"
-            flex_variant_keys.append(key)
-            enabled_solvers[key] = str(args.flex_solver or "gurobi")
+        for solver_name in flex_solvers:
+            solver_clean = solver_name.strip() or DEFAULT_SOLVERS.get("flex", "gurobi")
+            for form in flex_forms:
+                key = f"flex:{solver_clean}:{form}"
+                flex_variant_keys.append(key)
+                enabled_solvers[key] = solver_clean
     else:
         enabled_solvers.pop("flex", None)
     setattr(args, "_flex_forms", flex_forms)
+    setattr(args, "_flex_solvers", flex_solvers)
     ensemble_keys = ["ensemble_avg", "ensemble_weighted", "ensemble_normalized"]
     if args.no_ensemble:
         for key in ensemble_keys:
