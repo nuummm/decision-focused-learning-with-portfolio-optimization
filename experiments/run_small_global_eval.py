@@ -200,6 +200,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="ols",
         help="Automatic weight anchor selection strategy for flex (e.g., ols).",
     )
+    parser.add_argument(
+        "--flex-theta-init-mode",
+        type=str,
+        default="ols",
+        help="Initial theta strategy for flex (choices: none, ols).",
+    )
     return parser.parse_args(argv)
 
 
@@ -311,6 +317,8 @@ def build_cmd(
                 str(getattr(args, "flex_theta_anchor_mode", "none")).lower(),
                 "--flex-w-anchor-mode",
                 str(getattr(args, "flex_w_anchor_mode", "ols")).lower(),
+                "--flex-theta-init-mode",
+                str(getattr(args, "flex_theta_init_mode", "ols")).lower(),
             ]
         )
     if args.no_plots:
@@ -912,7 +920,7 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --runs 1 \
   --seed0 200 \
   --enable-flex \
-  --flex-solver gurobi \
+  --flex-solver ipopt \
   --flex-formulation 'kkt,dual' \
   --flex-lambda-theta-anchor 0.0 \
   --flex-lambda-w-anchor 0.0 \
@@ -922,6 +930,8 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --flex-w-anchor-mode ols \
   --no-ensemble \
   --disable-dual \
-  --disable-kkt
+  --disable-kkt \
+  --tee \
+  --flex-theta-init-mode ols
 
 '''

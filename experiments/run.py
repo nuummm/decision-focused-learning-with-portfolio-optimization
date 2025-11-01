@@ -58,6 +58,7 @@ def run_once(
     theta_fixed: Optional[np.ndarray] = None,
     allow_gurobi_partial: bool = False,
     gurobi_max_gap: Optional[float] = None,
+    flex_theta_init_mode: str = "ols",
 ) -> Tuple[Any, ...]:
 
     # ----- データ生成 -----
@@ -138,7 +139,20 @@ def run_once(
         info["message"] = "evaluation_only"
     else:
         # ----- OLS 初期値（train 全体で学習）-----
-        theta_init = train_ols(X_tr, Y_tr)
+        theta_init_ols = np.asarray(train_ols(X_tr, Y_tr), dtype=float)
+        theta_init = theta_init_ols.copy()
+        if model_key == "flex":
+            flex_mode = (flex_theta_init_mode or "ols").lower()
+            if flex_mode == "ols":
+                print(f"[INFO] flex theta_init_mode=ols -> using OLS warm-start (solver={solver_spec.name})")
+                theta_init = theta_init_ols.copy()
+            elif flex_mode == "none":
+                print(f"[INFO] flex theta_init_mode=none -> no warm-start applied (solver={solver_spec.name})")
+                theta_init = None
+            else:
+                raise ValueError(f"Unsupported flex theta_init_mode: {flex_mode}")
+        else:
+            theta_init = theta_init_ols.copy()
 
         # ----- 学習（KKT / DUAL） -----
         trainer = get_trainer(model_key, solver_spec)
@@ -156,7 +170,7 @@ def run_once(
             theta_anchor_mode = flex_kwargs.pop("theta_anchor_mode", "none").lower()
             w_anchor_mode = flex_kwargs.pop("w_anchor_mode", "ols").lower()
 
-            theta_init_vec = np.asarray(theta_init, float)
+            theta_init_vec = theta_init_ols
             if "theta_anchor" not in flex_kwargs:
                 if theta_anchor_mode == "ols":
                     flex_kwargs["theta_anchor"] = theta_init_vec
@@ -602,6 +616,8 @@ def main():
                    help='Theta anchor source (e.g. "ols" or "none").')
     p.add_argument("--flex-w-anchor-mode", type=str, default="ols",
                    help='w anchor source (e.g. "ols" or "none").')
+    p.add_argument("--flex-theta-init-mode", type=str, default="ols",
+                   help='Theta initialisation for flex ("none" or "ols").')
 
     args = p.parse_args()
     auto_baseline = not args.no_auto_baseline
@@ -765,6 +781,7 @@ def main():
                 theta_fixed=theta_fixed_vec,
                 allow_gurobi_partial=args.allow_gurobi_partial,
                 gurobi_max_gap=args.gurobi_max_gap,
+                flex_theta_init_mode=getattr(args, "flex_theta_init_mode", "ols"),
             )
         except RuntimeError as e:
             msg = str(e)
