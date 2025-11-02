@@ -34,6 +34,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import product
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -58,6 +59,14 @@ RUNS_PATH_RE = re.compile(r"per-run CSV\s*:\s*(?P<path>.+)")
 def comma_split(text: str) -> List[str]:
     parts = [p.strip() for p in text.split(",") if p.strip()]
     return [p.lower() for p in parts]
+
+
+def float_list(text: str) -> List[float]:
+    items = [p.strip() for p in text.split(",") if p.strip()]
+    values: List[float] = []
+    for item in items:
+        values.append(float(item))
+    return values
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -154,9 +163,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--flex-lambda-theta-anchor",
-        type=float,
-        default=0.0,
-        help="Flex lambda for L2 anchoring on theta.",
+        type=str,
+        default="0.0",
+        help="Flex lambda for L2 anchoring on theta (comma-separated for multiple).",
     )
     parser.add_argument(
         "--flex-lambda-theta-anchor-l1",
@@ -166,15 +175,15 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--flex-lambda-theta-iso",
-        type=float,
-        default=0.0,
-        help="Flex lambda for isotropic L2 regularisation on theta.",
+        type=str,
+        default="0.0",
+        help="Flex lambda for isotropic L2 regularisation on theta (comma-separated for multiple).",
     )
     parser.add_argument(
         "--flex-lambda-w-anchor",
-        type=float,
-        default=0.0,
-        help="Flex lambda for L2 anchoring on portfolio weights.",
+        type=str,
+        default="0.0",
+        help="Flex lambda for L2 anchoring on portfolio weights (comma-separated for multiple).",
     )
     parser.add_argument(
         "--flex-lambda-w-anchor-l1",
@@ -184,27 +193,27 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--flex-lambda-w-iso",
-        type=float,
-        default=0.0,
-        help="Flex lambda for isotropic L2 regularisation on portfolio weights.",
+        type=str,
+        default="0.0",
+        help="Flex lambda for isotropic L2 regularisation on portfolio weights (comma-separated for multiple).",
     )
     parser.add_argument(
         "--flex-theta-anchor-mode",
         type=str,
         default="none",
-        help="Automatic theta anchor selection strategy for flex (e.g., none or ols).",
+        help="Automatic theta anchor selection strategy for flex (comma-separated: none, ols, ipo).",
     )
     parser.add_argument(
         "--flex-w-anchor-mode",
         type=str,
         default="ols",
-        help="Automatic weight anchor selection strategy for flex (e.g., ols).",
+        help="Automatic weight anchor selection strategy for flex (comma-separated: ols, ipo).",
     )
     parser.add_argument(
         "--flex-theta-init-mode",
         type=str,
         default="ols",
-        help="Initial theta strategy for flex (choices: none, ols).",
+        help="Initial theta strategy for flex (comma-separated: none, ols, ipo).",
     )
     return parser.parse_args(argv)
 
@@ -218,6 +227,73 @@ class RunOutcome:
     runs_csv: Path
     summary_row: Dict[str, str]
     run_row: Dict[str, str]
+
+
+@dataclass(frozen=True)
+class FlexConfig:
+    lambda_theta_anchor: float
+    lambda_w_anchor: float
+    lambda_theta_iso: float
+    lambda_w_iso: float
+    theta_anchor_mode: str
+    w_anchor_mode: str
+    theta_init_mode: str
+
+    def metadata_pairs(self) -> List[Tuple[str, str]]:
+        return [
+            ("lambda_theta_anchor", f"{self.lambda_theta_anchor:g}"),
+            ("lambda_w_anchor", f"{self.lambda_w_anchor:g}"),
+            ("lambda_theta_iso", f"{self.lambda_theta_iso:g}"),
+            ("lambda_w_iso", f"{self.lambda_w_iso:g}"),
+            ("theta_anchor_mode", self.theta_anchor_mode),
+            ("w_anchor_mode", self.w_anchor_mode),
+            ("theta_init_mode", self.theta_init_mode),
+        ]
+
+    def metadata_dict(self) -> Dict[str, str]:
+        return dict(self.metadata_pairs())
+
+    def key_suffix(self) -> str:
+        parts = []
+        for key, value in self.metadata_pairs():
+            if key == "lambda_theta_anchor":
+                parts.append(f"lambda={value}")
+            parts.append(f"{key}={value}")
+        return "|".join(parts)
+
+    def raw_dir_name(self, index: int) -> str:
+        def sanitize_token(text: str) -> str:
+            return text.replace("-", "m").replace(".", "p")
+
+        parts = [
+            f"lam{sanitize_token(f'{self.lambda_theta_anchor:g}')}",
+            f"lwa{sanitize_token(f'{self.lambda_w_anchor:g}')}",
+            f"lti{sanitize_token(f'{self.lambda_theta_iso:g}')}",
+            f"lwi{sanitize_token(f'{self.lambda_w_iso:g}')}",
+            f"tam_{self.theta_anchor_mode}",
+            f"wam_{self.w_anchor_mode}",
+            f"tim_{self.theta_init_mode}",
+        ]
+        return f"combo_{index:03d}_" + "_".join(parts)
+
+    def describe(self) -> str:
+        return ", ".join(f"{key}={value}" for key, value in self.metadata_pairs())
+
+
+def parse_float_choices(spec: object, default: float) -> List[float]:
+    text = str(spec).strip()
+    if not text:
+        return [default]
+    values = float_list(text)
+    return values if values else [default]
+
+
+def parse_str_choices(spec: object, default: str) -> List[str]:
+    text = str(spec or "").strip()
+    if not text:
+        return [default.lower()]
+    values = comma_split(text)
+    return values if values else [default.lower()]
 
 
 DEFAULT_SOLVERS: Dict[str, str] = {
@@ -250,6 +326,16 @@ SUMMARY_METRIC_MAP = {
     "sharpe_ratio_train": "sharpe_ratio_train",
 }
 
+FLEX_METADATA_KEYS = [
+    "lambda_theta_anchor",
+    "lambda_w_anchor",
+    "lambda_theta_iso",
+    "lambda_w_iso",
+    "theta_anchor_mode",
+    "w_anchor_mode",
+    "theta_init_mode",
+]
+
 
 def build_cmd(
     model_key: str,
@@ -259,6 +345,7 @@ def build_cmd(
     seed: int,
     outdir: Path,
     fixed_theta: Optional[Path] = None,
+    flex_config: Optional[FlexConfig] = None,
 ) -> List[str]:
     base_model = base_model_key(model_key)
     cmd = [
@@ -297,28 +384,38 @@ def build_cmd(
         cmd.append("--no-auto-baseline")
     if base_model == "flex":
         flex_form = flex_variant_form(model_key, args)
+        if flex_config is None:
+            flex_config = FlexConfig(
+                lambda_theta_anchor=parse_float_choices(getattr(args, "flex_lambda_theta_anchor", "0"), 0.0)[0],
+                lambda_w_anchor=parse_float_choices(getattr(args, "flex_lambda_w_anchor", "0"), 0.0)[0],
+                lambda_theta_iso=parse_float_choices(getattr(args, "flex_lambda_theta_iso", "0"), 0.0)[0],
+                lambda_w_iso=parse_float_choices(getattr(args, "flex_lambda_w_iso", "0"), 0.0)[0],
+                theta_anchor_mode=parse_str_choices(getattr(args, "flex_theta_anchor_mode", "none"), "none")[0],
+                w_anchor_mode=parse_str_choices(getattr(args, "flex_w_anchor_mode", "ols"), "ols")[0],
+                theta_init_mode=parse_str_choices(getattr(args, "flex_theta_init_mode", "ols"), "ols")[0],
+            )
         cmd.extend(
             [
                 "--flex-formulation",
                 flex_form,
                 "--flex-lambda-theta-anchor",
-                str(getattr(args, "flex_lambda_theta_anchor", 0.0)),
+                str(flex_config.lambda_theta_anchor),
                 "--flex-lambda-theta-anchor-l1",
                 str(getattr(args, "flex_lambda_theta_anchor_l1", 0.0)),
                 "--flex-lambda-theta-iso",
-                str(getattr(args, "flex_lambda_theta_iso", 0.0)),
+                str(flex_config.lambda_theta_iso),
                 "--flex-lambda-w-anchor",
-                str(getattr(args, "flex_lambda_w_anchor", 0.0)),
+                str(flex_config.lambda_w_anchor),
                 "--flex-lambda-w-anchor-l1",
                 str(getattr(args, "flex_lambda_w_anchor_l1", 0.0)),
                 "--flex-lambda-w-iso",
-                str(getattr(args, "flex_lambda_w_iso", 0.0)),
+                str(flex_config.lambda_w_iso),
                 "--flex-theta-anchor-mode",
-                str(getattr(args, "flex_theta_anchor_mode", "none")).lower(),
+                str(flex_config.theta_anchor_mode).lower(),
                 "--flex-w-anchor-mode",
-                str(getattr(args, "flex_w_anchor_mode", "ols")).lower(),
+                str(flex_config.w_anchor_mode).lower(),
                 "--flex-theta-init-mode",
-                str(getattr(args, "flex_theta_init_mode", "ols")).lower(),
+                str(flex_config.theta_init_mode).lower(),
             ]
         )
     if args.no_plots:
@@ -368,13 +465,24 @@ def run_model(
     log_handle,
     keep_raw: bool,
     fixed_theta: Optional[Path] = None,
+    flex_config: Optional[FlexConfig] = None,
 ) -> RunOutcome:
-    cmd = build_cmd(model_key, solver, args, seed=seed, outdir=outdir, fixed_theta=fixed_theta)
+    cmd = build_cmd(
+        model_key,
+        solver,
+        args,
+        seed=seed,
+        outdir=outdir,
+        fixed_theta=fixed_theta,
+        flex_config=flex_config,
+    )
     if args.dryrun:
         print("[DRYRUN]", " ".join(cmd))
         raise SystemExit(0)
 
     display_model = model_display_name(model_key, args)
+    if flex_config is not None:
+        display_model = f"{display_model} [{flex_config.describe()}]"
     print(f"[INFO] Running {display_model} (key={model_key}) with solver={solver} seed={seed}")
 
     stdout_lines: List[str] = []
@@ -559,15 +667,46 @@ def average_theta(rows: List[Dict[str, str]]) -> str:
     return average_vector(rows, "theta")
 
 
-def base_model_key(model_key: str) -> str:
-    if model_key.startswith("flex:"):
-        return "flex"
+def strip_lambda_suffix(model_key: str) -> str:
+    if "|lambda=" in model_key:
+        return model_key.split("|lambda=", 1)[0]
     return model_key
 
 
+def model_key_metadata(model_key: str) -> Dict[str, str]:
+    if "|lambda=" not in model_key:
+        return {}
+    suffix = model_key.split("|lambda=", 1)[1]
+    parts = suffix.split("|")
+    metadata: Dict[str, str] = {}
+    for idx, part in enumerate(parts):
+        if "=" not in part:
+            if idx == 0 and part:
+                metadata.setdefault("lambda_theta_anchor", part)
+            continue
+        key, value = part.split("=", 1)
+        if key == "lambda":
+            metadata.setdefault("lambda_theta_anchor", value)
+        else:
+            metadata[key] = value
+    ordered_metadata: Dict[str, str] = {}
+    for key in FLEX_METADATA_KEYS:
+        if key in metadata:
+            ordered_metadata[key] = metadata[key]
+    return ordered_metadata
+
+
+def base_model_key(model_key: str) -> str:
+    base_key = strip_lambda_suffix(model_key)
+    if base_key.startswith("flex:"):
+        return "flex"
+    return base_key
+
+
 def flex_variant_form(model_key: str, args: argparse.Namespace) -> str:
-    if model_key.startswith("flex:"):
-        parts = model_key.split(":")
+    key = strip_lambda_suffix(model_key)
+    if key.startswith("flex:"):
+        parts = key.split(":")
         if len(parts) >= 3:
             return parts[2].strip().lower() or "dual"
         if len(parts) == 2:
@@ -577,8 +716,9 @@ def flex_variant_form(model_key: str, args: argparse.Namespace) -> str:
 
 
 def flex_solver_from_key(model_key: str, args: argparse.Namespace) -> str:
-    if model_key.startswith("flex:"):
-        parts = model_key.split(":")
+    key = strip_lambda_suffix(model_key)
+    if key.startswith("flex:"):
+        parts = key.split(":")
         if len(parts) >= 3:
             return parts[1].strip() or DEFAULT_SOLVERS.get("flex", "gurobi")
         if len(parts) == 2:
@@ -591,11 +731,17 @@ def flex_solver_from_key(model_key: str, args: argparse.Namespace) -> str:
 
 def model_display_name(model_key: str, args: argparse.Namespace) -> str:
     base = base_model_key(model_key)
+    meta = model_key_metadata(model_key)
+    param_display = ""
+    if meta:
+        param_bits = [f"{key}={value}" for key, value in meta.items() if value]
+        if param_bits:
+            param_display = " (" + ", ".join(param_bits) + ")"
     if base == "flex":
         formulation = flex_variant_form(model_key, args)
         solver = flex_solver_from_key(model_key, args)
-        return f"{formulation}(flex,{solver})"
-    return model_key
+        return f"{formulation}(flex,{solver}){param_display}"
+    return f"{strip_lambda_suffix(model_key)}{param_display}"
 
 
 def plot_metrics(
@@ -692,6 +838,43 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     else:
         run_ensemble = True
 
+    lambda_theta_anchor_values = parse_float_choices(getattr(args, "flex_lambda_theta_anchor", "0"), 0.0)
+    lambda_w_anchor_values = parse_float_choices(getattr(args, "flex_lambda_w_anchor", "0"), 0.0)
+    lambda_theta_iso_values = parse_float_choices(getattr(args, "flex_lambda_theta_iso", "0"), 0.0)
+    lambda_w_iso_values = parse_float_choices(getattr(args, "flex_lambda_w_iso", "0"), 0.0)
+    theta_anchor_modes = parse_str_choices(getattr(args, "flex_theta_anchor_mode", "none"), "none")
+    w_anchor_modes = parse_str_choices(getattr(args, "flex_w_anchor_mode", "ols"), "ols")
+    theta_init_modes = parse_str_choices(getattr(args, "flex_theta_init_mode", "ols"), "ols")
+
+    flex_configs: List[FlexConfig] = [
+        FlexConfig(
+            lambda_theta_anchor=lam_theta_anchor,
+            lambda_w_anchor=lam_w_anchor,
+            lambda_theta_iso=lam_theta_iso,
+            lambda_w_iso=lam_w_iso,
+            theta_anchor_mode=theta_anchor_mode,
+            w_anchor_mode=w_anchor_mode,
+            theta_init_mode=theta_init_mode,
+        )
+        for (
+            lam_theta_anchor,
+            lam_w_anchor,
+            lam_theta_iso,
+            lam_w_iso,
+            theta_anchor_mode,
+            w_anchor_mode,
+            theta_init_mode,
+        ) in product(
+            lambda_theta_anchor_values,
+            lambda_w_anchor_values,
+            lambda_theta_iso_values,
+            lambda_w_iso_values,
+            theta_anchor_modes,
+            w_anchor_modes,
+            theta_init_modes,
+        )
+    ]
+
     target = int(args.runs)
     if target <= 0:
         print("[WARN] runs must be positive; nothing to do")
@@ -706,9 +889,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     log_path = exp_dir / "experiment.log"
 
-    shared_seeds: List[int] = []
-    per_model_rows: Dict[str, List[Dict[str, str]]] = {key: [] for key in enabled_solvers}
-    next_seed = int(args.seed0)
+    per_model_rows: Dict[str, List[Dict[str, str]]] = {}
+    model_metadata: Dict[str, Dict[str, object]] = {}
 
     core_sequence: List[str] = []
     for base in ["dual", "kkt"]:
@@ -722,120 +904,166 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("[ERROR] No predictive model enabled (dual/kkt/flex/ols/ipo); aborting.")
         return 1
 
-    def pop_attempt_rows(models: List[str]) -> None:
-        for model in models:
-            rows = per_model_rows.get(model)
+    def pop_attempt_rows(model_keys: List[str]) -> None:
+        for key in model_keys:
+            rows = per_model_rows.get(key)
             if rows:
                 rows.pop()
 
     with open(log_path, "w", encoding="utf-8") as log_handle:
-        while len(shared_seeds) < target:
-            attempt_models: List[str] = []
-            anchor_seed: Optional[int] = None
-            failed = False
+        for combo_idx, flex_config in enumerate(flex_configs):
+            config_pairs = flex_config.metadata_pairs()
+            combo_metadata = dict(config_pairs)
+            config_desc = flex_config.describe()
+            lam_str = combo_metadata["lambda_theta_anchor"]
+            key_suffix = flex_config.key_suffix()
 
-            for model in core_sequence:
-                request_seed = next_seed if anchor_seed is None else anchor_seed
-                outcome = run_model(
-                    model,
-                    enabled_solvers[model],
-                    args,
-                    seed=request_seed,
-                    outdir=raw_dir,
-                    log_handle=log_handle,
-                    keep_raw=args.keep_raw,
-                )
-                model_seed = outcome.seed
-                if anchor_seed is None:
-                    anchor_seed = model_seed
-                elif model_seed != anchor_seed:
-                    print(
-                        f"[WARN] {model} deviated to seed={model_seed} (expected {anchor_seed}); discarding"
-                    )
-                    pop_attempt_rows(attempt_models)
-                    next_seed = max(model_seed, anchor_seed) + 1
-                    failed = True
-                    break
+            log_handle.write(f"\n=== flex_config[{combo_idx}] {config_desc} ===\n")
+            lam_raw_dir = raw_dir / flex_config.raw_dir_name(combo_idx)
+            lam_raw_dir.mkdir(parents=True, exist_ok=True)
 
-                display_model = model_display_name(model, args)
-                per_model_rows[model].append({**outcome.run_row, "model": display_model, "solver": outcome.solver})
-                attempt_models.append(model)
+            shared_seeds: List[int] = []
+            next_seed = int(args.seed0)
 
-            if failed:
-                continue
+            while len(shared_seeds) < target:
+                attempt_keys: List[str] = []
+                anchor_seed: Optional[int] = None
+                failed = False
 
-            if anchor_seed is None:
-                print("[WARN] No valid seed collected; advancing seed cursor")
-                next_seed += 1
-                continue
-
-            if not run_ensemble:
-                shared_seeds.append(anchor_seed)
-                next_seed = anchor_seed + 1
-                print(f"[INFO] Accepted seed {anchor_seed}; total collected {len(shared_seeds)}/{target}")
-                continue
-
-            theta_dual_vec = parse_theta(per_model_rows["dual"][-1]) if "dual" in per_model_rows else None
-            theta_kkt_vec = parse_theta(per_model_rows["kkt"][-1]) if "kkt" in per_model_rows else None
-            if theta_dual_vec is None or theta_kkt_vec is None:
-                print("[WARN] Failed to parse theta for ensemble; discarding seed")
-                pop_attempt_rows(attempt_models)
-                next_seed = anchor_seed + 1
-                continue
-
-            ensembles = {
-                "ensemble_avg": 0.5 * (theta_dual_vec + theta_kkt_vec),
-                "ensemble_weighted": (np.linalg.norm(theta_dual_vec) * theta_dual_vec + np.linalg.norm(theta_kkt_vec) * theta_kkt_vec) / (np.linalg.norm(theta_dual_vec) + np.linalg.norm(theta_kkt_vec) + 1e-12),
-                "ensemble_normalized": 0.5 * (normalize_theta(theta_dual_vec) + normalize_theta(theta_kkt_vec)),
-            }
-
-            ensemble_results = {}
-            ensemble_fail = False
-            for ens_model, theta_vec in ensembles.items():
-                theta_tmp = raw_dir / f"{ens_model}_seed{anchor_seed}.npy"
-                np.save(theta_tmp, theta_vec)
-                try:
+                for model in core_sequence:
+                    request_seed = next_seed if anchor_seed is None else anchor_seed
+                    current_flex_config = flex_config if model.startswith("flex") else None
                     outcome = run_model(
-                        ens_model,
-                        enabled_solvers[ens_model],
+                        model,
+                        enabled_solvers[model],
                         args,
-                        seed=anchor_seed,
-                        outdir=raw_dir,
+                        seed=request_seed,
+                        outdir=lam_raw_dir,
                         log_handle=log_handle,
                         keep_raw=args.keep_raw,
-                        fixed_theta=theta_tmp,
+                        flex_config=current_flex_config,
                     )
-                except RuntimeError as exc:
-                    print(f"[WARN] {ens_model} failed for seed={anchor_seed}: {exc}; discarding")
-                    ensemble_fail = True
-                    break
-                finally:
-                    if not args.keep_raw and theta_tmp.exists():
-                        theta_tmp.unlink()
+                    model_seed = outcome.seed
+                    if anchor_seed is None:
+                        anchor_seed = model_seed
+                    elif model_seed != anchor_seed:
+                        print(
+                            f"[WARN] {model} deviated to seed={model_seed} (expected {anchor_seed}); discarding"
+                        )
+                        pop_attempt_rows(attempt_keys)
+                        next_seed = max(model_seed, anchor_seed) + 1
+                        failed = True
+                        break
+
+                    display_model = model_display_name(model, args)
+                    key = f"{model}|{key_suffix}"
+                    row_data = {
+                        **outcome.run_row,
+                        "model": display_model,
+                        "solver": outcome.solver,
+                        **combo_metadata,
+                    }
+                    per_model_rows.setdefault(key, []).append(row_data)
+                    model_metadata.setdefault(
+                        key,
+                        {
+                            "model": display_model,
+                            "solver": outcome.solver,
+                            **combo_metadata,
+                        },
+                    )
+                    attempt_keys.append(key)
+
+                if failed:
+                    continue
+
+                if anchor_seed is None:
+                    print("[WARN] No valid seed collected; advancing seed cursor")
+                    next_seed += 1
+                    continue
+
+                if not run_ensemble:
+                    shared_seeds.append(anchor_seed)
+                    next_seed = anchor_seed + 1
+                    print(
+                        f"[INFO] Accepted seed {anchor_seed} ({config_desc}); total collected {len(shared_seeds)}/{target}"
+                    )
+                    continue
+
+                dual_key = f"dual|{key_suffix}"
+                kkt_key = f"kkt|{key_suffix}"
+                theta_dual_vec = parse_theta(per_model_rows.get(dual_key, [{}])[-1]) if dual_key in per_model_rows else None
+                theta_kkt_vec = parse_theta(per_model_rows.get(kkt_key, [{}])[-1]) if kkt_key in per_model_rows else None
+                if theta_dual_vec is None or theta_kkt_vec is None:
+                    print("[WARN] Failed to parse theta for ensemble; discarding seed")
+                    pop_attempt_rows(attempt_keys)
+                    next_seed = anchor_seed + 1
+                    continue
+
+                ensembles = {
+                    "ensemble_avg": 0.5 * (theta_dual_vec + theta_kkt_vec),
+                    "ensemble_weighted": (np.linalg.norm(theta_dual_vec) * theta_dual_vec + np.linalg.norm(theta_kkt_vec) * theta_kkt_vec) / (np.linalg.norm(theta_dual_vec) + np.linalg.norm(theta_kkt_vec) + 1e-12),
+                    "ensemble_normalized": 0.5 * (normalize_theta(theta_dual_vec) + normalize_theta(theta_kkt_vec)),
+                }
+
+                ensemble_fail = False
+                for ens_model, theta_vec in ensembles.items():
+                    theta_tmp = lam_raw_dir / f"{ens_model}_seed{anchor_seed}.npy"
+                    np.save(theta_tmp, theta_vec)
+                    try:
+                        outcome = run_model(
+                            ens_model,
+                            enabled_solvers[ens_model],
+                            args,
+                            seed=anchor_seed,
+                            outdir=lam_raw_dir,
+                            log_handle=log_handle,
+                            keep_raw=args.keep_raw,
+                            fixed_theta=theta_tmp,
+                        )
+                    except RuntimeError as exc:
+                        print(f"[WARN] {ens_model} failed for seed={anchor_seed}: {exc}; discarding")
+                        ensemble_fail = True
+                        break
+                    finally:
+                        if not args.keep_raw and theta_tmp.exists():
+                            theta_tmp.unlink()
+                    if ensemble_fail:
+                        break
+                    ensemble_key = f"{ens_model}|{key_suffix}"
+                    per_model_rows.setdefault(ensemble_key, []).append(
+                        {
+                            **outcome.run_row,
+                            "model": ens_model,
+                            "solver": outcome.solver,
+                            **combo_metadata,
+                        }
+                    )
+                    model_metadata.setdefault(
+                        ensemble_key,
+                        {"model": ens_model, "solver": outcome.solver, **combo_metadata},
+                    )
+                    attempt_keys.append(ensemble_key)
+
                 if ensemble_fail:
-                    break
-                ensemble_results[ens_model] = outcome
+                    pop_attempt_rows(attempt_keys)
+                    next_seed = anchor_seed + 1
+                    continue
 
-            if ensemble_fail:
-                pop_attempt_rows(attempt_models)
+                shared_seeds.append(anchor_seed)
                 next_seed = anchor_seed + 1
-                continue
-
-            for ens_model, outcome in ensemble_results.items():
-                per_model_rows[ens_model].append({**outcome.run_row, "model": ens_model, "solver": outcome.solver})
-
-            shared_seeds.append(anchor_seed)
-            next_seed = anchor_seed + 1
-            print(f"[INFO] Accepted seed {anchor_seed}; total collected {len(shared_seeds)}/{target}")
+                print(
+                    f"[INFO] Accepted seed {anchor_seed} ({config_desc}); total collected {len(shared_seeds)}/{target}"
+                )
 
     # --- Prepare CSV outputs ---
     detail_rows: List[Dict[str, str]] = []
-    for model, rows in per_model_rows.items():
-        display_model = model_display_name(model, args)
+    for model_key, rows in per_model_rows.items():
+        meta = model_metadata.get(model_key, {})
         for row in rows:
             row = dict(row)
-            row["model"] = row.get("model") or display_model
-            row["solver"] = row.get("solver") or enabled_solvers.get(model, DEFAULT_SOLVERS.get(model, ""))
+            row.setdefault("model", meta.get("model", model_key))
+            row.setdefault("solver", meta.get("solver", ""))
             if "seed" in row:
                 try:
                     row["seed"] = str(int(round(float(row["seed"]))))
@@ -843,11 +1071,28 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     row["seed"] = str(row.get("seed", ""))
             else:
                 row["seed"] = ""
+            for key in FLEX_METADATA_KEYS:
+                row.setdefault(key, meta.get(key, ""))
+            row.setdefault("N", str(args.N))
+            row.setdefault("d", str(args.d))
+            row.setdefault("snr", str(args.snr))
+            row.setdefault("rho", str(args.rho))
+            row.setdefault("sigma", str(args.sigma))
+            row.setdefault("res", str(args.res))
+            row.setdefault("delta", str(args.delta))
             detail_rows.append(row)
 
     detail_field_order = [
         "model",
         "solver",
+        "N",
+        "d",
+        "snr",
+        "rho",
+        "sigma",
+        "res",
+        "delta",
+    ] + FLEX_METADATA_KEYS + [
         "runtime_sec",
         "eval_rows",
         "mean_cost_test_vtrue",
@@ -893,16 +1138,26 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     summary_metrics = list(SUMMARY_METRIC_MAP.keys())
     summary_rows: List[Dict[str, str]] = []
-    for model, rows in per_model_rows.items():
+    for model_key, rows in per_model_rows.items():
         if not rows:
             continue
         metrics = summarise_metrics(rows, SUMMARY_METRIC_MAP.keys())
+        meta = model_metadata.get(model_key, {})
         summary_row = {
-            "model": model_display_name(model, args),
-            "solver": enabled_solvers.get(model, DEFAULT_SOLVERS.get(model, "")),
-            "n_seeds": str(len(rows)),
-            "seeds": seeds_to_string(rows),
+            "model": meta.get("model", model_key),
+            "solver": meta.get("solver", ""),
+            "N": str(args.N),
+            "d": str(args.d),
+            "snr": str(args.snr),
+            "rho": str(args.rho),
+            "sigma": str(args.sigma),
+            "res": str(args.res),
+            "delta": str(args.delta),
         }
+        for key in FLEX_METADATA_KEYS:
+            summary_row[key] = meta.get(key, "")
+        summary_row["n_seeds"] = str(len(rows))
+        summary_row["seeds"] = seeds_to_string(rows)
         for src, dst in SUMMARY_METRIC_MAP.items():
             value = metrics.get(src, math.nan)
             summary_row[dst] = f"{value:.10g}" if not math.isnan(value) else ""
@@ -911,17 +1166,34 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         summary_row["avg_weight_train"] = average_vector(rows, "avg_weight_train")
         summary_rows.append(summary_row)
 
+    summary_field_order = [
+        "model",
+        "solver",
+        "N",
+        "d",
+        "snr",
+        "rho",
+        "sigma",
+        "res",
+        "delta",
+    ] + FLEX_METADATA_KEYS + [
+        "n_seeds",
+        "seeds",
+    ] + list(SUMMARY_METRIC_MAP.values()) + ["theta", "avg_weight_test", "avg_weight_train"]
+
     summary_csv = exp_dir / args.report_csv.name
-    write_csv(summary_csv, summary_rows)
+    write_csv(summary_csv, summary_rows, fieldnames=summary_field_order)
 
     plot_metrics(per_model_rows, summary_metrics, exp_dir, args.fig_format, args)
 
     for row in summary_rows:
         model = row["model"]
+        param_bits = [f"{name}={row.get(name, '')}" for name in FLEX_METADATA_KEYS if row.get(name, "")]
+        param_display = ", ".join(param_bits)
         mean_cost = row.get("mean_cost_test", "")
         dec_err = row.get("decision_error_test", "")
         print(
-            f"[RESULT] model={model} n={row['n_seeds']} "
+            f"[RESULT] model={model} params=({param_display}) n={row['n_seeds']} "
             f"mean_cost_test={mean_cost} decision_error_test={dec_err}"
         )
 
@@ -939,27 +1211,29 @@ if __name__ == "__main__":
 python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/experiments/run_small_global_eval.py \
   --N 50 \
   --d 3 \
-  --snr 0.1 \
+  --snr 0.01 \
   --rho 0.5 \
   --sigma 0.0125 \
   --res 0 \
   --delta 1.0 \
-  --runs 30 \
+  --runs 1 \
   --seed0 200 \
+  --tee \
   --enable-flex \
-  --flex-solver ipopt \
-  --flex-formulation 'kkt,dual' \
-  --flex-lambda-theta-anchor 100 \
+  --flex-solver 'ipopt,knitro' \
+  --flex-formulation 'dual,kkt' \
+  --flex-lambda-theta-anchor 0,0.1,0.01,0.001,0.0001,1,10,100,1000 \
   --flex-lambda-w-anchor 0.0 \
-  --flex-lambda-theta-iso 0.0 \
+  --flex-lambda-theta-iso 0 \
   --flex-lambda-w-iso 0.0 \
   --flex-theta-anchor-mode ols \
   --flex-w-anchor-mode ols \
+  --flex-theta-init-mode none \
   --no-ensemble \
   --disable-dual \
   --disable-kkt \
-  --tee \
-  --flex-theta-init-mode none
+
+
 
   
   flex-theta-init-mode：ols,ipo,none

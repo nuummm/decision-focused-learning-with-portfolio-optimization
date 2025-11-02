@@ -38,29 +38,29 @@ TrainerFn = Callable[
 
 # --- デフォルトのソルバー仕様（必要に応じて run.py から上書き） ---
 KNITRO_DEFAULTS = {
-    "outlev": 5,
-    "nlp_algorithm": 1,
-    "hessopt": 2,
-    "linsolver": 3,  # 3 = MA57
+    "outlev": 3,
+    "nlp_algorithm": 2,   # SQP
+    "hessopt": 6,         # L-BFGS
+    "lmsize": 30,
+    "linsolver": 0,       # automatic
     "scale": 1,
     "presolve": 1,
     "feastol": 1e-8,
     "opttol": 1e-8,
-    "xtol": 1e-10,
-    "honorbnds": 1,
-    "maxit": 20000,
-    "maxtime_real": 1200,
-    "numthreads": 1,
-    "ms_enable": 0,
-    "bar_initmu": 1e-1,
+    "xtol": 1e-8,
+    "maxit": 50000,
+    "maxtime_real": 200,
+    "numthreads": 8,
+    "ms_enable": 1,
+    "ms_maxsolves": 5,
+    # "ms_maxtime": 35,
     "bar_murule": 4,
-    "outmode": 1,
 }
 GUROBI_DEFAULTS = {
     "NonConvex": 2,
     "Threads": 1,
     "Seed": 0,
-    "TimeLimit": 1200,
+    "TimeLimit": 300,
     "OutputFlag": 1,
     "MIPGap": 0,
     "MIPGapAbs": 0,
@@ -74,21 +74,22 @@ GUROBI_DEFAULTS = {
     "Method": 2,
 }
 IPOPT_DEFAULTS = {
-    "tol": 1e-8,
-    "acceptable_tol": 1e-6,
+    "tol": 5e-7,
+    "acceptable_tol": 1e-4,
     "dual_inf_tol": 1e-8,
     "constr_viol_tol": 1e-8,
     "compl_inf_tol": 1e-8,
-    "max_iter": 200000,
-    "max_cpu_time": 1200,
+    "max_iter": 50000,
+    "max_cpu_time": 200,
     "mu_strategy": "adaptive",
     "nlp_scaling_method": "gradient-based",
-    "hessian_approximation": "exact",
-    "linear_solver": "ma57",
+    "hessian_approximation": "limited-memory",
+    "limited_memory_max_history": 15,
+    "linear_solver": "mumps",
     "bound_push": 1e-12,
     "bound_frac": 1e-12,
     "warm_start_init_point": "yes",
-    "print_level": 5,
+    "print_level": 3,
 }
 
 def _merge_defaults(spec: SolverSpec) -> SolverSpec:

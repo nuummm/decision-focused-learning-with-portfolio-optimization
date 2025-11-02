@@ -1,0 +1,96 @@
+
+=======================================
+           Academic License
+       (NOT FOR COMMERCIAL USE)
+         Artelys Knitro 15.0.0
+=======================================
+
+Knitro using up to 8 threads.
+Knitro presolve eliminated 0 variables and 0 constraints.
+
+bar_initmu               0.1
+bar_murule               4
+concurrent_evals         0
+datacheck                0
+feastol                  1e-06
+feastol_abs              0.001
+findiff_numthreads       1
+hessian_no_f             1
+hessopt                  6
+honorbnds                1
+lmsize                   30
+maxit                    10000
+maxtime_real             300
+ms_enable                1
+ms_maxsolves             5
+nlp_algorithm            1
+numthreads               8
+opttol                   1e-06
+opttol_abs               0.001
+outmode                  1
+xtol                     1e-08
+The problem is identified as a QCQP.
+
+Problem Characteristics                                 (   Presolved)
+-----------------------
+Objective goal:  Minimize
+Objective type:  quadratic
+Number of variables:                                178 (         178)
+    bounded below only:                             150 (         150)
+    bounded above only:                               0 (           0)
+    bounded below and above:                          0 (           0)
+    fixed:                                            0 (           0)
+    free:                                            28 (          28)
+Number of constraints:                              125 (         125)
+    linear equalities:                              100 (         100)
+    quadratic equalities:                            25 (          25)
+    gen. nonlinear equalities:                        0 (           0)
+    linear one-sided inequalities:                    0 (           0)
+    quadratic one-sided inequalities:                 0 (           0)
+    gen. nonlinear one-sided inequalities:            0 (           0)
+    linear two-sided inequalities:                    0 (           0)
+    quadratic two-sided inequalities:                 0 (           0)
+    gen. nonlinear two-sided inequalities:            0 (           0)
+Number of nonzeros in Jacobian:                     700 (         700)
+Number of nonzeros in Hessian:                        0 (           0)
+
+Knitro parallel multistart will run with 8 threads.
+
+Return codes description
+------------------------
+  0:  The final solution satisfies the termination conditions for verifying optimality.
+  -100 to -199:  A feasible approximate solution was found.
+  -200 to -299:  Knitro terminated at an infeasible point.
+  -300 to -301:  The problem was determined to be unbounded.
+  -400 to -499:  Knitro terminated because it reached a pre-defined limit.
+    -400 to -409:  A feasible point was found.
+    -410 to -419:  No feasible point was found.
+  -500 to -599:  Knitro terminated with an input error or some non-standard error.
+A more detailed description of individual return codes and their corresponding
+termination messages is provided at
+https://www.artelys.com/app/docs/knitro/3_referenceManual/returnCodes.html
+
+ Solve #  ThreadID  Status     Objective      FeasError    OptError    Real Time 
+--------  --------  ------  --------------   ----------   ----------  ----------
+      0          0    -101        -2.21717  4.87726e-15     0.105974  5.24190e-02
+      4          3       0        -2.21717  1.11022e-16  3.49820e-07  5.98530e-02
+      1          2    -102        -2.21717  7.85516e-16  5.89153e-02  6.30760e-02
+      3          6       0        -2.21717  5.12963e-17  8.87458e-07  9.29830e-02
+      2          7       0        -2.21717  5.12963e-17  8.87458e-07  9.30700e-02
+
+MULTISTART: Best locally optimal solution is returned.
+EXIT: Locally optimal solution found.
+
+Final Statistics
+----------------
+Final objective value               =  -2.21717293005198e+00
+Final feasibility error (abs / rel) =   5.13e-17 / 5.13e-17
+Final optimality error  (abs / rel) =   8.87e-07 / 8.87e-07
+# of iterations                     =        257 
+# of CG iterations                  =          0 
+# of function evaluations           =          0
+# of gradient evaluations           =          0
+Total program time (secs)           =       0.09454 (     0.365 CPU time)
+
+===============================================================================
+
