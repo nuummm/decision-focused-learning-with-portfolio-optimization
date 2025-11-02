@@ -38,7 +38,7 @@ TrainerFn = Callable[
 
 # --- デフォルトのソルバー仕様（必要に応じて run.py から上書き） ---
 KNITRO_DEFAULTS = {
-    "outlev": 3,
+    "outlev": 5,
     "nlp_algorithm": 1,
     "hessopt": 2,
     "linsolver": 3,  # 3 = MA57

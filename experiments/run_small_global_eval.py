@@ -944,12 +944,12 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --sigma 0.0125 \
   --res 0 \
   --delta 1.0 \
-  --runs 1 \
+  --runs 30 \
   --seed0 200 \
   --enable-flex \
   --flex-solver ipopt \
   --flex-formulation 'kkt,dual' \
-  --flex-lambda-theta-anchor 0.0 \
+  --flex-lambda-theta-anchor 100 \
   --flex-lambda-w-anchor 0.0 \
   --flex-lambda-theta-iso 0.0 \
   --flex-lambda-w-iso 0.0 \
@@ -959,6 +959,8 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --disable-dual \
   --disable-kkt \
   --tee \
-  --flex-theta-init-mode ols
+  --flex-theta-init-mode none
 
+  
+  flex-theta-init-mode：ols,ipo,none
 '''

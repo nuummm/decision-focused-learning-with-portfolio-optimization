@@ -24,6 +24,7 @@ from data.synthetic import generate_simulation1_dataset
 from models.covariance import estimate_epscov_rolling
 from models.ols import train_ols, predict_yhat
 from models.ols_gurobi import solve_series_mvo_gurobi
+from models.ipo_closed_form import fit_ipo_closed_form
 from viz.plots import save_summary_plots  # ← 追加
 
 
@@ -141,11 +142,36 @@ def run_once(
         # ----- OLS 初期値（train 全体で学習）-----
         theta_init_ols = np.asarray(train_ols(X_tr, Y_tr), dtype=float)
         theta_init = theta_init_ols.copy()
+        theta_ipo_vec: Optional[np.ndarray] = None
         if model_key == "flex":
             flex_mode = (flex_theta_init_mode or "ols").lower()
             if flex_mode == "ols":
                 print(f"[INFO] flex theta_init_mode=ols -> using OLS warm-start (solver={solver_spec.name})")
                 theta_init = theta_init_ols.copy()
+            elif flex_mode == "ipo":
+                try:
+                    theta_ipo, _, _, _, _, ipo_meta = fit_ipo_closed_form(
+                        X,
+                        Y,
+                        Vhats,
+                        idx,
+                        start_index=start_train,
+                        end_index=end_train,
+                        delta=delta,
+                        mode="budget",
+                        tee=tee,
+                    )
+                    theta_init = np.asarray(theta_ipo, dtype=float)
+                    theta_ipo_vec = theta_init.copy()
+                    print(
+                        f"[INFO] flex theta_init_mode=ipo -> using IPO warm-start (solver={solver_spec.name})"
+                    )
+                except Exception as exc:
+                    print(
+                        f"[WARN] flex theta_init_mode=ipo failed ({exc}); falling back to OLS warm-start"
+                    )
+                    theta_init = theta_init_ols.copy()
+                    theta_ipo_vec = None
             elif flex_mode == "none":
                 print(f"[INFO] flex theta_init_mode=none -> no warm-start applied (solver={solver_spec.name})")
                 theta_init = None
@@ -170,19 +196,52 @@ def run_once(
             theta_anchor_mode = flex_kwargs.pop("theta_anchor_mode", "none").lower()
             w_anchor_mode = flex_kwargs.pop("w_anchor_mode", "ols").lower()
 
-            theta_init_vec = theta_init_ols
-            if "theta_anchor" not in flex_kwargs:
-                if theta_anchor_mode == "ols":
-                    flex_kwargs["theta_anchor"] = theta_init_vec
-                elif theta_anchor_mode not in {"none"}:
-                    raise ValueError(f"Unsupported flex theta_anchor_mode: {theta_anchor_mode}")
+            def resolve_theta_source(mode: str) -> Optional[np.ndarray]:
+                nonlocal theta_ipo_vec
+                m = (mode or "none").lower()
+                if m == "none":
+                    return None
+                if m == "ols":
+                    return theta_init_ols.copy()
+                if m == "ipo":
+                    if theta_ipo_vec is None:
+                        try:
+                            theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
+                                X,
+                                Y,
+                                Vhats,
+                                idx,
+                                start_index=start_train,
+                                end_index=end_train,
+                                delta=delta,
+                                mode="budget",
+                                tee=tee,
+                            )
+                            theta_ipo_vec = np.asarray(theta_ipo, dtype=float)
+                        except Exception as exc:
+                            raise ValueError(
+                                f"Unable to construct IPO-based anchor (mode={mode}): {exc}"
+                            )
+                    return theta_ipo_vec.copy()
+                raise ValueError(f"Unsupported anchor mode: {mode}")
+
+            theta_anchor_vec = resolve_theta_source(theta_anchor_mode)
+            if "theta_anchor" not in flex_kwargs and theta_anchor_mode != "none":
+                if theta_anchor_vec is None:
+                    raise ValueError(f"theta_anchor_mode='{theta_anchor_mode}' unavailable without anchor data")
+                flex_kwargs["theta_anchor"] = theta_anchor_vec
 
             need_w_anchor = (
                 "w_anchor" not in flex_kwargs
-                and (lam_w_anchor > 0.0 or lam_w_anchor_l1 > 0.0 or w_anchor_mode == "ols")
+                and (lam_w_anchor > 0.0 or lam_w_anchor_l1 > 0.0 or w_anchor_mode in {"ols", "ipo"})
             )
             if need_w_anchor:
-                Yhat_anchor_all = predict_yhat(X, theta_init_vec)
+                theta_for_w_anchor = resolve_theta_source(w_anchor_mode)
+                if theta_for_w_anchor is None:
+                    raise ValueError(
+                        "w_anchor_mode requires a reference theta; provide w_anchor manually or select ols/ipo"
+                    )
+                Yhat_anchor_all = predict_yhat(X, theta_for_w_anchor)
                 w_anchor_mat = solve_series_mvo_gurobi(
                     Yhat_all=Yhat_anchor_all,
                     Vhats=Vhats_train,
