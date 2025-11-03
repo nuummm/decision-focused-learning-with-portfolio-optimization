@@ -69,6 +69,14 @@ def float_list(text: str) -> List[float]:
     return values
 
 
+def int_list(text: str) -> List[int]:
+    items = [p.strip() for p in text.split(",") if p.strip()]
+    values: List[int] = []
+    for item in items:
+        values.append(int(item))
+    return values
+
+
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run small-scale QCQP experiments and aggregate optimal summaries."
@@ -80,6 +88,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Number of successful (globally optimal) seeds required per model",
     )
     parser.add_argument("--seed0", type=int, default=100, help="Initial seed")
+    parser.add_argument(
+        "--seed-list",
+        type=str,
+        default="",
+        help="Comma-separated list of explicit seeds to evaluate (overrides runs/seed0).",
+    )
     parser.add_argument("--N", type=int, default=50, help="Number of samples")
     parser.add_argument("--d", type=int, default=3, help="Asset dimension")
     parser.add_argument("--snr", type=float, default=0.1, help="Signal-to-noise ratio")
@@ -297,8 +311,8 @@ def parse_str_choices(spec: object, default: str) -> List[str]:
 
 
 DEFAULT_SOLVERS: Dict[str, str] = {
-    "dual": "knitro",
-    "kkt": "knitro",
+    "dual": "gurobi",
+    "kkt": "gurobi",
     "flex": "gurobi",
     "ols": "analytic",
     "ipo": "analytic",
@@ -335,6 +349,30 @@ FLEX_METADATA_KEYS = [
     "w_anchor_mode",
     "theta_init_mode",
 ]
+
+
+def _is_zero_value(value: object) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    try:
+        return abs(float(text)) < 1e-12
+    except (TypeError, ValueError):
+        return False
+
+
+def _format_meta_params(meta: Dict[str, str]) -> List[str]:
+    parts: List[str] = []
+    for key in FLEX_METADATA_KEYS:
+        value = meta.get(key)
+        if value is None or value == "":
+            continue
+        if key.startswith("lambda") and _is_zero_value(value):
+            continue
+        parts.append(f"{key}={value}")
+    return parts
 
 
 def build_cmd(
@@ -734,7 +772,7 @@ def model_display_name(model_key: str, args: argparse.Namespace) -> str:
     meta = model_key_metadata(model_key)
     param_display = ""
     if meta:
-        param_bits = [f"{key}={value}" for key, value in meta.items() if value]
+        param_bits = _format_meta_params(meta)
         if param_bits:
             param_display = " (" + ", ".join(param_bits) + ")"
     if base == "flex":
@@ -875,9 +913,22 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         )
     ]
 
-    target = int(args.runs)
+    seed_list_raw = str(getattr(args, "seed_list", "") or "").strip()
+    seed_list_values = int_list(seed_list_raw) if seed_list_raw else []
+    use_seed_list = bool(seed_list_values)
+
+    if use_seed_list:
+        seed_pool = seed_list_values
+    else:
+        target = int(args.runs)
+        if target <= 0:
+            print("[WARN] runs must be positive; nothing to do")
+            return 0
+        seed0 = int(args.seed0)
+        seed_pool = [seed0 + i for i in range(target)]
+    target = len(seed_pool)
     if target <= 0:
-        print("[WARN] runs must be positive; nothing to do")
+        print("[WARN] No seeds available; nothing to do")
         return 0
 
     base_outdir: Path = args.outdir
@@ -923,15 +974,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             lam_raw_dir.mkdir(parents=True, exist_ok=True)
 
             shared_seeds: List[int] = []
-            next_seed = int(args.seed0)
-
-            while len(shared_seeds) < target:
+            for current_seed in seed_pool:
                 attempt_keys: List[str] = []
                 anchor_seed: Optional[int] = None
                 failed = False
 
                 for model in core_sequence:
-                    request_seed = next_seed if anchor_seed is None else anchor_seed
+                    request_seed = current_seed if anchor_seed is None else anchor_seed
                     current_flex_config = flex_config if model.startswith("flex") else None
                     outcome = run_model(
                         model,
@@ -951,7 +1000,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                             f"[WARN] {model} deviated to seed={model_seed} (expected {anchor_seed}); discarding"
                         )
                         pop_attempt_rows(attempt_keys)
-                        next_seed = max(model_seed, anchor_seed) + 1
                         failed = True
                         break
 
@@ -979,12 +1027,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
                 if anchor_seed is None:
                     print("[WARN] No valid seed collected; advancing seed cursor")
-                    next_seed += 1
                     continue
 
                 if not run_ensemble:
                     shared_seeds.append(anchor_seed)
-                    next_seed = anchor_seed + 1
                     print(
                         f"[INFO] Accepted seed {anchor_seed} ({config_desc}); total collected {len(shared_seeds)}/{target}"
                     )
@@ -997,7 +1043,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 if theta_dual_vec is None or theta_kkt_vec is None:
                     print("[WARN] Failed to parse theta for ensemble; discarding seed")
                     pop_attempt_rows(attempt_keys)
-                    next_seed = anchor_seed + 1
                     continue
 
                 ensembles = {
@@ -1047,13 +1092,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
                 if ensemble_fail:
                     pop_attempt_rows(attempt_keys)
-                    next_seed = anchor_seed + 1
                     continue
 
                 shared_seeds.append(anchor_seed)
-                next_seed = anchor_seed + 1
                 print(
                     f"[INFO] Accepted seed {anchor_seed} ({config_desc}); total collected {len(shared_seeds)}/{target}"
+                )
+
+            if len(shared_seeds) < target:
+                reason = "seed list exhausted" if use_seed_list else "some seeds failed"
+                print(
+                    f"[WARN] {reason} for config {config_desc}; collected {len(shared_seeds)}/{target} seeds"
                 )
 
     # --- Prepare CSV outputs ---
@@ -1188,7 +1237,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     for row in summary_rows:
         model = row["model"]
-        param_bits = [f"{name}={row.get(name, '')}" for name in FLEX_METADATA_KEYS if row.get(name, "")]
+        meta = {name: row.get(name, "") for name in FLEX_METADATA_KEYS}
+        param_bits = _format_meta_params(meta)
         param_display = ", ".join(param_bits)
         mean_cost = row.get("mean_cost_test", "")
         dec_err = row.get("decision_error_test", "")
@@ -1216,16 +1266,15 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --sigma 0.0125 \
   --res 0 \
   --delta 1.0 \
-  --runs 1 \
-  --seed0 200 \
+  --seed-list '1,2,3,4,5,6,7,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31' \
   --tee \
   --enable-flex \
-  --flex-solver 'ipopt,knitro' \
+  --flex-solver 'knitro' \
   --flex-formulation 'dual,kkt' \
-  --flex-lambda-theta-anchor 0,0.1,0.01,0.001,0.0001,1,10,100,1000 \
-  --flex-lambda-w-anchor 0.0 \
+  --flex-lambda-theta-anchor 0 \
+  --flex-lambda-w-anchor 0 \
   --flex-lambda-theta-iso 0 \
-  --flex-lambda-w-iso 0.0 \
+  --flex-lambda-w-iso 0 \
   --flex-theta-anchor-mode ols \
   --flex-w-anchor-mode ols \
   --flex-theta-init-mode none \
@@ -1233,7 +1282,8 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --disable-dual \
   --disable-kkt \
 
-
+  --runs 1 \
+  --seed0 200 \
 
   
   flex-theta-init-mode：ols,ipo,none

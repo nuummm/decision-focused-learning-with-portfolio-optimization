@@ -522,10 +522,10 @@ if __name__ == "__main__":
 # python GraduationResearch/DFL_Portfolio_Optimization2/experiments/run_gurobi_partial_eval.py \
 #   --N 50 --d 3 --res 0 \
 #   --snr 0.01 --rho 0.5 --delta 1.0 \
-#   --runs 100\
+#   --seeds 1,2,3,4,5,6,7,9,10,11 \
+
 #   --models kkt,ols,ipo \
 #   --gurobi-accept-time-limit \
 #   --gurobi-max-gap 0.01 \
 #   --no-ensemble --tee
-
-#   --seeds 100,101,102,103,106,107,108,109,111,113,116,118,119,120,121,123,124,126,127,128,129,130,131,133,134,137,138,139,140,141 \
+#   --runs 100\

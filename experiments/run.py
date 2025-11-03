@@ -142,15 +142,22 @@ def run_once(
         # ----- OLS 初期値（train 全体で学習）-----
         theta_init_ols = np.asarray(train_ols(X_tr, Y_tr), dtype=float)
         theta_init = theta_init_ols.copy()
-        theta_ipo_vec: Optional[np.ndarray] = None
-        if model_key == "flex":
-            flex_mode = (flex_theta_init_mode or "ols").lower()
-            if flex_mode == "ols":
-                print(f"[INFO] flex theta_init_mode=ols -> using OLS warm-start (solver={solver_spec.name})")
-                theta_init = theta_init_ols.copy()
-            elif flex_mode == "ipo":
+        theta_sources: Dict[str, np.ndarray] = {"ols": theta_init_ols.copy()}
+        ipo_error: Optional[Exception] = None
+        ipo_message_logged = False
+
+        def ensure_theta_source(mode: str, *, fallback_to_ols: bool, context: str) -> Optional[np.ndarray]:
+            nonlocal theta_sources, ipo_error, ipo_message_logged
+            m = (mode or "none").lower()
+            if m == "none":
+                return None
+            if m == "ols":
+                return theta_sources["ols"].copy()
+            if m == "ipo":
+                if "ipo" in theta_sources:
+                    return theta_sources["ipo"].copy()
                 try:
-                    theta_ipo, _, _, _, _, ipo_meta = fit_ipo_closed_form(
+                    theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
                         X,
                         Y,
                         Vhats,
@@ -161,24 +168,35 @@ def run_once(
                         mode="budget",
                         tee=tee,
                     )
-                    theta_init = np.asarray(theta_ipo, dtype=float)
-                    theta_ipo_vec = theta_init.copy()
-                    print(
-                        f"[INFO] flex theta_init_mode=ipo -> using IPO warm-start (solver={solver_spec.name})"
-                    )
+                    theta_sources["ipo"] = np.asarray(theta_ipo, dtype=float)
+                    if context == "init" and not ipo_message_logged:
+                        print(
+                            f"[INFO] flex theta_init_mode=ipo -> using IPO warm-start (solver={solver_spec.name})"
+                        )
+                        ipo_message_logged = True
+                    return theta_sources["ipo"].copy()
                 except Exception as exc:
-                    print(
-                        f"[WARN] flex theta_init_mode=ipo failed ({exc}); falling back to OLS warm-start"
-                    )
-                    theta_init = theta_init_ols.copy()
-                    theta_ipo_vec = None
-            elif flex_mode == "none":
+                    ipo_error = exc
+                    if fallback_to_ols:
+                        print(
+                            f"[WARN] flex theta_init_mode=ipo failed ({exc}); falling back to OLS warm-start"
+                        )
+                        return theta_sources["ols"].copy()
+                    raise ValueError(f"Unable to construct IPO-based anchor (mode=ipo): {exc}") from exc
+            raise ValueError(f"Unsupported theta source mode: {mode}")
+
+        if model_key == "flex":
+            flex_mode = (flex_theta_init_mode or "ols").lower()
+            if flex_mode == "none":
                 print(f"[INFO] flex theta_init_mode=none -> no warm-start applied (solver={solver_spec.name})")
                 theta_init = None
             else:
-                raise ValueError(f"Unsupported flex theta_init_mode: {flex_mode}")
+                theta_init_candidate = ensure_theta_source(flex_mode, fallback_to_ols=True, context="init")
+                theta_init = None if theta_init_candidate is None else theta_init_candidate.copy()
+                if flex_mode == "ols":
+                    print(f"[INFO] flex theta_init_mode=ols -> using OLS warm-start (solver={solver_spec.name})")
         else:
-            theta_init = theta_init_ols.copy()
+            theta_init = theta_sources["ols"].copy()
 
         # ----- 学習（KKT / DUAL） -----
         trainer = get_trainer(model_key, solver_spec)
@@ -196,36 +214,7 @@ def run_once(
             theta_anchor_mode = flex_kwargs.pop("theta_anchor_mode", "none").lower()
             w_anchor_mode = flex_kwargs.pop("w_anchor_mode", "ols").lower()
 
-            def resolve_theta_source(mode: str) -> Optional[np.ndarray]:
-                nonlocal theta_ipo_vec
-                m = (mode or "none").lower()
-                if m == "none":
-                    return None
-                if m == "ols":
-                    return theta_init_ols.copy()
-                if m == "ipo":
-                    if theta_ipo_vec is None:
-                        try:
-                            theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
-                                X,
-                                Y,
-                                Vhats,
-                                idx,
-                                start_index=start_train,
-                                end_index=end_train,
-                                delta=delta,
-                                mode="budget",
-                                tee=tee,
-                            )
-                            theta_ipo_vec = np.asarray(theta_ipo, dtype=float)
-                        except Exception as exc:
-                            raise ValueError(
-                                f"Unable to construct IPO-based anchor (mode={mode}): {exc}"
-                            )
-                    return theta_ipo_vec.copy()
-                raise ValueError(f"Unsupported anchor mode: {mode}")
-
-            theta_anchor_vec = resolve_theta_source(theta_anchor_mode)
+            theta_anchor_vec = ensure_theta_source(theta_anchor_mode, fallback_to_ols=False, context="theta_anchor")
             if "theta_anchor" not in flex_kwargs and theta_anchor_mode != "none":
                 if theta_anchor_vec is None:
                     raise ValueError(f"theta_anchor_mode='{theta_anchor_mode}' unavailable without anchor data")
@@ -236,7 +225,7 @@ def run_once(
                 and (lam_w_anchor > 0.0 or lam_w_anchor_l1 > 0.0 or w_anchor_mode in {"ols", "ipo"})
             )
             if need_w_anchor:
-                theta_for_w_anchor = resolve_theta_source(w_anchor_mode)
+                theta_for_w_anchor = ensure_theta_source(w_anchor_mode, fallback_to_ols=False, context="w_anchor")
                 if theta_for_w_anchor is None:
                     raise ValueError(
                         "w_anchor_mode requires a reference theta; provide w_anchor manually or select ols/ipo"
@@ -751,15 +740,15 @@ def main():
 
     if solver_name == "ipopt":
         # デフォルト（未設定キーだけ）
-        solver_options.setdefault("tol", "1e-6")
-        solver_options.setdefault("acceptable_tol", "1e-5")
-        solver_options.setdefault("max_iter", 100000)
-        solver_options.setdefault("linear_solver", "mumps")
-        solver_options.setdefault("hessian_approximation", "limited-memory")
-        solver_options.setdefault("limited_memory_max_history", 20)
-        solver_options.setdefault("mu_strategy", "adaptive")
-        solver_options.setdefault("watchdog_shortened_iter_trigger", 10)
-        solver_options.setdefault("max_cpu_time", 300)
+        # solver_options.setdefault("tol", "1e-6")
+        # solver_options.setdefault("acceptable_tol", "1e-5")
+        # solver_options.setdefault("max_iter", 100000)
+        # solver_options.setdefault("linear_solver", "mumps")
+        # solver_options.setdefault("hessian_approximation", "limited-memory")
+        # solver_options.setdefault("limited_memory_max_history", 20)
+        # solver_options.setdefault("mu_strategy", "adaptive")
+        # solver_options.setdefault("watchdog_shortened_iter_trigger", 10)
+        # solver_options.setdefault("max_cpu_time", 300)
 
         # CLI 上書き
         if args.ipopt_max_cpu_time is not None:

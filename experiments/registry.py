@@ -39,23 +39,24 @@ TrainerFn = Callable[
 # --- デフォルトのソルバー仕様（必要に応じて run.py から上書き） ---
 KNITRO_DEFAULTS = {
     "outlev": 3,
-    "nlp_algorithm": 2,   # SQP
-    "hessopt": 6,         # L-BFGS
-    "lmsize": 30,
-    "linsolver": 0,       # automatic
+    "outmode": 1,
+    "nlp_algorithm": 3,     # Interior/Direct
+    "hessopt": 4,           # BFGS
+    "linsolver": 3,         # MA57 (sparse symmetric)
     "scale": 1,
     "presolve": 1,
-    "feastol": 1e-8,
-    "opttol": 1e-8,
-    "xtol": 1e-8,
-    "maxit": 50000,
-    "maxtime_real": 200,
-    "numthreads": 8,
-    "ms_enable": 1,
-    "ms_maxsolves": 5,
-    # "ms_maxtime": 35,
+    "feastol": 1e-6,
+    "opttol": 1e-6,
+    "xtol": 1e-10,
+    "honorbnds": 1,
+    "maxit": 20000,
+    "maxtime_real": 180,
+    "numthreads": 1,
+    "ms_enable": 0,
+    "bar_initmu": 0.1,
     "bar_murule": 4,
 }
+
 GUROBI_DEFAULTS = {
     "NonConvex": 2,
     "Threads": 1,
@@ -74,8 +75,24 @@ GUROBI_DEFAULTS = {
     "Method": 2,
 }
 IPOPT_DEFAULTS = {
-    "tol": 5e-7,
-    "acceptable_tol": 1e-4,
+    # "tol": 1e-8,
+    # "acceptable_tol": 1e-8,
+    # "dual_inf_tol": 1e-8,
+    # "constr_viol_tol": 1e-8,
+    # "compl_inf_tol": 1e-8,
+    # "max_iter": 50000,
+    # "max_cpu_time": 200,
+    # "mu_strategy": "adaptive",
+    # "nlp_scaling_method": "gradient-based",
+    # "hessian_approximation": "limited-memory",
+    # "limited_memory_max_history": 15,
+    # "linear_solver": "mumps",
+    # "bound_push": 1e-12,
+    # "bound_frac": 1e-12,
+    # "warm_start_init_point": "yes",
+    # "print_level": 3,
+    "tol": 1e-8,
+    "acceptable_tol": 1e-8,
     "dual_inf_tol": 1e-8,
     "constr_viol_tol": 1e-8,
     "compl_inf_tol": 1e-8,
@@ -84,13 +101,14 @@ IPOPT_DEFAULTS = {
     "mu_strategy": "adaptive",
     "nlp_scaling_method": "gradient-based",
     "hessian_approximation": "limited-memory",
-    "limited_memory_max_history": 15,
+    "limited_memory_max_history": 20,
     "linear_solver": "mumps",
-    "bound_push": 1e-12,
-    "bound_frac": 1e-12,
     "warm_start_init_point": "yes",
-    "print_level": 3,
+    "bound_push": 1e-10,
+    "bound_frac": 1e-10,
+    "print_level": 4,
 }
+
 
 def _merge_defaults(spec: SolverSpec) -> SolverSpec:
     """spec.options が空ならソルバーごとのデフォルトを自動で付与"""
