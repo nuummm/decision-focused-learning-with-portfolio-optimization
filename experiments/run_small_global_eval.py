@@ -1277,7 +1277,7 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --flex-lambda-w-iso 0 \
   --flex-theta-anchor-mode ols \
   --flex-w-anchor-mode ols \
-  --flex-theta-init-mode none \
+  --flex-theta-init-mode 'none,ipo,ols' \
   --no-ensemble \
   --disable-dual \
   --disable-kkt \
