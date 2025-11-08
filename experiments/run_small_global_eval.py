@@ -1271,13 +1271,13 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --enable-flex \
   --flex-solver 'knitro' \
   --flex-formulation 'dual,kkt' \
-  --flex-lambda-theta-anchor 0 \
-  --flex-lambda-w-anchor 0 \
-  --flex-lambda-theta-iso 0 \
-  --flex-lambda-w-iso 0 \
+  --flex-lambda-theta-anchor 1000 \
+  --flex-lambda-w-anchor 0.0 \
+  --flex-lambda-theta-iso 0.0 \
+  --flex-lambda-w-iso 0.0001 \
   --flex-theta-anchor-mode ols \
   --flex-w-anchor-mode ols \
-  --flex-theta-init-mode 'none,ipo,ols' \
+  --flex-theta-init-mode none \
   --no-ensemble \
   --disable-dual \
   --disable-kkt \
