@@ -30,6 +30,7 @@ import numpy as np
 import pyomo.environ as pyo
 
 from optimization.solvers import make_pyomo_solver
+from models.ipo_closed_form import fit_ipo_closed_form
 from models.ols import train_ols, predict_yhat
 from models.ols_gurobi import solve_series_mvo_gurobi
 
@@ -138,6 +139,12 @@ def fit_dfl_p1_flex(
     lambda_w_anchor_l1: float = 0.0,
     w_anchor: Optional[np.ndarray] = None,
     lambda_w_iso: float = 0.0,
+    theta_clamp_source: str = "none",
+    theta_clamp_enable: bool = False,
+    w_clamp_source: str = "none",
+    w_clamp_enable: bool = False,
+    anchor_clamp_tol: float = 0.0,
+    anchor_clamp_floor: float = 0.0,
 ):
     """
     DFL-P1 の柔軟な学習ルーチン。
@@ -187,6 +194,14 @@ def fit_dfl_p1_flex(
 
     used_idx, V_list = _prepare_pairs(idx, Vhats, start_index, end_index)
     T_used = len(used_idx)
+    used_idx_array = np.array(used_idx, dtype=int)
+    X_used = X[used_idx_array, :]
+    Y_used = Y[used_idx_array, :]
+
+    print("[DEBUG] clamp flags",
+      theta_clamp_enable, theta_clamp_source,
+      anchor_clamp_tol, anchor_clamp_floor)
+
 
     # --- θアンカー正則化の準備 ---
     lam_theta_l2 = float(lambda_theta_anchor)
@@ -209,6 +224,50 @@ def fit_dfl_p1_flex(
 
     # --- w 等方正則化 / DRO の準備 ---
     lam_w_iso = float(lambda_w_iso)
+    anchor_clamp_tol = max(0.0, float(anchor_clamp_tol))
+    anchor_clamp_floor = max(0.0, float(anchor_clamp_floor))
+
+    def _resolve_theta_anchor(mode: str) -> Optional[np.ndarray]:
+        m = (mode or "none").lower()
+        if m == "ols":
+            return np.asarray(train_ols(X_used, Y_used), float)
+        if m == "ipo":
+            theta_ipo, *_ = fit_ipo_closed_form(
+                X,
+                Y,
+                Vhats,
+                idx,
+                start_index=start_index,
+                end_index=end_index,
+                delta=delta,
+                mode="budget",
+                tee=tee,
+            )
+            return np.asarray(theta_ipo, float)
+        return None
+
+    def _resolve_w_anchor(mode: str) -> Optional[np.ndarray]:
+        m = (mode or "none").lower()
+        if m == "none":
+            return None
+        if m == "ipo":
+            theta_ref = _resolve_theta_anchor("ipo")
+            if theta_ref is None:
+                return None
+        else:
+            theta_ref = np.asarray(train_ols(X_used, Y_used), float)
+        try:
+            yhat_all = predict_yhat(X, theta_ref)
+            return solve_series_mvo_gurobi(
+                Yhat_all=yhat_all,
+                Vhats=V_list,
+                idx=used_idx,
+                delta=delta,
+                psd_eps=1e-12,
+                output=False,
+            )
+        except Exception:
+            return None
     # ---------------------------------------------------------
     # Build Pyomo model
     # ---------------------------------------------------------
@@ -367,6 +426,51 @@ def fit_dfl_p1_flex(
         m.w_dev_pos = pyo.Constraint(m.T, m.J, rule=w_dev_pos)
         m.w_dev_neg = pyo.Constraint(m.T, m.J, rule=w_dev_neg)
 
+    # ----- 成分ごとの相対クランプ制約 -----
+    def _relative_width(base: float) -> float:
+        return max(abs(base) * anchor_clamp_tol, anchor_clamp_floor)
+
+    clamp_theta_vec: Optional[np.ndarray] = None
+    if theta_clamp_enable and anchor_clamp_tol > 0.0:
+        clamp_theta_vec = _resolve_theta_anchor(theta_clamp_source)
+        if clamp_theta_vec is None:
+            raise ValueError("theta clamp requested but anchor unavailable.")
+        clamp_theta_vec = np.asarray(clamp_theta_vec, float).reshape(-1)
+        if clamp_theta_vec.shape[0] != d:
+            raise ValueError("theta clamp anchor must have length d.")
+
+        def theta_upper(m, j):
+            base = float(clamp_theta_vec[int(j)])
+            return m.theta[j] <= base + _relative_width(base)
+
+        def theta_lower(m, j):
+            base = float(clamp_theta_vec[int(j)])
+            return m.theta[j] >= base - _relative_width(base)
+
+        m.theta_clamp_pos = pyo.Constraint(m.J, rule=theta_upper)
+        m.theta_clamp_neg = pyo.Constraint(m.J, rule=theta_lower)
+
+    if theta_clamp_enable and anchor_clamp_tol > 0.0:
+        m.theta_clamp_pos.pprint()
+        m.theta_clamp_neg.pprint()
+
+    if w_clamp_enable and anchor_clamp_tol > 0.0:
+        clamp_w_raw = _resolve_w_anchor(w_clamp_source)
+        if clamp_w_raw is None:
+            raise ValueError("w clamp requested but anchor unavailable.")
+        clamp_w_mat = _align_matrix(clamp_w_raw, d, used_idx, idx)
+
+        def w_upper(m, t, j):
+            base = float(clamp_w_mat[int(t), int(j)])
+            return m.w[t, j] <= base + _relative_width(base)
+
+        def w_lower(m, t, j):
+            base = float(clamp_w_mat[int(t), int(j)])
+            return m.w[t, j] >= base - _relative_width(base)
+
+        m.w_clamp_pos = pyo.Constraint(m.T, m.J, rule=w_upper)
+        m.w_clamp_neg = pyo.Constraint(m.T, m.J, rule=w_lower)
+
     opt = make_pyomo_solver(m, solver=solver, tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
     meta = _solver_metadata(opt, res, solver)
@@ -375,5 +479,13 @@ def fit_dfl_p1_flex(
     W = np.array([[pyo.value(m.w[t, j]) for j in m.J] for t in m.T], dtype=float)
     MU = np.array([pyo.value(m.mu[t]) for t in m.T], dtype=float)
     LAM = np.array([[pyo.value(m.lam[t, j]) for j in m.J] for t in m.T], dtype=float)
+
+    if clamp_theta_vec is not None:
+        print("[DEBUG] theta anchor used", clamp_theta_vec)
+        print("[DEBUG] theta solution", theta_hat)
+        diff = np.abs(theta_hat - clamp_theta_vec)
+        rel = diff / np.maximum(np.abs(clamp_theta_vec), 1e-12)
+        print("[DEBUG] theta diff", diff, "rel", rel)
+
 
     return theta_hat, W, MU, LAM, used_idx, meta

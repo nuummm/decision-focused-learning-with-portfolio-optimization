@@ -229,6 +229,40 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="ols",
         help="Initial theta strategy for flex (comma-separated: none, ols, ipo).",
     )
+    parser.add_argument(
+        "--flex-theta-clamp-enable",
+        action="store_true",
+        help="Enable element-wise clamp around a reference theta (OLS or IPO).",
+    )
+    parser.add_argument(
+        "--flex-theta-clamp-source",
+        type=str,
+        default="none",
+        help="Anchor source for theta clamp (none, ols, ipo).",
+    )
+    parser.add_argument(
+        "--flex-w-clamp-enable",
+        action="store_true",
+        help="Enable element-wise clamp around a reference w (OLS or IPO).",
+    )
+    parser.add_argument(
+        "--flex-w-clamp-source",
+        type=str,
+        default="none",
+        help="Anchor source for w clamp (none, ols, ipo).",
+    )
+    parser.add_argument(
+        "--flex-anchor-clamp-tol",
+        type=str,
+        default="0.0",
+        help="Relative tolerance (e.g., 0.05 ⇒ ±5%) for theta/w clamp constraints (comma-separated).",
+    )
+    parser.add_argument(
+        "--flex-anchor-clamp-floor",
+        type=float,
+        default=0.0,
+        help="Minimum absolute tolerance for theta/w clamp constraints.",
+    )
     return parser.parse_args(argv)
 
 
@@ -252,6 +286,8 @@ class FlexConfig:
     theta_anchor_mode: str
     w_anchor_mode: str
     theta_init_mode: str
+    anchor_clamp_tol: float
+    anchor_clamp_floor: float
 
     def metadata_pairs(self) -> List[Tuple[str, str]]:
         return [
@@ -262,6 +298,8 @@ class FlexConfig:
             ("theta_anchor_mode", self.theta_anchor_mode),
             ("w_anchor_mode", self.w_anchor_mode),
             ("theta_init_mode", self.theta_init_mode),
+            ("anchor_clamp_tol", f"{self.anchor_clamp_tol:g}"),
+            ("anchor_clamp_floor", f"{self.anchor_clamp_floor:g}"),
         ]
 
     def metadata_dict(self) -> Dict[str, str]:
@@ -287,6 +325,8 @@ class FlexConfig:
             f"tam_{self.theta_anchor_mode}",
             f"wam_{self.w_anchor_mode}",
             f"tim_{self.theta_init_mode}",
+            f"clt{sanitize_token(f'{self.anchor_clamp_tol:g}')}",
+            f"clf{sanitize_token(f'{self.anchor_clamp_floor:g}')}",
         ]
         return f"combo_{index:03d}_" + "_".join(parts)
 
@@ -348,6 +388,12 @@ FLEX_METADATA_KEYS = [
     "theta_anchor_mode",
     "w_anchor_mode",
     "theta_init_mode",
+    "anchor_clamp_tol",
+    "anchor_clamp_floor",
+    "theta_clamp_enable",
+    "theta_clamp_source",
+    "w_clamp_enable",
+    "w_clamp_source",
 ]
 
 
@@ -431,6 +477,8 @@ def build_cmd(
                 theta_anchor_mode=parse_str_choices(getattr(args, "flex_theta_anchor_mode", "none"), "none")[0],
                 w_anchor_mode=parse_str_choices(getattr(args, "flex_w_anchor_mode", "ols"), "ols")[0],
                 theta_init_mode=parse_str_choices(getattr(args, "flex_theta_init_mode", "ols"), "ols")[0],
+                anchor_clamp_tol=parse_float_choices(getattr(args, "flex_anchor_clamp_tol", "0"), 0.0)[0],
+                anchor_clamp_floor=float(getattr(args, "flex_anchor_clamp_floor", 0.0) or 0.0),
             )
         cmd.extend(
             [
@@ -454,6 +502,30 @@ def build_cmd(
                 str(flex_config.w_anchor_mode).lower(),
                 "--flex-theta-init-mode",
                 str(flex_config.theta_init_mode).lower(),
+            ]
+        )
+        if getattr(args, "flex_theta_clamp_enable", False):
+            cmd.append("--flex-theta-clamp-enable")
+        cmd.extend(
+            [
+                "--flex-theta-clamp-source",
+                str(getattr(args, "flex_theta_clamp_source", "none")),
+            ]
+        )
+        if getattr(args, "flex_w_clamp_enable", False):
+            cmd.append("--flex-w-clamp-enable")
+        cmd.extend(
+            [
+                "--flex-w-clamp-source",
+                str(getattr(args, "flex_w_clamp_source", "none")),
+            ]
+        )
+        cmd.extend(
+            [
+                "--flex-anchor-clamp-tol",
+                str(flex_config.anchor_clamp_tol),
+                "--flex-anchor-clamp-floor",
+                str(flex_config.anchor_clamp_floor),
             ]
         )
     if args.no_plots:
@@ -883,6 +955,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     theta_anchor_modes = parse_str_choices(getattr(args, "flex_theta_anchor_mode", "none"), "none")
     w_anchor_modes = parse_str_choices(getattr(args, "flex_w_anchor_mode", "ols"), "ols")
     theta_init_modes = parse_str_choices(getattr(args, "flex_theta_init_mode", "ols"), "ols")
+    anchor_clamp_tol_values = parse_float_choices(getattr(args, "flex_anchor_clamp_tol", "0"), 0.0)
+    anchor_clamp_floor_value = float(getattr(args, "flex_anchor_clamp_floor", 0.0) or 0.0)
 
     flex_configs: List[FlexConfig] = [
         FlexConfig(
@@ -893,6 +967,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             theta_anchor_mode=theta_anchor_mode,
             w_anchor_mode=w_anchor_mode,
             theta_init_mode=theta_init_mode,
+            anchor_clamp_tol=clamp_tol,
+            anchor_clamp_floor=anchor_clamp_floor_value,
         )
         for (
             lam_theta_anchor,
@@ -902,6 +978,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             theta_anchor_mode,
             w_anchor_mode,
             theta_init_mode,
+            clamp_tol,
         ) in product(
             lambda_theta_anchor_values,
             lambda_w_anchor_values,
@@ -910,6 +987,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             theta_anchor_modes,
             w_anchor_modes,
             theta_init_modes,
+            anchor_clamp_tol_values,
         )
     ]
 
@@ -968,6 +1046,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             config_desc = flex_config.describe()
             lam_str = combo_metadata["lambda_theta_anchor"]
             key_suffix = flex_config.key_suffix()
+
+            theta_clamp_enabled = bool(getattr(args, "flex_theta_clamp_enable", False))
+            theta_clamp_source = (getattr(args, "flex_theta_clamp_source", "none") or "none").lower()
+            combo_metadata["theta_clamp_enable"] = "true" if theta_clamp_enabled else ""
+            combo_metadata["theta_clamp_source"] = theta_clamp_source if theta_clamp_enabled else ""
+
+            w_clamp_enabled = bool(getattr(args, "flex_w_clamp_enable", False))
+            w_clamp_source = (getattr(args, "flex_w_clamp_source", "none") or "none").lower()
+            combo_metadata["w_clamp_enable"] = "true" if w_clamp_enabled else ""
+            combo_metadata["w_clamp_source"] = w_clamp_source if w_clamp_enabled else ""
 
             log_handle.write(f"\n=== flex_config[{combo_idx}] {config_desc} ===\n")
             lam_raw_dir = raw_dir / flex_config.raw_dir_name(combo_idx)
@@ -1266,25 +1354,33 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --sigma 0.0125 \
   --res 0 \
   --delta 1.0 \
-  --seed-list '1,2,3,4,5,6,7,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31' \
+  --runs 100 \
+  --seed0 0 \
   --tee \
   --enable-flex \
   --flex-solver 'knitro' \
   --flex-formulation 'dual,kkt' \
-  --flex-lambda-theta-anchor 1000 \
-  --flex-lambda-w-anchor 0.0 \
+  --flex-lambda-theta-anchor '0.00001,0.001,0.1,10,1000' \
+  --flex-lambda-w-anchor 0 \
   --flex-lambda-theta-iso 0.0 \
-  --flex-lambda-w-iso 0.0001 \
+  --flex-lambda-w-iso 0.0 \
   --flex-theta-anchor-mode ols \
   --flex-w-anchor-mode ols \
   --flex-theta-init-mode none \
   --no-ensemble \
   --disable-dual \
   --disable-kkt \
+  --flex-w-clamp-enable --flex-w-clamp-source ols \
+  --flex-anchor-clamp-tol 1,0.5,0.25,0.1,0.05,0.01 --flex-anchor-clamp-floor 0.0 \
+  --flex-theta-clamp-enable --flex-theta-clamp-source ols \
+  --flex-anchor-clamp-tol 1,0.5,0.25,0.1,0.05,0.01 --flex-anchor-clamp-floor 0.0
 
-  --runs 1 \
-  --seed0 200 \
+  
 
+
+
+
+  --seed-list '1,2,3,4,5,6,7,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31' \
   
   flex-theta-init-mode：ols,ipo,none
 '''

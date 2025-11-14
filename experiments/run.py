@@ -92,19 +92,45 @@ def run_once(
     # Vhats = [V_true.copy() for _ in idx]  # V̂ を常に真の共分散にする
 
     def empty_result() -> Tuple[Any, ...]:
+        """Fallback payload when training/validation cannot proceed."""
         return (
-            np.nan, np.nan, 0, 1.0,
-            np.nan, np.nan, np.nan, 0.0,
-            np.nan, np.nan, np.nan,
-            np.nan, np.nan, np.nan, np.nan,
-            np.nan, np.nan, np.nan, np.nan,
-            np.full(d, np.nan),
-            "", "", np.nan, "", "fixed" if theta_fixed is not None else "trained",
-        np.nan, np.nan, np.nan, np.nan, np.nan,
-        np.nan, np.nan, np.nan,
-        np.nan, np.nan, np.nan,
-        np.nan,
-    )
+            np.nan,  # mean_cost_true
+            np.nan,  # mean_r2_corrsq
+            0,       # |Z_eval|
+            1.0,     # train_cost_true_mean (kept for backward compat)
+            np.nan,  # train_cost_vhat_mean
+            np.nan,  # mean_cost_vhat
+            np.nan,  # elapsed
+            0.0,     # train_r2_corrsq
+            np.nan,  # mean_r2_sklearn
+            np.nan,  # train_r2_sklearn
+            np.nan,  # mse_mean
+            np.nan,  # train_mse_mean
+            np.nan,  # best_cost_true_mean
+            np.nan,  # train_best_cost_true_mean
+            np.nan,  # decision_error_test
+            np.nan,  # decision_error_train
+            np.full(d, np.nan),  # theta
+            "",      # solver_status
+            "",      # solver_term
+            np.nan,  # solver_time
+            "",      # solver_message
+            "fixed" if theta_fixed is not None else "trained",  # theta_source
+            np.nan,  # budget_violation
+            np.nan,  # nonneg_violation
+            np.nan,  # stationarity_violation
+            np.nan,  # complementarity_violation
+            np.nan,  # strong_duality_violation
+            np.nan,  # mean_return_test
+            np.nan,  # std_return_test
+            np.nan,  # sharpe_test
+            np.nan,  # mean_return_train
+            np.nan,  # std_return_train
+            np.nan,  # sharpe_train
+            np.nan,  # gurobi_gap
+            np.full(d, np.nan),  # avg_weight_test
+            np.full(d, np.nan),  # avg_weight_train
+        )
 
     if len(Vhats) == 0:
         return empty_result()
@@ -666,6 +692,18 @@ def main():
                    help='w anchor source (e.g. "ols" or "none").')
     p.add_argument("--flex-theta-init-mode", type=str, default="ols",
                    help='Theta initialisation for flex ("none" or "ols").')
+    p.add_argument("--flex-theta-clamp-enable", action="store_true",
+                   help="Enable element-wise clamp around chosen theta anchor (ols/ipo).")
+    p.add_argument("--flex-theta-clamp-source", type=str, default="none",
+                   help='Source for theta clamp anchor ("none", "ols", "ipo").')
+    p.add_argument("--flex-w-clamp-enable", action="store_true",
+                   help="Enable element-wise clamp around chosen w anchor (ols/ipo).")
+    p.add_argument("--flex-w-clamp-source", type=str, default="none",
+                   help='Source for w clamp anchor ("none", "ols", "ipo").')
+    p.add_argument("--flex-anchor-clamp-tol", type=float, default=0.0,
+                   help="Relative tolerance for clamp constraints (e.g., 0.05 => ±5%).")
+    p.add_argument("--flex-anchor-clamp-floor", type=float, default=0.0,
+                   help="Absolute minimum tolerance for clamp constraints.")
 
     args = p.parse_args()
     auto_baseline = not args.no_auto_baseline
@@ -732,6 +770,12 @@ def main():
             "lambda_w_iso": float(getattr(args, "flex_lambda_w_iso", 0.0) or 0.0),
             "theta_anchor_mode": (getattr(args, "flex_theta_anchor_mode", "none") or "none").lower(),
             "w_anchor_mode": (getattr(args, "flex_w_anchor_mode", "ols") or "ols").lower(),
+            "theta_clamp_enable": bool(getattr(args, "flex_theta_clamp_enable", False)),
+            "theta_clamp_source": (getattr(args, "flex_theta_clamp_source", "none") or "none").lower(),
+            "w_clamp_enable": bool(getattr(args, "flex_w_clamp_enable", False)),
+            "w_clamp_source": (getattr(args, "flex_w_clamp_source", "none") or "none").lower(),
+            "anchor_clamp_tol": float(getattr(args, "flex_anchor_clamp_tol", 0.0) or 0.0),
+            "anchor_clamp_floor": float(getattr(args, "flex_anchor_clamp_floor", 0.0) or 0.0),
         }
 
     # ここで solver_options を一回だけ作る
