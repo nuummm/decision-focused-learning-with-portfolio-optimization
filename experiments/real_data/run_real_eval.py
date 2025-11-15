@@ -1,0 +1,1065 @@
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from data.real_data.loader import MarketLoaderConfig
+from experiments.real_data.data_pipeline import (
+    PipelineConfig,
+    build_data_bundle,
+)
+from experiments.registry import (
+    SolverSpec,
+    get_trainer,
+    KNITRO_DEFAULTS,
+    GUROBI_DEFAULTS,
+    IPOPT_DEFAULTS,
+)
+from models.ols import predict_yhat
+from models.ols_gurobi import solve_mvo_gurobi
+
+try:  # Optional plotting for debug artifacts
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover
+    plt = None
+
+HERE = Path(__file__).resolve()
+RESULTS_BASE = HERE.parents[3] / "results"
+RESULTS_ROOT = RESULTS_BASE / "exp_real_data"
+DEBUG_ROOT = RESULTS_BASE / "debug_outputs"
+
+PERIOD_WINDOWS = [
+    ("gfc_2008", "2007-01-01", "2009-12-31"),
+    ("covid_2020", "2020-02-01", "2020-12-31"),
+    ("inflation_2022", "2022-01-01", "2023-12-31"),
+]
+
+WEIGHT_THRESHOLD = 0.95
+
+
+def mvo_cost(z: np.ndarray, y: np.ndarray, V: np.ndarray, delta: float = 1.0) -> float:
+    z = np.asarray(z, dtype=float)
+    y = np.asarray(y, dtype=float)
+    V = np.asarray(V, dtype=float)
+    return float(-z @ y + 0.5 * delta * (z @ V @ z))
+
+
+def parse_tickers(value: str) -> List[str]:
+    return [t.strip().upper() for t in value.split(",") if t.strip()]
+
+
+def parse_commalist(value: str) -> List[str]:
+    return [v.strip().lower() for v in value.split(",") if v.strip()]
+
+
+def make_output_dir(base: Path | None) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    root = base or (RESULTS_ROOT / timestamp)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+@dataclass
+class ScheduleItem:
+    rebalance_idx: int
+    train_start: int
+    train_end: int
+    eval_indices: List[int]
+
+
+def build_rebalance_schedule(
+    bundle,
+    train_window: int,
+    rebal_interval: int,
+) -> List[ScheduleItem]:
+    cov_indices = bundle.cov_indices.tolist()
+    cov_set = set(cov_indices)
+    test_cov = cov_indices[:]
+
+    schedule: List[ScheduleItem] = []
+    pos = 0
+    while pos < len(test_cov):
+        rebalance_idx = test_cov[pos]
+        train_end = rebalance_idx - 1
+        train_start = train_end - train_window + 1
+        if train_start < 0:
+            pos += 1
+            continue
+        if train_start not in cov_set or train_end not in cov_set:
+            pos += 1
+            continue
+        eval_indices = test_cov[pos : pos + rebal_interval]
+        if not eval_indices:
+            break
+        schedule.append(
+            ScheduleItem(
+                rebalance_idx=rebalance_idx,
+                train_start=train_start,
+                train_end=train_end,
+                eval_indices=eval_indices,
+            )
+        )
+        pos += rebal_interval
+    return schedule
+
+
+def plot_wealth_curve(dates: Sequence[pd.Timestamp], wealth: Sequence[float], path: Path) -> None:
+    if plt is None:
+        return
+    plt.figure(figsize=(10, 4))
+    plt.plot(dates, wealth, label="wealth")
+    plt.xlabel("date")
+    plt.ylabel("wealth")
+    plt.title("Portfolio wealth trajectory")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def plot_weight_paths(weights_df: pd.DataFrame, model: str, path: Path) -> None:
+    if plt is None or weights_df.empty:
+        return
+    dates = pd.to_datetime(weights_df["date"])
+    value_cols = [c for c in weights_df.columns if c not in {"date", "portfolio_return_sq"}]
+    values = weights_df[value_cols].astype(float)
+    value_cols_sorted = sorted(value_cols)
+    values = values[value_cols_sorted]
+    plt.figure(figsize=(10, 4))
+    bottom = np.zeros(len(values))
+    if len(dates) > 1:
+        date_series = pd.Series(dates)
+        diffs = date_series.diff().dt.days.dropna()
+        median_diff = diffs.median() if not diffs.empty else 1
+        interval_days = max(int(median_diff), 1)
+    else:
+        interval_days = 7
+    width = interval_days
+    for col in value_cols_sorted:
+        plt.bar(dates, values[col], bottom=bottom, label=col, width=width, align="center")
+        bottom += values[col].to_numpy()
+    plt.ylim(0, 1)
+    plt.title(f"Weight allocation (stacked) - {model}")
+    plt.xlabel("date")
+    plt.ylabel("weight share")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+    # also plot individual lines for reference
+    plt.figure(figsize=(10, 4))
+    for col in value_cols_sorted:
+        plt.plot(dates, values[col], label=col)
+    plt.ylim(0, 1)
+    plt.title(f"Weight trajectories ({model})")
+    plt.xlabel("date")
+    plt.ylabel("weight")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(path.with_name(path.stem + "_lines" + path.suffix))
+    plt.close()
+
+
+def plot_weight_comparison(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+    if plt is None or not weight_dict:
+        return
+    models = list(weight_dict.keys())
+    n = len(models)
+    fig, axes = plt.subplots(n, 1, figsize=(10, 3 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+    for ax, model in zip(axes, models):
+        df = weight_dict[model]
+        dates = pd.to_datetime(df["date"])
+        value_cols = [c for c in df.columns if c not in {"date", "portfolio_return_sq"}]
+        values = df[value_cols].astype(float)
+        bottom = np.zeros(len(values))
+        for col in value_cols:
+            ax.bar(dates, values[col], bottom=bottom, label=col, width=5)
+            bottom += values[col].to_numpy()
+        ax.set_ylim(0, 1)
+        ax.set_ylabel(model)
+        ax.legend(loc="upper right")
+    axes[-1].set_xlabel("date")
+    fig.suptitle("Weight allocation (stacked) per model")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def export_weight_variance_correlation(
+    weight_dict: Dict[str, pd.DataFrame],
+    csv_path: Path,
+    fig_path: Path,
+) -> None:
+    rows: List[Dict[str, object]] = []
+    for model, df in weight_dict.items():
+        if "portfolio_return_sq" not in df.columns:
+            continue
+        ticker_cols = [c for c in df.columns if c not in {"date", "portfolio_return_sq"}]
+        if not ticker_cols:
+            continue
+        returns_sq = df["portfolio_return_sq"].astype(float)
+        if returns_sq.std(ddof=0) == 0:
+            continue
+        for ticker in ticker_cols:
+            corr = np.corrcoef(df[ticker].astype(float), returns_sq)[0, 1]
+            rows.append(
+                {
+                    "model": model,
+                    "ticker": ticker,
+                    "corr_weight_vs_return_var": float(corr),
+                }
+            )
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(csv_path, index=False)
+        if plt is not None:
+            pivot = df.pivot(index="model", columns="ticker", values="corr_weight_vs_return_var")
+            fig, ax = plt.subplots(figsize=(6, 4))
+            data = pivot.to_numpy()
+            cax = ax.imshow(data, cmap="coolwarm", vmin=-1, vmax=1)
+            ax.set_xticks(range(len(pivot.columns)))
+            ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+            ax.set_yticks(range(len(pivot.index)))
+            ax.set_yticklabels(pivot.index)
+            ax.set_title("Weight vs variance correlation")
+            for i in range(data.shape[0]):
+                for j in range(data.shape[1]):
+                    ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
+            fig.colorbar(cax)
+            fig.tight_layout()
+            fig.savefig(fig_path)
+            plt.close(fig)
+
+
+def plot_wealth_correlation_heatmap(corr_df: pd.DataFrame, path: Path) -> None:
+    if plt is None or corr_df.empty:
+        return
+    fig, ax = plt.subplots(figsize=(5, 4))
+    data = corr_df.to_numpy()
+    cax = ax.imshow(data, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(corr_df.columns)))
+    ax.set_xticklabels(corr_df.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(corr_df.index)))
+    ax.set_yticklabels(corr_df.index)
+    ax.set_title("Wealth return correlation")
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
+    fig.colorbar(cax)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def max_drawdown(wealth_series: Sequence[float]) -> float:
+    arr = np.asarray(wealth_series, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    running_max = np.maximum.accumulate(arr)
+    dd = 1.0 - arr / running_max
+    return float(np.nanmax(dd))
+
+
+def compute_period_metrics(step_df: pd.DataFrame) -> List[Dict[str, object]]:
+    if step_df.empty:
+        return []
+    df = step_df.copy()
+    df["date_ts"] = pd.to_datetime(df["date"])
+    results: List[Dict[str, object]] = []
+    for name, start, end in PERIOD_WINDOWS:
+        mask = (df["date_ts"] >= pd.Timestamp(start)) & (df["date_ts"] <= pd.Timestamp(end))
+        subset = df.loc[mask]
+        if subset.empty:
+            continue
+        returns = subset["portfolio_return"].to_numpy()
+        mean_ret = float(np.mean(returns))
+        std_ret = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+        sharpe = mean_ret / std_ret if std_ret > 1e-12 else np.nan
+        wealth = subset["wealth"].to_numpy()
+        dd = max_drawdown(wealth)
+        results.append(
+            {
+                "period": name,
+                "start": start,
+                "end": end,
+                "mean_return": mean_ret,
+                "std_return": std_ret,
+                "sharpe": sharpe,
+                "max_drawdown": dd,
+                "n_steps": int(len(subset)),
+            }
+        )
+    return results
+
+
+def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+    if plt is None:
+        return
+    plt.figure(figsize=(10, 4))
+    for model, df in wealth_dict.items():
+        plt.plot(pd.to_datetime(df["date"]), df["wealth"], label=model)
+    plt.xlabel("date")
+    plt.ylabel("wealth")
+    plt.title("Wealth comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+    if plt is None:
+        return
+    plt.figure(figsize=(10, 4))
+    for model, df in wealth_dict.items():
+        plt.plot(pd.to_datetime(df["date"]), df["wealth"], label=model)
+    for name, start, end in PERIOD_WINDOWS:
+        plt.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15, label=name)
+    plt.xlabel("date")
+    plt.ylabel("wealth")
+    plt.title("Wealth comparison with crisis windows")
+    handles, labels = plt.gca().get_legend_handles_labels()
+    seen = set()
+    unique_handles = []
+    unique_labels = []
+    for h, l in zip(handles, labels):
+        if l not in seen:
+            unique_handles.append(h)
+            unique_labels.append(l)
+            seen.add(l)
+    plt.legend(unique_handles, unique_labels, loc="best")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def plot_time_series(df: pd.DataFrame, title: str, start_date: pd.Timestamp, path: Path) -> None:
+    if plt is None or df.empty:
+        return
+    plt.figure(figsize=(10, 4))
+    for col in df.columns:
+        plt.plot(df.index, df[col], label=col)
+    if not pd.isna(start_date):
+        plt.axvline(start_date, color="red", linestyle="--", label="start_date")
+    plt.title(title)
+    plt.xlabel("date")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
+
+
+def reduce_weight_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    value_cols = [c for c in df.columns if c not in {"date", "portfolio_return_sq"}]
+    value_cols_sorted = sorted(value_cols)
+    values = df[value_cols_sorted].astype(float)
+    return values, value_cols_sorted
+
+
+def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path, fig_path: Path) -> None:
+    rows: List[Dict[str, object]] = []
+    for model, df in weight_dict.items():
+        values, cols = reduce_weight_columns(df)
+        mean_vals = values.mean(skipna=True)
+        for ticker in cols:
+            rows.append({"model": model, "ticker": ticker, "avg_weight": float(mean_vals[ticker])})
+    if not rows:
+        return
+    avg_df = pd.DataFrame(rows)
+    avg_df.to_csv(csv_path, index=False)
+    if plt is None:
+        return
+    pivot = avg_df.pivot(index="model", columns="ticker", values="avg_weight")
+    pivot = pivot.fillna(0.0)
+    ind = np.arange(len(pivot.index))
+    width = 0.8 / max(len(pivot.columns), 1)
+    plt.figure(figsize=(8, 4))
+    for i, ticker in enumerate(pivot.columns):
+        plt.bar(ind + i * width, pivot[ticker], width=width, label=ticker)
+    plt.xticks(ind + width * (len(pivot.columns) - 1) / 2, pivot.index)
+    plt.ylabel("average weight")
+    plt.title("Average allocation per model")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(fig_path)
+    plt.close()
+
+
+def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+    if plt is None or not weight_dict:
+        return
+    models = list(weight_dict.keys())
+    tickers = reduce_weight_columns(next(iter(weight_dict.values())))[1]
+    n_rows = len(models)
+    n_cols = len(tickers)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 2.5 * n_rows), sharex=False)
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = np.array([axes])
+    elif n_cols == 1:
+        axes = np.array([[ax] for ax in axes])
+    for r, model in enumerate(models):
+        values, _ = reduce_weight_columns(weight_dict[model])
+        for c, ticker in enumerate(tickers):
+            ax = axes[r, c]
+            ax.hist(values[ticker].dropna(), bins=20, range=(0, 1), color="tab:blue", alpha=0.7)
+            if r == n_rows - 1:
+                ax.set_xlabel(ticker)
+            if c == 0:
+                ax.set_ylabel(model)
+    fig.suptitle("Weight distributions")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def export_weight_threshold_frequency(
+    weight_dict: Dict[str, pd.DataFrame],
+    threshold: float,
+    csv_path: Path,
+    fig_path: Path,
+) -> None:
+    rows: List[Dict[str, object]] = []
+    for model, df in weight_dict.items():
+        values, cols = reduce_weight_columns(df)
+        counts = (values >= threshold).sum(axis=0)
+        total = len(values)
+        for ticker in cols:
+            freq = float(counts[ticker]) / total if total > 0 else 0.0
+            rows.append({"model": model, "ticker": ticker, "freq_ge_thresh": freq})
+    if not rows:
+        return
+    freq_df = pd.DataFrame(rows)
+    freq_df.to_csv(csv_path, index=False)
+    if plt is None:
+        return
+    pivot = freq_df.pivot(index="model", columns="ticker", values="freq_ge_thresh").fillna(0.0)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    data = pivot.to_numpy()
+    cax = ax.imshow(data, cmap="Blues", vmin=0, vmax=1)
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    ax.set_title(f"Freq(weight >= {threshold:.2f})")
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
+    fig.colorbar(cax)
+    fig.tight_layout()
+    fig.savefig(fig_path)
+    plt.close(fig)
+
+
+def resolved_solver_options(name: str, options: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+    if options:
+        return dict(options)
+    lower = (name or "").lower()
+    if lower == "knitro":
+        return dict(KNITRO_DEFAULTS)
+    if lower == "gurobi":
+        return dict(GUROBI_DEFAULTS)
+    if lower == "ipopt":
+        return dict(IPOPT_DEFAULTS)
+    return {}
+
+
+
+def train_model_window(
+    model_key: str,
+    trainer,
+    bundle,
+    delta: float,
+    solver_spec: SolverSpec,
+    flex_options: Dict[str, float] | None,
+    train_start: int,
+    train_end: int,
+    tee: bool,
+):
+    trainer_kwargs: Dict[str, object] = dict(
+        X=bundle.dataset.X,
+        Y=bundle.dataset.Y,
+        Vhats=bundle.covariances,
+        idx=bundle.cov_indices.tolist(),
+        start_index=train_start,
+        end_index=train_end,
+        delta=delta,
+        tee=tee,
+    )
+    if model_key == "flex" and flex_options:
+        trainer_kwargs.update(flex_options)
+
+    start_time = time.perf_counter()
+    trainer_ret = trainer(**trainer_kwargs)
+    elapsed = time.perf_counter() - start_time
+
+    if not isinstance(trainer_ret, (list, tuple)) or len(trainer_ret) < 5:
+        raise RuntimeError(f"Trainer {model_key} returned unexpected output")
+
+    theta_hat = trainer_ret[0]
+    info = trainer_ret[5] if len(trainer_ret) >= 6 else {}
+    return theta_hat, info, elapsed
+
+
+def run_rolling_experiment(
+    model_key: str,
+    model_label: str,
+    bundle,
+    delta: float,
+    solver_spec: SolverSpec,
+    flex_options: Dict[str, float] | None,
+    train_window: int,
+    rebal_interval: int,
+    debug_roll: bool,
+    debug_dir: Path,
+    results_model_dir: Path,
+    tee: bool,
+) -> Dict[str, object]:
+    trainer = get_trainer(model_key, solver_spec)
+    schedule = build_rebalance_schedule(bundle, train_window, rebal_interval)
+    cov_lookup = {
+        idx: (cov, stat)
+        for idx, cov, stat in zip(
+            bundle.cov_indices.tolist(), bundle.covariances, bundle.cov_stats
+        )
+    }
+
+    wealth = 1.0
+    wealth_dates: List[pd.Timestamp] = []
+    wealth_values: List[float] = []
+    wealth_labels: List[str] = []
+
+    step_rows: List[Dict[str, object]] = []
+    rebalance_rows: List[Dict[str, object]] = []
+
+    total_cycles = len(schedule)
+    for cycle_id, item in enumerate(schedule):
+        theta_hat, info, elapsed = train_model_window(
+            model_key,
+            trainer,
+            bundle,
+            delta,
+            solver_spec,
+            flex_options,
+            item.train_start,
+            item.train_end,
+            tee,
+        )
+        Yhat_all = predict_yhat(bundle.dataset.X, theta_hat)
+
+        if debug_roll:
+            progress = (cycle_id + 1) / max(total_cycles, 1)
+            bar = "#" * int(progress * 20)
+            print(
+                f"[roll-debug] model={model_label} cycle={cycle_id+1}/{total_cycles} "
+                f"idx={item.rebalance_idx} train=[{item.train_start},{item.train_end}] "
+                f"n_eval={len(item.eval_indices)} [{bar:<20}] {progress:.0%}"
+            )
+
+        rebalance_rows.append(
+            {
+                "cycle": cycle_id,
+                "model": model_label,
+                "rebalance_idx": item.rebalance_idx,
+                "rebalance_date": bundle.dataset.timestamps[item.rebalance_idx].isoformat(),
+                "train_start": item.train_start,
+                "train_end": item.train_end,
+                "solver_status": (info or {}).get("status", ""),
+                "solver_term": (info or {}).get("termination_condition", ""),
+                "elapsed_sec": elapsed,
+            }
+        )
+
+        if not wealth_dates and item.eval_indices:
+            wealth_dates.append(bundle.dataset.timestamps[item.eval_indices[0]])
+            wealth_values.append(wealth)
+            wealth_labels.append("initial")
+
+        for eval_idx in item.eval_indices:
+            if eval_idx not in cov_lookup:
+                continue
+            cov, stat = cov_lookup[eval_idx]
+            yhat = Yhat_all[eval_idx]
+            z = solve_mvo_gurobi(
+                y_hat=yhat,
+                V_hat=cov,
+                delta=delta,
+                psd_eps=1e-9,
+                output=False,
+            )
+            if z is None or np.isnan(z).any():
+                continue
+            realized = float(z @ bundle.dataset.Y[eval_idx])
+            wealth *= (1.0 + realized)
+            wealth_dates.append(bundle.dataset.timestamps[eval_idx])
+            wealth_values.append(wealth)
+            wealth_labels.append("after_step")
+
+            cost = mvo_cost(z, bundle.dataset.Y[eval_idx], cov, delta)
+            step_rows.append(
+                {
+                    "cycle": cycle_id,
+                    "model": model_label,
+                    "date": bundle.dataset.timestamps[eval_idx].isoformat(),
+                    "eval_idx": eval_idx,
+                    "eig_min": stat.eigen_min,
+                    "portfolio_return": realized,
+                    "wealth": wealth,
+                    "mvo_cost": cost,
+                    "theta": json.dumps(theta_hat.tolist()),
+                    "weights": json.dumps(z.tolist()),
+                    "weight_sum": float(np.sum(z)),
+                    "weight_min": float(np.min(z)),
+                    "weight_max": float(np.max(z)),
+                }
+            )
+
+    if not step_rows:
+        raise RuntimeError("No evaluation steps were executed. Check train_window/rebal_interval settings.")
+
+    step_df = pd.DataFrame(step_rows)
+    returns = step_df["portfolio_return"].to_numpy()
+    mean_return = float(np.mean(returns))
+    std_return = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+    sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
+
+    model_debug_dir = debug_dir / f"model_{model_label}"
+    model_debug_dir.mkdir(parents=True, exist_ok=True)
+
+    step_path = model_debug_dir / "step_log.csv"
+    step_df.to_csv(step_path, index=False)
+
+    rebalance_df = pd.DataFrame(rebalance_rows)
+    rebalance_df.to_csv(model_debug_dir / "rebalance_log.csv", index=False)
+
+    wealth_df = pd.DataFrame({"date": wealth_dates, "wealth": wealth_values, "label": wealth_labels})
+    wealth_df.to_csv(model_debug_dir / "wealth.csv", index=False)
+    plot_wealth_curve(wealth_dates, wealth_values, model_debug_dir / "wealth.png")
+
+    # Parse weights into tidy columns
+    if step_df.empty:
+        weights_df = pd.DataFrame()
+    else:
+        weight_records: List[Dict[str, float]] = []
+        tickers = bundle.dataset.config.tickers
+        for _, row in step_df.iterrows():
+            weights = json.loads(row["weights"])
+            record = {"date": row["date"]}
+            for i, ticker in enumerate(tickers):
+                record[ticker] = float(weights[i]) if i < len(weights) else np.nan
+            record["portfolio_return_sq"] = float(row["portfolio_return"]) ** 2
+            weight_records.append(record)
+        weights_df = pd.DataFrame(weight_records)
+
+    if not results_model_dir.exists():
+        results_model_dir.mkdir(parents=True, exist_ok=True)
+    wealth_df.to_csv(results_model_dir / "wealth.csv", index=False)
+    if not weights_df.empty:
+        weights_df.to_csv(results_model_dir / "weights.csv", index=False)
+        plot_weight_paths(weights_df, model_label, results_model_dir / "weights.png")
+    step_df.to_csv(results_model_dir / "step_metrics.csv", index=False)
+
+    lengths = (rebalance_df["train_end"] - rebalance_df["train_start"] + 1).tolist()
+    status_counts = rebalance_df["solver_status"].value_counts().to_dict()
+    reb_summary = {
+        "n_cycles": len(schedule),
+        "train_length_min": int(min(lengths)) if lengths else 0,
+        "train_length_max": int(max(lengths)) if lengths else 0,
+        "solver_status_counts": status_counts,
+        "elapsed_mean": float(rebalance_df["elapsed_sec"].mean()) if len(rebalance_df) else 0.0,
+        "elapsed_max": float(rebalance_df["elapsed_sec"].max()) if len(rebalance_df) else 0.0,
+    }
+    (model_debug_dir / "rebalance_summary.json").write_text(
+        json.dumps(reb_summary, ensure_ascii=False, indent=2)
+    )
+
+    stats_report = {
+        "model": model_label,
+        "n_cycles": len(schedule),
+        "n_steps": len(step_rows),
+        "mean_return": mean_return,
+        "std_return": std_return,
+        "sharpe": sharpe,
+        "max_drawdown": max_drawdown(wealth_values),
+        "final_wealth": float(wealth_values[-1]) if wealth_values else 1.0,
+    }
+
+    report_path = model_debug_dir / "debug_notes.txt"
+    report_path.write_text(
+        "\n".join(
+            [
+                "# Rolling debug notes",
+                f"model: {model_key}",
+                f"cycles: {len(schedule)}",
+                f"steps: {len(step_rows)}",
+                "Check points:",
+                "- eig_min > 0 (see step_log.csv) ⇒ 共分散が正定値",
+                "- wealth.csv の initial 行 = 1.0 で始まり、以降 0 未満になっていないか",
+                "- step_log の weight_sum≈1, weight_min>=0 か（制約違反チェック）",
+                "- rebalance_summary.json で solver_status が異常値を持っていないか",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    period_metrics = compute_period_metrics(step_df)
+
+    return {
+        "stats": stats_report,
+        "period_metrics": period_metrics,
+        "wealth_df": wealth_df,
+        "weights_df": weights_df,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Real-data rolling experiment runner")
+    parser.add_argument("--tickers", type=str, default="SPY,TLT,DBC,BIL")
+    parser.add_argument("--start", type=str, default="2010-01-01")
+    parser.add_argument("--end", type=str, default="2024-12-31")
+    parser.add_argument("--interval", type=str, default="1d")
+    parser.add_argument("--price-field", type=str, default="Close")
+    parser.add_argument("--return-kind", type=str, default="log", choices=["simple", "log"])
+    parser.add_argument("--frequency", type=str, default="weekly", choices=["daily", "weekly"])
+    parser.add_argument("--resample-rule", type=str, default="W-FRI")
+    parser.add_argument("--momentum-window", type=int, default=52)
+    parser.add_argument("--return-horizon", type=int, default=1)
+    parser.add_argument("--cov-window", type=int, default=60)
+    parser.add_argument("--cov-method", type=str, default="diag", choices=["diag", "ledoit_wolf"])
+    parser.add_argument("--cov-shrinkage", type=float, default=0.94)
+    parser.add_argument("--cov-eps", type=float, default=1e-6)
+    parser.add_argument("--no-auto-adjust", action="store_true")
+    parser.add_argument("--force-refresh", action="store_true")
+
+    parser.add_argument("--train-window", type=int, default=25)
+    parser.add_argument("--rebal-interval", type=int, default=1)
+
+    parser.add_argument("--delta", type=float, default=1.0)
+    parser.add_argument("--models", type=str, default="ols,ipo,dual,flex")
+    parser.add_argument("--dual-solver", type=str, default="gurobi")
+    parser.add_argument("--flex-solver", type=str, default="gurobi")
+    parser.add_argument(
+        "--flex-formulation",
+        type=str,
+        default="dual",
+        help="Comma-separated flex base models to run (e.g., 'dual' or 'dual,kkt').",
+    )
+    parser.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0)
+    parser.add_argument("--flex-lambda-w-anchor", type=float, default=0.0)
+    parser.add_argument("--flex-lambda-theta-iso", type=float, default=0.0)
+    parser.add_argument("--flex-lambda-w-iso", type=float, default=0.0)
+    parser.add_argument("--flex-theta-anchor-mode", type=str, default="ols")
+    parser.add_argument("--flex-w-anchor-mode", type=str, default="ols")
+    parser.add_argument("--flex-theta-init-mode", type=str, default="ols")
+    parser.add_argument("--flex-theta-clamp-enable", action="store_true")
+    parser.add_argument("--flex-theta-clamp-source", type=str, default="ols")
+    parser.add_argument("--flex-theta-clamp-tol", type=float, default=0.0)
+    parser.add_argument("--flex-theta-clamp-floor", type=float, default=0.0)
+    parser.add_argument("--flex-theta-clamp-penalty", type=float, default=0.0)
+    parser.add_argument("--flex-w-clamp-enable", action="store_true")
+    parser.add_argument("--flex-w-clamp-source", type=str, default="ols")
+    parser.add_argument("--flex-w-clamp-tol", type=float, default=0.0)
+    parser.add_argument("--flex-w-clamp-floor", type=float, default=0.0)
+    parser.add_argument("--flex-w-clamp-penalty", type=float, default=0.0)
+    parser.add_argument("--tee", action="store_true")
+    parser.add_argument("--debug-roll", action="store_true")
+
+    parser.add_argument("--outdir", type=Path, default=None)
+    parser.add_argument("--no-debug", action="store_true")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    tickers = parse_tickers(args.tickers)
+    outdir = make_output_dir(args.outdir)
+    analysis_dir = outdir / "analysis"
+    analysis_csv_dir = analysis_dir / "csv"
+    analysis_fig_dir = analysis_dir / "figures"
+    analysis_csv_dir.mkdir(parents=True, exist_ok=True)
+    analysis_fig_dir.mkdir(parents=True, exist_ok=True)
+    model_outputs_dir = outdir / "model_outputs"
+    model_outputs_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = DEBUG_ROOT / f"{outdir.name}_rolling"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    flex_formulations = parse_commalist(args.flex_formulation)
+    if not flex_formulations:
+        flex_formulations = ["dual"]
+    valid_forms = {"dual", "kkt"}
+    for form in flex_formulations:
+        if form not in valid_forms:
+            raise ValueError(f"Unknown flex formulation '{form}'. Use 'dual' or 'kkt'.")
+
+    loader_cfg = MarketLoaderConfig.for_cli(
+        tickers=tickers,
+        start=args.start,
+        end=args.end,
+        interval=args.interval,
+        price_field=args.price_field,
+        return_kind=args.return_kind,  # type: ignore[arg-type]
+        frequency=args.frequency,  # type: ignore[arg-type]
+        resample_rule=args.resample_rule,
+        momentum_window=args.momentum_window,
+        return_horizon=args.return_horizon,
+        cov_window=args.cov_window,
+        cov_method=args.cov_method,  # type: ignore[arg-type]
+        cov_shrinkage=args.cov_shrinkage,
+        cov_eps=args.cov_eps,
+        auto_adjust=not args.no_auto_adjust,
+        cache_dir=None,
+        force_refresh=args.force_refresh,
+        debug=not args.no_debug,
+    )
+
+    pipeline_cfg = PipelineConfig(loader=loader_cfg, debug=not args.no_debug)
+    bundle = build_data_bundle(pipeline_cfg)
+    bundle_summary = bundle.summary()
+    bundle_summary.update(
+        {
+            "train_window": args.train_window,
+            "rebal_interval": args.rebal_interval,
+            "covariance_samples": len(bundle.cov_indices),
+        }
+    )
+
+    summary_path = outdir / "experiment_summary.json"
+    summary_path.write_text(json.dumps(bundle_summary, ensure_ascii=False, indent=2))
+
+    config_records = []
+    for key, value in sorted(vars(args).items()):
+        config_records.append({"parameter": key, "value": value})
+    pd.DataFrame(config_records).to_csv(analysis_csv_dir / "experiment_config.csv", index=False)
+
+    start_ts = pd.Timestamp(loader_cfg.start)
+    plot_time_series(
+        bundle.dataset.prices,
+        "Prices timeseries",
+        start_ts,
+        analysis_fig_dir / "data_prices.png",
+    )
+    plot_time_series(
+        bundle.dataset.returns,
+        "Returns timeseries",
+        start_ts,
+        analysis_fig_dir / "data_returns.png",
+    )
+    plot_time_series(
+        bundle.dataset.momentum,
+        "Momentum timeseries",
+        start_ts,
+        analysis_fig_dir / "data_momentum.png",
+    )
+
+    stats_results: List[Dict[str, object]] = []
+    period_rows: List[Dict[str, object]] = []
+    wealth_dict: Dict[str, pd.DataFrame] = {}
+    weight_dict: Dict[str, pd.DataFrame] = {}
+    weight_dict: Dict[str, pd.DataFrame] = {}
+
+    flex_base_options = dict(
+        lambda_theta_anchor=args.flex_lambda_theta_anchor,
+        lambda_w_anchor=args.flex_lambda_w_anchor,
+        lambda_theta_iso=args.flex_lambda_theta_iso,
+        lambda_w_iso=args.flex_lambda_w_iso,
+        theta_anchor_mode=args.flex_theta_anchor_mode,
+        w_anchor_mode=args.flex_w_anchor_mode,
+        theta_init_mode=args.flex_theta_init_mode,
+        theta_clamp_enable=args.flex_theta_clamp_enable,
+        theta_clamp_source=args.flex_theta_clamp_source,
+        theta_clamp_tol=args.flex_theta_clamp_tol,
+        theta_clamp_floor=args.flex_theta_clamp_floor,
+        theta_clamp_penalty=args.flex_theta_clamp_penalty,
+        w_clamp_enable=args.flex_w_clamp_enable,
+        w_clamp_source=args.flex_w_clamp_source,
+        w_clamp_tol=args.flex_w_clamp_tol,
+        w_clamp_floor=args.flex_w_clamp_floor,
+        w_clamp_penalty=args.flex_w_clamp_penalty,
+    )
+
+    model_list = [m.strip().lower() for m in args.models.split(",") if m.strip()]
+
+    for model_key in model_list:
+        if model_key not in {"ols", "ipo", "dual", "flex"}:
+            print(f"[real-data] skipping unsupported model '{model_key}'")
+            continue
+        formulations = flex_formulations if model_key == "flex" else [None]
+        for form in formulations:
+            label = model_key
+            if model_key == "flex" and (len(formulations) > 1 or (form and form != "dual")):
+                label = f"{model_key}_{form}"
+            print(f"[real-data] rolling model={label}")
+            solver_name = args.dual_solver if model_key == "dual" else args.flex_solver if model_key == "flex" else "analytic"
+            if model_key in {"ols", "ipo"}:
+                solver_spec = SolverSpec(name="analytic", tee=args.tee)
+            else:
+                solver_spec = SolverSpec(name=solver_name, tee=args.tee)
+            flex_options = None
+            if model_key == "flex":
+                flex_options = dict(flex_base_options)
+                flex_options["formulation"] = form or "dual"
+            results_dir = model_outputs_dir / label
+            run_result = run_rolling_experiment(
+                model_key=model_key,
+                model_label=label,
+                bundle=bundle,
+                delta=args.delta,
+                solver_spec=solver_spec,
+                flex_options=flex_options,
+                train_window=args.train_window,
+                rebal_interval=args.rebal_interval,
+                debug_roll=args.debug_roll,
+                debug_dir=debug_dir,
+                results_model_dir=results_dir,
+                tee=args.tee,
+            )
+            stats_results.append(run_result["stats"])
+            for row in run_result["period_metrics"]:
+                period_entry = dict(row)
+                period_entry["model"] = label
+                period_rows.append(period_entry)
+            wealth_dict[label] = run_result["wealth_df"][["date", "wealth"]]
+            if not run_result["weights_df"].empty:
+                weight_dict[label] = run_result["weights_df"]
+            if not run_result["weights_df"].empty:
+                weight_dict[label] = run_result["weights_df"]
+
+    if stats_results:
+        df = pd.DataFrame(stats_results)
+        df["max_drawdown"] = df["max_drawdown"].astype(float)
+        df.to_csv(analysis_csv_dir / "summary.csv", index=False)
+
+    if period_rows:
+        period_df = pd.DataFrame(period_rows)
+        period_df.to_csv(analysis_csv_dir / "period_metrics.csv", index=False)
+
+    if wealth_dict:
+        wealth_merge = None
+        for model, wdf in wealth_dict.items():
+            df_model = wdf.rename(columns={"wealth": model})
+            if wealth_merge is None:
+                wealth_merge = df_model
+            else:
+                wealth_merge = wealth_merge.merge(df_model, on="date", how="outer")
+        if wealth_merge is not None:
+            wealth_merge = wealth_merge.sort_values("date")
+            wealth_merge.to_csv(analysis_csv_dir / "wealth_comparison.csv", index=False)
+            plot_multi_wealth({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_comparison.png")
+            plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_events.png")
+            wealth_returns = wealth_merge.copy()
+            wealth_returns["date"] = pd.to_datetime(wealth_returns["date"])
+            wealth_returns = wealth_returns.set_index("date").pct_change().dropna(how="all")
+            if not wealth_returns.empty:
+                corr = wealth_returns.corr()
+                corr.to_csv(analysis_csv_dir / "wealth_correlation.csv")
+                plot_wealth_correlation_heatmap(corr, analysis_fig_dir / "wealth_correlation.png")
+
+    if weight_dict:
+        plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")
+        export_weight_variance_correlation(
+            weight_dict,
+            analysis_csv_dir / "weight_variance_correlation.csv",
+            analysis_fig_dir / "weight_variance_correlation.png",
+        )
+        export_average_weights(
+            weight_dict,
+            analysis_csv_dir / "average_weights.csv",
+            analysis_fig_dir / "average_weights.png",
+        )
+        plot_weight_histograms(weight_dict, analysis_fig_dir / "weight_histograms.png")
+        export_weight_threshold_frequency(
+            weight_dict,
+            WEIGHT_THRESHOLD,
+            analysis_csv_dir / "weight_threshold_freq.csv",
+            analysis_fig_dir / "weight_threshold_freq.png",
+        )
+
+    print(f"[real-data] finished. outputs -> {outdir}")
+    print(f"[real-data] debug artifacts -> {debug_dir}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
+
+"""
+cd /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2
+
+python -m experiments.real_data.run_real_eval \
+  --tickers "SPY,GLD,EEM,TLT" \
+  --start 2006-10-31 --end 2025-10-31 \
+  --interval 1d \
+  --price-field Close \
+  --return-kind log \
+  --frequency weekly \
+  --resample-rule W-FRI \
+  --momentum-window 30 \
+  --return-horizon 1 \
+  --cov-window 10 \
+  --cov-method diag \
+  --cov-shrinkage 0.94 \
+  --cov-eps 1e-6 \
+  --train-window 25 \
+  --rebal-interval 4 \
+  --delta 1.0 \
+  --models ols,ipo,flex \
+  --flex-solver knitro \
+  --flex-formulation dual,kkt \
+  --flex-lambda-theta-anchor 0.0 \
+  --flex-lambda-w-anchor 0.0 \
+  --flex-lambda-theta-iso 0.0 \
+  --flex-lambda-w-iso 0.0 \
+  --flex-theta-anchor-mode ols \
+  --flex-w-anchor-mode ols \
+  --flex-theta-init-mode none \
+  --debug-roll \
+  
+#   --flex-w-clamp-enable --flex-w-clamp-source ols --flex-anchor-clamp-tol 0 --flex-anchor-clamp-floor 0.0 \
+#   --flex-theta-clamp-enable --flex-theta-clamp-source ols --flex-anchor-clamp-tol 0 --flex-anchor-clamp-floor 0.0 \
+
+
+
+--tickers : 例 "SPY,GLD,EEM,TLT"
+--start, --end : 日付文字列 (YYYY-MM-DD)
+--interval : Yahoo Finance から取得する間隔 (1d, 1wk, 1mo など)
+--price-field : Close, Adj Close など
+--return-kind : log / simple
+--frequency : daily / weekly
+--resample-rule : 週次時のリサンプル規則 (W-FRI など)
+--momentum-window : モメンタム期間
+--return-horizon : 予測先 (例: 1 = 1 期間先)
+--cov-window : 共分散のローリング窓
+--cov-method : diag / ledoit_wolf
+--cov-shrinkage : diag shrinkage の λ
+--cov-eps : 数値安定化用 epsilon
+--no-auto-adjust : Yahoo の調整終値を使わない
+--force-refresh : キャッシュ無視で再取得
+ローリング設定:
+
+--train-window : 各サイクルの学習窓サイズ
+--rebal-interval : リバランス間隔 H
+モデル設定:
+
+--delta : リスク回避係数
+--models : ols,ipo,dual,flex などカンマ区切り
+--flex-formulation : dual,kkt のように指定可
+--flex-lambda-theta-anchor, --flex-lambda-w-anchor, --flex-lambda-theta-iso, --flex-lambda-w-iso : Flex の正則化パラメータ
+実行制御:
+
+--tee : ソルバーのログ表示
+--debug-roll : ローリング進捗ログを表示
+--outdir : 出力先ディレクトリ（省略時は results/exp_real_data/<timestamp>）
+--no-debug : ローデータ読み込み時のデバッグ出力を抑制
+
+"""

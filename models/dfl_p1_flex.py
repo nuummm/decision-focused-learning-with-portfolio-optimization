@@ -198,9 +198,9 @@ def fit_dfl_p1_flex(
     X_used = X[used_idx_array, :]
     Y_used = Y[used_idx_array, :]
 
-    print("[DEBUG] clamp flags",
-      theta_clamp_enable, theta_clamp_source,
-      anchor_clamp_tol, anchor_clamp_floor)
+    # print("[DEBUG] clamp flags",
+    #   theta_clamp_enable, theta_clamp_source,
+    #   anchor_clamp_tol, anchor_clamp_floor)
 
 
     # --- θアンカー正則化の準備 ---
@@ -480,12 +480,12 @@ def fit_dfl_p1_flex(
     MU = np.array([pyo.value(m.mu[t]) for t in m.T], dtype=float)
     LAM = np.array([[pyo.value(m.lam[t, j]) for j in m.J] for t in m.T], dtype=float)
 
-    if clamp_theta_vec is not None:
-        print("[DEBUG] theta anchor used", clamp_theta_vec)
-        print("[DEBUG] theta solution", theta_hat)
-        diff = np.abs(theta_hat - clamp_theta_vec)
-        rel = diff / np.maximum(np.abs(clamp_theta_vec), 1e-12)
-        print("[DEBUG] theta diff", diff, "rel", rel)
+    # if clamp_theta_vec is not None:
+    #     print("[DEBUG] theta anchor used", clamp_theta_vec)
+    #     print("[DEBUG] theta solution", theta_hat)
+    #     diff = np.abs(theta_hat - clamp_theta_vec)
+    #     rel = diff / np.maximum(np.abs(clamp_theta_vec), 1e-12)
+    #     print("[DEBUG] theta diff", diff, "rel", rel)
 
 
     return theta_hat, W, MU, LAM, used_idx, meta

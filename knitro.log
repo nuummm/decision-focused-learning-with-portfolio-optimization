@@ -5,8 +5,9 @@
          Artelys Knitro 15.0.0
 =======================================
 
-Knitro using up to 8 threads.
-Knitro presolve eliminated 0 variables and 0 constraints.
+Knitro using 1 thread.
+Knitro presolve eliminated 0 variables and 36 constraints.
+Knitro presolve detected 36 implied complementarity constraints.
 
 bar_initmu               0.1
 bar_murule               4
@@ -16,34 +17,34 @@ feastol                  1e-06
 feastol_abs              0.001
 findiff_numthreads       1
 hessian_no_f             1
-hessopt                  6
+hessopt                  4
 honorbnds                1
-lmsize                   30
-maxit                    10000
-maxtime_real             300
-ms_enable                1
-ms_maxsolves             5
-nlp_algorithm            1
-numthreads               8
+linsolver                3
+maxit                    20000
+maxtime_real             180
+nlp_algorithm            3
+numthreads               1
 opttol                   1e-06
 opttol_abs               0.001
+outlev                   3
 outmode                  1
-xtol                     1e-08
-The problem is identified as a QCQP.
+xtol                     1e-10
+The problem is linearly constrained.
+The problem is identified as an MPEC.
 
 Problem Characteristics                                 (   Presolved)
 -----------------------
 Objective goal:  Minimize
 Objective type:  quadratic
-Number of variables:                                178 (         178)
-    bounded below only:                             150 (         150)
+Number of variables:                                 87 (          87)
+    bounded below only:                              72 (          72)
     bounded above only:                               0 (           0)
     bounded below and above:                          0 (           0)
     fixed:                                            0 (           0)
-    free:                                            28 (          28)
-Number of constraints:                              125 (         125)
-    linear equalities:                              100 (         100)
-    quadratic equalities:                            25 (          25)
+    free:                                            15 (          15)
+Number of constraints:                               84 (          48)
+    linear equalities:                               48 (          48)
+    quadratic equalities:                            36 (           0)
     gen. nonlinear equalities:                        0 (           0)
     linear one-sided inequalities:                    0 (           0)
     quadratic one-sided inequalities:                 0 (           0)
@@ -51,46 +52,50 @@ Number of constraints:                              125 (         125)
     linear two-sided inequalities:                    0 (           0)
     quadratic two-sided inequalities:                 0 (           0)
     gen. nonlinear two-sided inequalities:            0 (           0)
-Number of nonzeros in Jacobian:                     700 (         700)
+Number of complementarities:                          0 (          36)
+Number of nonzeros in Jacobian:                     324 (         252)
 Number of nonzeros in Hessian:                        0 (           0)
 
-Knitro parallel multistart will run with 8 threads.
+Knitro using the Active-Set Conjugate Gradient algorithm.
 
-Return codes description
-------------------------
-  0:  The final solution satisfies the termination conditions for verifying optimality.
-  -100 to -199:  A feasible approximate solution was found.
-  -200 to -299:  Knitro terminated at an infeasible point.
-  -300 to -301:  The problem was determined to be unbounded.
-  -400 to -499:  Knitro terminated because it reached a pre-defined limit.
-    -400 to -409:  A feasible point was found.
-    -410 to -419:  No feasible point was found.
-  -500 to -599:  Knitro terminated with an input error or some non-standard error.
-A more detailed description of individual return codes and their corresponding
-termination messages is provided at
-https://www.artelys.com/app/docs/knitro/3_referenceManual/returnCodes.html
+  Iter      Objective      FeasError   OptError    ||Step||    CGits 
+--------  --------------  ----------  ----------  ----------  -------
+       0   -7.407352e-01   1.042e-04
+       1   -5.188060e+00   1.172e-04   3.333e+01   2.828e+00        0
+       2   -2.853225e+00   5.309e-05   1.121e+00   2.540e+00        1
+       3   -1.560182e+00   2.123e-05   4.406e+00   1.215e+00        0
+       4   -1.043452e+00   7.281e-06   3.586e+03   5.446e-01        0
+       5   -1.047790e+00   7.041e-07   4.004e+03   3.188e-01        0
+       6   -1.212159e+00   1.032e-07   1.450e+04   7.244e-01        1
+       7   -1.234090e+00   1.648e-08   2.022e+04   1.028e-01        0
+       8   -1.292607e+00   3.960e-09   1.156e+04   1.373e-01        0
+       9   -1.300661e+00   1.062e-08   1.862e-01   2.135e-02        4
+      10   -1.305269e+00   7.889e-10   2.313e-01   1.786e-02        1
+      11   -1.319303e+00   2.580e-09   1.981e-01   3.719e-02        1
+      12   -1.345981e+00   1.713e-15   1.981e-01   6.997e-02        1
+      13   -1.367367e+00   2.220e-16   4.042e+03   2.125e-01        1
+      14   -1.399003e+00   1.756e-08   2.778e-01   4.516e-02        6
+      15   -1.461985e+00   1.818e-17   2.700e-01   9.032e-02        1
+      16   -1.574371e+00   1.110e-16   1.832e-01   1.608e-01        1
+      17   -1.741794e+00   1.110e-16   1.211e+03   3.340e-01        1
+      18   -1.773139e+00   2.466e-08   1.881e-01   4.424e-02        6
+      19   -1.784314e+00   4.669e-18   2.511e+03   1.954e-02        0
+      20   -1.852488e+00   5.471e-17   3.661e-01   1.368e-01        1
+      21   -1.867841e+00   1.711e-17   5.079e-11   3.081e-02        0
 
- Solve #  ThreadID  Status     Objective      FeasError    OptError    Real Time 
---------  --------  ------  --------------   ----------   ----------  ----------
-      0          0    -101        -2.21717  4.87726e-15     0.105974  5.24190e-02
-      4          3       0        -2.21717  1.11022e-16  3.49820e-07  5.98530e-02
-      1          2    -102        -2.21717  7.85516e-16  5.89153e-02  6.30760e-02
-      3          6       0        -2.21717  5.12963e-17  8.87458e-07  9.29830e-02
-      2          7       0        -2.21717  5.12963e-17  8.87458e-07  9.30700e-02
-
-MULTISTART: Best locally optimal solution is returned.
 EXIT: Locally optimal solution found.
 
 Final Statistics
 ----------------
-Final objective value               =  -2.21717293005198e+00
-Final feasibility error (abs / rel) =   5.13e-17 / 5.13e-17
-Final optimality error  (abs / rel) =   8.87e-07 / 8.87e-07
-# of iterations                     =        257 
-# of CG iterations                  =          0 
+Final objective value               =  -1.86784119076498e+00
+Final feasibility error (abs / rel) =   1.71e-17 / 1.71e-17
+Final optimality error  (abs / rel) =   5.08e-11 / 3.84e-11
+# of iterations                     =         21 
+# of CG iterations                  =         26 
 # of function evaluations           =          0
 # of gradient evaluations           =          0
-Total program time (secs)           =       0.09454 (     0.365 CPU time)
+Total program time (secs)           =       0.07394 (     0.042 CPU time)
+Time spent in evaluations (secs)    =       0.00000
 
 ===============================================================================
 

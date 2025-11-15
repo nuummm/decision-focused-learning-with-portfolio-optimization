@@ -94,13 +94,28 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="",
         help="Comma-separated list of explicit seeds to evaluate (overrides runs/seed0).",
     )
-    parser.add_argument("--N", type=int, default=50, help="Number of samples")
-    parser.add_argument("--d", type=int, default=3, help="Asset dimension")
+    parser.add_argument(
+        "--N",
+        type=str,
+        default="50",
+        help="Number of samples (either a single integer or comma-separated list)",
+    )
+    parser.add_argument(
+        "--d",
+        type=str,
+        default="3",
+        help="Asset dimension (single integer or comma-separated list)",
+    )
     parser.add_argument("--snr", type=float, default=0.1, help="Signal-to-noise ratio")
     parser.add_argument("--rho", type=float, default=0.5, help="Correlation parameter")
     parser.add_argument("--sigma", type=float, default=0.0125, help="Marginal stdev of returns")
     parser.add_argument("--res", type=int, default=10, help="Rolling window length (burn-in)")
-    parser.add_argument("--delta", type=float, default=1.0, help="Risk-aversion parameter")
+    parser.add_argument(
+        "--delta",
+        type=str,
+        default="1.0",
+        help="Risk-aversion parameter (single value or comma-separated list)",
+    )
     parser.add_argument(
         "--lambda-theta",
         type=float,
@@ -339,6 +354,14 @@ def parse_float_choices(spec: object, default: float) -> List[float]:
     if not text:
         return [default]
     values = float_list(text)
+    return values if values else [default]
+
+
+def parse_int_choices(spec: object, default: int) -> List[int]:
+    text = str(spec).strip()
+    if not text:
+        return [default]
+    values = int_list(text)
     return values if values else [default]
 
 
@@ -898,8 +921,7 @@ def plot_metrics(
         plt.close()
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
-    args = parse_args(argv)
+def run_single_configuration(args: argparse.Namespace) -> int:
     enabled_solvers: Dict[str, str] = dict(DEFAULT_SOLVERS)
     if args.disable_dual:
         enabled_solvers.pop("dual", None)
@@ -1337,6 +1359,34 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     print(f"[INFO] Experiment outputs stored in {exp_dir}")
 
+    return 0
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    parsed_args = parse_args(argv)
+    N_values = parse_int_choices(getattr(parsed_args, "N", "50"), 50)
+    d_values = parse_int_choices(getattr(parsed_args, "d", "3"), 3)
+    delta_values = parse_float_choices(getattr(parsed_args, "delta", "1.0"), 1.0)
+
+    combos = list(product(N_values, d_values, delta_values))
+    total = len(combos)
+    if total == 0:
+        print("[WARN] No (N, d, delta) combinations specified; exiting.")
+        return 0
+
+    base_kwargs = vars(parsed_args).copy()
+    for idx, (N_val, d_val, delta_val) in enumerate(combos, start=1):
+        combo_args = argparse.Namespace(**base_kwargs)
+        combo_args.N = int(N_val)
+        combo_args.d = int(d_val)
+        combo_args.delta = float(delta_val)
+        print(
+            f"[CONFIG] Combination {idx}/{total} -> "
+            f"N={combo_args.N}, d={combo_args.d}, delta={combo_args.delta}"
+        )
+        code = run_single_configuration(combo_args)
+        if code != 0:
+            return code
     return 0
 
 
