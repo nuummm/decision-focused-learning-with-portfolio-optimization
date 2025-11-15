@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,8 +23,9 @@ from experiments.registry import (
     GUROBI_DEFAULTS,
     IPOPT_DEFAULTS,
 )
-from models.ols import predict_yhat
-from models.ols_gurobi import solve_mvo_gurobi
+from models.ols import predict_yhat, train_ols
+from models.ipo_closed_form import fit_ipo_closed_form
+from models.ols_gurobi import solve_mvo_gurobi, solve_series_mvo_gurobi
 
 try:  # Optional plotting for debug artifacts
     import matplotlib.pyplot as plt
@@ -58,6 +59,31 @@ def parse_tickers(value: str) -> List[str]:
 
 def parse_commalist(value: str) -> List[str]:
     return [v.strip().lower() for v in value.split(",") if v.strip()]
+
+
+def parse_model_train_window_spec(value: str) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    text = (value or "").strip()
+    if not text:
+        return mapping
+    for part in text.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if ":" not in token:
+            raise ValueError(f"Invalid model-train-window spec '{token}'. Use model:window format.")
+        name, window_str = token.split(":", 1)
+        model_name = name.strip().lower()
+        if not model_name:
+            raise ValueError(f"Missing model name in spec '{token}'.")
+        try:
+            window_val = int(window_str.strip())
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise ValueError(f"Invalid train window '{window_str}' for model '{model_name}'.") from exc
+        if window_val <= 0:
+            raise ValueError(f"Train window for model '{model_name}' must be positive.")
+        mapping[model_name] = window_val
+    return mapping
 
 
 def make_output_dir(base: Path | None) -> Path:
@@ -423,6 +449,48 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
     plt.close(fig)
 
 
+def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
+    if plt is None or df.empty:
+        return
+    flex_df = df.copy()
+    for col in flex_df.columns:
+        if col.startswith("solver_status_"):
+            flex_df[col] = pd.to_numeric(flex_df[col], errors="coerce")
+    models = flex_df["model"].tolist()
+    x = np.arange(len(models))
+    status_cols = [c for c in flex_df.columns if c.startswith("solver_status_")]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    if status_cols:
+        width = 0.8 / len(status_cols)
+        for i, col in enumerate(status_cols):
+            axes[0].bar(
+                x + i * width,
+                flex_df[col].astype(float),
+                width=width,
+                label=col.replace("solver_status_", ""),
+            )
+        axes[0].set_xticks(x + width * (len(status_cols) - 1) / 2)
+    else:
+        axes[0].bar(x, [0] * len(models), width=0.6, label="none")
+        axes[0].set_xticks(x)
+    axes[0].set_xticklabels(models, rotation=45, ha="right")
+    axes[0].set_ylabel("count")
+    axes[0].set_title("Solver status counts")
+    axes[0].legend()
+
+    width2 = 0.35
+    axes[1].bar(x - width2 / 2, flex_df["elapsed_mean"].astype(float), width=width2, label="elapsed_mean")
+    axes[1].bar(x + width2 / 2, flex_df["elapsed_max"].astype(float), width=width2, label="elapsed_max")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(models, rotation=45, ha="right")
+    axes[1].set_ylabel("seconds")
+    axes[1].set_title("Solver elapsed time")
+    axes[1].legend()
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
 def export_weight_threshold_frequency(
     weight_dict: Dict[str, pd.DataFrame],
     threshold: float,
@@ -474,6 +542,143 @@ def resolved_solver_options(name: str, options: Optional[Dict[str, object]] = No
     return {}
 
 
+def prepare_flex_training_args(
+    bundle,
+    train_start: int,
+    train_end: int,
+    delta: float,
+    tee: bool,
+    flex_options: Dict[str, Any],
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    flex_kwargs: Dict[str, Any] = dict(flex_options or {})
+    theta_init_mode = str(flex_kwargs.pop("theta_init_mode", "none") or "none").lower()
+    theta_anchor_mode = str(flex_kwargs.pop("theta_anchor_mode", "none") or "none").lower()
+    w_anchor_mode = str(flex_kwargs.pop("w_anchor_mode", "none") or "none").lower()
+    theta_clamp_tol = float(flex_kwargs.pop("theta_clamp_tol", 0.0) or 0.0)
+    theta_clamp_floor = float(flex_kwargs.pop("theta_clamp_floor", 0.0) or 0.0)
+    w_clamp_tol = float(flex_kwargs.pop("w_clamp_tol", 0.0) or 0.0)
+    w_clamp_floor = float(flex_kwargs.pop("w_clamp_floor", 0.0) or 0.0)
+    flex_kwargs.pop("theta_clamp_penalty", None)
+    flex_kwargs.pop("w_clamp_penalty", None)
+
+    anchor_clamp_tol = float(flex_kwargs.get("anchor_clamp_tol", 0.0) or 0.0)
+    anchor_clamp_floor = float(flex_kwargs.get("anchor_clamp_floor", 0.0) or 0.0)
+    anchor_clamp_tol = max(anchor_clamp_tol, theta_clamp_tol, w_clamp_tol)
+    anchor_clamp_floor = max(anchor_clamp_floor, theta_clamp_floor, w_clamp_floor)
+    flex_kwargs["anchor_clamp_tol"] = anchor_clamp_tol
+    flex_kwargs["anchor_clamp_floor"] = anchor_clamp_floor
+    flex_kwargs["theta_clamp_enable"] = bool(flex_kwargs.get("theta_clamp_enable", False))
+    flex_kwargs["w_clamp_enable"] = bool(flex_kwargs.get("w_clamp_enable", False))
+    flex_kwargs["theta_clamp_source"] = str(flex_kwargs.get("theta_clamp_source", "none") or "none").lower()
+    flex_kwargs["w_clamp_source"] = str(flex_kwargs.get("w_clamp_source", "none") or "none").lower()
+    flex_kwargs["formulation"] = str(flex_kwargs.get("formulation", "dual") or "dual").lower()
+
+    X = np.asarray(bundle.dataset.X, dtype=float)
+    Y = np.asarray(bundle.dataset.Y, dtype=float)
+    n_samples = X.shape[0]
+    start_idx = max(0, int(train_start))
+    end_idx = min(n_samples - 1, int(train_end))
+    if end_idx < start_idx:
+        raise ValueError(f"Invalid train window [{train_start}, {train_end}]")
+    train_slice = slice(start_idx, end_idx + 1)
+    X_train = X[train_slice]
+    Y_train = Y[train_slice]
+
+    idx_list = bundle.cov_indices.tolist()
+    cov_pairs = [
+        (idx_val, cov)
+        for idx_val, cov in zip(idx_list, bundle.covariances)
+        if train_start <= idx_val <= train_end
+    ]
+    used_train_idx = [idx_val for idx_val, _ in cov_pairs]
+    cov_train = [cov for _, cov in cov_pairs]
+
+    theta_sources: Dict[str, np.ndarray] = {}
+
+    def ensure_theta_source(mode: str, *, fallback_to_ols: bool, context: str) -> Optional[np.ndarray]:
+        m = (mode or "none").lower()
+        if m in {"", "none"}:
+            return None
+        if m == "ols":
+            if "ols" not in theta_sources:
+                theta_sources["ols"] = np.asarray(train_ols(X_train, Y_train), dtype=float)
+            return theta_sources["ols"].copy()
+        if m == "ipo":
+            if "ipo" in theta_sources:
+                return theta_sources["ipo"].copy()
+            try:
+                theta_ipo, *_ = fit_ipo_closed_form(
+                    X,
+                    Y,
+                    bundle.covariances,
+                    idx_list,
+                    start_index=train_start,
+                    end_index=train_end,
+                    delta=delta,
+                    mode="budget",
+                    tee=tee,
+                )
+                theta_sources["ipo"] = np.asarray(theta_ipo, dtype=float)
+                return theta_sources["ipo"].copy()
+            except Exception as exc:
+                if fallback_to_ols:
+                    print(f"[WARN] IPO anchor construction failed ({exc}); using OLS for {context}")
+                    if "ols" not in theta_sources:
+                        theta_sources["ols"] = np.asarray(train_ols(X_train, Y_train), dtype=float)
+                    return theta_sources["ols"].copy()
+                raise
+        raise ValueError(f"Unsupported theta source '{mode}' for {context}")
+
+    theta_init = None
+    if theta_init_mode not in {"", "none"}:
+        theta_init = ensure_theta_source(theta_init_mode, fallback_to_ols=True, context="theta_init")
+
+    lam_theta_anchor = float(flex_kwargs.get("lambda_theta_anchor", 0.0) or 0.0)
+    lam_theta_anchor_l1 = float(flex_kwargs.get("lambda_theta_anchor_l1", 0.0) or 0.0)
+    if (
+        "theta_anchor" not in flex_kwargs
+        and (lam_theta_anchor > 0.0 or lam_theta_anchor_l1 > 0.0 or theta_anchor_mode not in {"", "none"})
+    ):
+        theta_anchor_vec = ensure_theta_source(theta_anchor_mode, fallback_to_ols=False, context="theta_anchor")
+        if theta_anchor_vec is None:
+            raise ValueError("theta_anchor_mode requires a valid reference but none was available.")
+        flex_kwargs["theta_anchor"] = theta_anchor_vec
+
+    lam_w_anchor = float(flex_kwargs.get("lambda_w_anchor", 0.0) or 0.0)
+    lam_w_anchor_l1 = float(flex_kwargs.get("lambda_w_anchor_l1", 0.0) or 0.0)
+    need_w_anchor = (
+        "w_anchor" not in flex_kwargs
+        and (lam_w_anchor > 0.0 or lam_w_anchor_l1 > 0.0 or w_anchor_mode not in {"", "none"})
+    )
+    if need_w_anchor:
+        theta_for_w_anchor = ensure_theta_source(w_anchor_mode, fallback_to_ols=False, context="w_anchor")
+        if theta_for_w_anchor is None:
+            raise ValueError("w_anchor_mode requires a reference theta but none was produced.")
+        if not used_train_idx or not cov_train:
+            raise ValueError("Cannot construct w_anchor: no covariance pairs in the training window.")
+        Yhat_anchor_all = predict_yhat(X, theta_for_w_anchor)
+        w_anchor_mat = solve_series_mvo_gurobi(
+            Yhat_all=Yhat_anchor_all,
+            Vhats=cov_train,
+            idx=used_train_idx,
+            delta=delta,
+            psd_eps=1e-12,
+            output=False,
+            start_index=None,
+        )
+        if w_anchor_mat.size == 0:
+            raise ValueError("solve_series_mvo_gurobi returned empty matrix for w_anchor.")
+        flex_kwargs["w_anchor"] = w_anchor_mat
+
+    flex_kwargs["lambda_theta_anchor"] = lam_theta_anchor
+    flex_kwargs["lambda_theta_anchor_l1"] = float(flex_kwargs.get("lambda_theta_anchor_l1", 0.0) or 0.0)
+    flex_kwargs["lambda_theta_iso"] = float(flex_kwargs.get("lambda_theta_iso", 0.0) or 0.0)
+    flex_kwargs["lambda_w_anchor"] = lam_w_anchor
+    flex_kwargs["lambda_w_anchor_l1"] = float(flex_kwargs.get("lambda_w_anchor_l1", 0.0) or 0.0)
+    flex_kwargs["lambda_w_iso"] = float(flex_kwargs.get("lambda_w_iso", 0.0) or 0.0)
+
+    return theta_init, flex_kwargs
+
 
 def train_model_window(
     model_key: str,
@@ -481,7 +686,7 @@ def train_model_window(
     bundle,
     delta: float,
     solver_spec: SolverSpec,
-    flex_options: Dict[str, float] | None,
+    flex_options: Dict[str, Any] | None,
     train_start: int,
     train_end: int,
     tee: bool,
@@ -496,8 +701,14 @@ def train_model_window(
         delta=delta,
         tee=tee,
     )
+    theta_init_override: Optional[np.ndarray] = None
     if model_key == "flex" and flex_options:
-        trainer_kwargs.update(flex_options)
+        theta_init_override, resolved_flex = prepare_flex_training_args(
+            bundle, train_start, train_end, delta, tee, flex_options
+        )
+        trainer_kwargs.update(resolved_flex)
+    if theta_init_override is not None:
+        trainer_kwargs["theta_init"] = theta_init_override
 
     start_time = time.perf_counter()
     trainer_ret = trainer(**trainer_kwargs)
@@ -517,7 +728,7 @@ def run_rolling_experiment(
     bundle,
     delta: float,
     solver_spec: SolverSpec,
-    flex_options: Dict[str, float] | None,
+    flex_options: Dict[str, Any] | None,
     train_window: int,
     rebal_interval: int,
     debug_roll: bool,
@@ -692,6 +903,8 @@ def run_rolling_experiment(
         "sharpe": sharpe,
         "max_drawdown": max_drawdown(wealth_values),
         "final_wealth": float(wealth_values[-1]) if wealth_values else 1.0,
+        "train_window": train_window,
+        "rebal_interval": rebal_interval,
     }
 
     report_path = model_debug_dir / "debug_notes.txt"
@@ -719,6 +932,7 @@ def run_rolling_experiment(
         "period_metrics": period_metrics,
         "wealth_df": wealth_df,
         "weights_df": weights_df,
+        "rebalance_summary": reb_summary,
     }
 
 
@@ -743,6 +957,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--train-window", type=int, default=25)
     parser.add_argument("--rebal-interval", type=int, default=1)
+    parser.add_argument(
+        "--model-train-window",
+        type=str,
+        default="",
+        help="Optional overrides e.g. 'ols:60,flex:25' to use per-model train windows.",
+    )
 
     parser.add_argument("--delta", type=float, default=1.0)
     parser.add_argument("--models", type=str, default="ols,ipo,dual,flex")
@@ -782,6 +1002,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    model_train_windows = parse_model_train_window_spec(getattr(args, "model_train_window", ""))
 
     tickers = parse_tickers(args.tickers)
     outdir = make_output_dir(args.outdir)
@@ -832,6 +1053,7 @@ def main() -> None:
             "train_window": args.train_window,
             "rebal_interval": args.rebal_interval,
             "covariance_samples": len(bundle.cov_indices),
+            "train_window_overrides": model_train_windows,
         }
     )
 
@@ -868,6 +1090,8 @@ def main() -> None:
     wealth_dict: Dict[str, pd.DataFrame] = {}
     weight_dict: Dict[str, pd.DataFrame] = {}
     weight_dict: Dict[str, pd.DataFrame] = {}
+    train_window_records: List[Dict[str, object]] = []
+    rebalance_records: List[Dict[str, object]] = []
 
     flex_base_options = dict(
         lambda_theta_anchor=args.flex_lambda_theta_anchor,
@@ -911,6 +1135,20 @@ def main() -> None:
                 flex_options = dict(flex_base_options)
                 flex_options["formulation"] = form or "dual"
             results_dir = model_outputs_dir / label
+            effective_train_window = model_train_windows.get(model_key, args.train_window)
+            train_window_records.append(
+                {
+                    "model": label,
+                    "base_model": model_key,
+                    "train_window": effective_train_window,
+                    "override": "yes" if model_key in model_train_windows else "no",
+                }
+            )
+            if model_key in model_train_windows:
+                print(
+                    f"[real-data] overriding train_window for {label}: "
+                    f"{effective_train_window} (default {args.train_window})"
+                )
             run_result = run_rolling_experiment(
                 model_key=model_key,
                 model_label=label,
@@ -918,7 +1156,7 @@ def main() -> None:
                 delta=args.delta,
                 solver_spec=solver_spec,
                 flex_options=flex_options,
-                train_window=args.train_window,
+                train_window=effective_train_window,
                 rebal_interval=args.rebal_interval,
                 debug_roll=args.debug_roll,
                 debug_dir=debug_dir,
@@ -926,15 +1164,35 @@ def main() -> None:
                 tee=args.tee,
             )
             stats_results.append(run_result["stats"])
-            for row in run_result["period_metrics"]:
-                period_entry = dict(row)
-                period_entry["model"] = label
-                period_rows.append(period_entry)
-            wealth_dict[label] = run_result["wealth_df"][["date", "wealth"]]
-            if not run_result["weights_df"].empty:
-                weight_dict[label] = run_result["weights_df"]
-            if not run_result["weights_df"].empty:
-                weight_dict[label] = run_result["weights_df"]
+            reb_summary = run_result.get("rebalance_summary", {})
+            if reb_summary:
+                record = {
+                    "model": label,
+                    "base_model": model_key,
+                    "n_cycles": reb_summary.get("n_cycles"),
+                    "train_length_min": reb_summary.get("train_length_min"),
+                    "train_length_max": reb_summary.get("train_length_max"),
+                    "elapsed_mean": reb_summary.get("elapsed_mean"),
+                    "elapsed_max": reb_summary.get("elapsed_max"),
+                    "solver_status_counts": json.dumps(
+                        reb_summary.get("solver_status_counts", {}) or {}, ensure_ascii=False
+                    ),
+                }
+                status_counts = reb_summary.get("solver_status_counts", {}) or {}
+                for status, count in status_counts.items():
+                    record[f"solver_status_{status}"] = count
+                record["solver_status_optimal_total"] = status_counts.get("optimal", 0)
+                rebalance_records.append(record)
+                for row in run_result["period_metrics"]:
+                    period_entry = dict(row)
+                    period_entry["model"] = label
+                    period_entry["train_window"] = run_result["stats"].get("train_window", effective_train_window)
+                    period_rows.append(period_entry)
+                wealth_dict[label] = run_result["wealth_df"][["date", "wealth"]]
+                if not run_result["weights_df"].empty:
+                    weight_dict[label] = run_result["weights_df"]
+                if not run_result["weights_df"].empty:
+                    weight_dict[label] = run_result["weights_df"]
 
     if stats_results:
         df = pd.DataFrame(stats_results)
@@ -985,6 +1243,16 @@ def main() -> None:
             analysis_csv_dir / "weight_threshold_freq.csv",
             analysis_fig_dir / "weight_threshold_freq.png",
         )
+    if train_window_records:
+        pd.DataFrame(train_window_records).to_csv(
+            analysis_csv_dir / "model_train_windows.csv", index=False
+        )
+    if rebalance_records:
+        rebalance_df = pd.DataFrame(rebalance_records)
+        rebalance_df.to_csv(analysis_csv_dir / "rebalance_summary.csv", index=False)
+        flex_debug_df = rebalance_df[rebalance_df["base_model"] == "flex"]
+        if not flex_debug_df.empty:
+            plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
 
     print(f"[real-data] finished. outputs -> {outdir}")
     print(f"[real-data] debug artifacts -> {debug_dir}")
@@ -1016,7 +1284,7 @@ python -m experiments.real_data.run_real_eval \
   --models ols,ipo,flex \
   --flex-solver knitro \
   --flex-formulation dual,kkt \
-  --flex-lambda-theta-anchor 0.0 \
+  --flex-lambda-theta-anchor 0 \
   --flex-lambda-w-anchor 0.0 \
   --flex-lambda-theta-iso 0.0 \
   --flex-lambda-w-iso 0.0 \
@@ -1024,6 +1292,8 @@ python -m experiments.real_data.run_real_eval \
   --flex-w-anchor-mode ols \
   --flex-theta-init-mode none \
   --debug-roll \
+  
+#   --model-train-window ols:100
   
 #   --flex-w-clamp-enable --flex-w-clamp-source ols --flex-anchor-clamp-tol 0 --flex-anchor-clamp-floor 0.0 \
 #   --flex-theta-clamp-enable --flex-theta-clamp-source ols --flex-anchor-clamp-tol 0 --flex-anchor-clamp-floor 0.0 \

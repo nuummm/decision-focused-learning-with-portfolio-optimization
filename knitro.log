@@ -6,8 +6,8 @@
 =======================================
 
 Knitro using 1 thread.
-Knitro presolve eliminated 0 variables and 36 constraints.
-Knitro presolve detected 36 implied complementarity constraints.
+Knitro presolve eliminated 0 variables and 60 constraints.
+Knitro presolve detected 60 implied complementarity constraints.
 
 bar_initmu               0.1
 bar_murule               4
@@ -36,15 +36,15 @@ Problem Characteristics                                 (   Presolved)
 -----------------------
 Objective goal:  Minimize
 Objective type:  quadratic
-Number of variables:                                 87 (          87)
-    bounded below only:                              72 (          72)
+Number of variables:                                137 (         137)
+    bounded below only:                             120 (         120)
     bounded above only:                               0 (           0)
     bounded below and above:                          0 (           0)
     fixed:                                            0 (           0)
-    free:                                            15 (          15)
-Number of constraints:                               84 (          48)
-    linear equalities:                               48 (          48)
-    quadratic equalities:                            36 (           0)
+    free:                                            17 (          17)
+Number of constraints:                              132 (          72)
+    linear equalities:                               72 (          72)
+    quadratic equalities:                            60 (           0)
     gen. nonlinear equalities:                        0 (           0)
     linear one-sided inequalities:                    0 (           0)
     quadratic one-sided inequalities:                 0 (           0)
@@ -52,54 +52,73 @@ Number of constraints:                               84 (          48)
     linear two-sided inequalities:                    0 (           0)
     quadratic two-sided inequalities:                 0 (           0)
     gen. nonlinear two-sided inequalities:            0 (           0)
-Number of complementarities:                          0 (          36)
-Number of nonzeros in Jacobian:                     324 (         252)
+Number of complementarities:                          0 (          60)
+Number of nonzeros in Jacobian:                     660 (         540)
 Number of nonzeros in Hessian:                        0 (           0)
 
 Knitro using the Active-Set Conjugate Gradient algorithm.
 
   Iter      Objective      FeasError   OptError    ||Step||    CGits 
 --------  --------------  ----------  ----------  ----------  -------
-       0   -1.876413e-01   1.042e-04
-       1   -1.869958e+00   1.584e-04   3.333e+01   2.828e+00        0
-       2   -1.316193e+00   3.778e-05   6.779e-02   1.924e+00        0
-       3   -1.100396e+00   8.908e-06   5.285e+02   9.090e-01        0
-       4   -1.029247e+00   1.939e-06   2.815e+03   2.038e-01        0
-       5   -1.022580e+00   3.794e-07   4.436e+02   1.315e-01        0
-       6   -1.028556e+00   9.450e-08   7.025e+02   1.918e-01        1
-       7   -1.032569e+00   5.710e-08   5.452e-02   4.888e-02        4
-       8   -1.036386e+00   4.456e-09   3.567e+02   4.888e-02        1
-       9   -1.044375e+00   2.220e-16   1.396e+03   8.005e-02        1
-      10   -1.068883e+00   2.220e-16   2.286e+03   1.823e-01        1
-      11   -1.086809e+00   2.220e-16   4.712e-02   7.349e-02        5
-      12   -1.103829e+00   2.220e-16   1.121e-01   9.390e-02        1
-      13   -1.108437e+00   1.004e-17   4.559e+02   2.917e-02        0
-      14   -1.148207e+00   2.220e-16   3.311e+02   2.802e-01        1
-      15   -1.150341e+00   1.544e-09   5.408e-02   1.305e-02        6
-      16   -1.152249e+00   7.630e-18   5.460e+02   1.305e-02        1
-      17   -1.166811e+00   4.993e-17   3.751e-02   9.132e-02        1
-      18   -1.204316e+00   2.220e-16   3.786e+02   2.353e-01        1
-      19   -1.290539e+00   2.220e-16   9.360e+02   8.887e-01        1
-      20   -1.291554e+00   5.146e-10   1.659e-01   3.613e-03       10
-      21   -1.293445e+00   3.788e-12   1.940e-01   7.018e-03        1
-      22   -1.303068e+00   1.735e-17   1.940e-01   3.483e-02        1
-      23   -1.355703e+00   9.714e-17   1.031e-01   1.905e-01        1
-      24   -1.465255e+00   1.527e-16   4.391e-02   4.711e-01        1
-      25   -1.501832e+00   3.417e-16   7.328e-03   1.000e+00        1
-      26   -1.509159e+00   1.110e-16   3.367e-13   2.003e-01        0
+       0    8.592244e-01   7.813e-04
+       1    4.698295e-01   2.220e-16   1.303e+03   1.077e+00        0
+       2    3.999256e-01   1.171e-06   8.169e-01   8.564e-02        4
+       3    3.473090e-01   1.861e-07   5.797e+01   1.209e-01        1
+       4    3.069303e-01   2.220e-16   6.329e+02   1.012e-01        1
+       5    1.915843e-01   5.552e-07   3.802e+02   2.666e-01        1
+       6    1.597856e-01   5.842e-07   3.735e+02   5.469e-02        4
+       7    1.240349e-01   1.534e-17   3.620e+02   8.501e-02        1
+       8    9.283984e-02   2.233e-07   5.361e+02   4.930e-02        3
+       9    6.677656e-02   2.724e-08   6.166e+02   4.930e-02        1
+      10    1.811555e-02   3.363e-13   2.351e-01   7.966e-02        1
+      11   -4.135013e-02   1.878e-11   1.847e+02   1.193e-01        1
+      12   -1.276779e-01   2.220e-16   7.062e-01   1.567e-01        1
+      13   -2.802870e-01   2.220e-16   5.046e+02   2.988e-01        1
+      14   -5.744279e-01   3.982e-17   6.720e+02   5.603e-01        1
+      15   -5.823230e-01   7.071e-08   1.605e-01   1.805e-02        7
+      16   -5.881818e-01   1.595e-08   1.395e-01   1.805e-02        1
+      17   -6.019305e-01   1.222e-17   1.521e-01   3.610e-02        1
+      18   -7.484919e-01   2.220e-16   2.626e-01   2.527e-01        1
+      19   -8.075291e-01   1.110e-16   2.097e+02   1.803e-01        0
+      20   -8.085977e-01   4.156e-09   1.260e-01   3.756e-03        8
+      21   -8.099074e-01   1.110e-16   1.260e-01   7.512e-03        1
+      22   -8.496100e-01   3.589e-06   1.043e+00   1.216e-01        2
+      23   -8.746405e-01   7.421e-07   1.500e+01   1.216e-01        1
+      24   -9.669129e-01   6.929e-06   1.355e-01   2.975e-01        1
+      25   -1.012949e+00   1.680e-10   3.414e+02   2.121e-01        1
+      26   -1.017980e+00   5.405e-08   5.187e-01   7.747e-03        7
+      27   -1.024088e+00   2.220e-16   4.845e+01   1.549e-02        1
+      28   -1.038711e+00   4.445e-18   1.086e+02   2.825e-02        1
+      29   -1.060787e+00   4.716e-18   2.706e-01   4.126e-02        1
+      30   -1.234309e+00   1.110e-16   2.722e-01   2.888e-01        1
+      31   -1.520303e+00   2.220e-16   2.465e+01   4.926e-01        1
+      32   -1.629892e+00   9.172e-17   2.253e+02   4.234e-01        1
+      33   -1.759587e+00   1.110e-16   1.552e+02   8.103e-01        1
+      34   -1.759789e+00   3.722e-09   1.833e-01   1.421e-03       11
+      35   -1.759739e+00   7.571e-10   1.834e-01   1.421e-03        1
+      36   -1.759898e+00   2.760e-09   9.163e-02   1.421e-03        2
+      37   -1.759838e+00   5.282e-10   9.163e-02   1.700e-03        1
+      38   -1.773498e+00   7.654e-06   9.166e-02   9.821e-02        3
+      39   -1.769899e+00   1.751e-06   7.220e-02   1.964e-01        1
+      40   -1.768201e+00   2.680e-11   3.176e+01   7.036e-02        0
+      41   -1.770422e+00   7.247e-08   7.420e-02   1.879e-02        4
+      42   -1.774897e+00   1.110e-16   7.903e-02   3.757e-02        1
+      43   -1.791341e+00   1.110e-16   5.636e-02   1.388e-01        1
+      44   -1.836017e+00   1.700e-16   1.167e-02   3.988e-01        1
+      45   -1.847689e+00   1.534e-17   3.227e-11   1.042e-01        0
 
 EXIT: Locally optimal solution found.
 
 Final Statistics
 ----------------
-Final objective value               =  -1.50915924332094e+00
-Final feasibility error (abs / rel) =   1.11e-16 / 1.11e-16
-Final optimality error  (abs / rel) =   3.37e-13 / 3.37e-13
-# of iterations                     =         26 
-# of CG iterations                  =         40 
+Final objective value               =  -1.84768921092505e+00
+Final feasibility error (abs / rel) =   1.53e-17 / 1.53e-17
+Final optimality error  (abs / rel) =   3.23e-11 / 3.23e-11
+# of iterations                     =         45 
+# of CG iterations                  =         85 
 # of function evaluations           =          0
 # of gradient evaluations           =          0
-Total program time (secs)           =       0.12001 (     0.049 CPU time)
+Total program time (secs)           =       0.26068 (     0.206 CPU time)
 Time spent in evaluations (secs)    =       0.00000
 
 ===============================================================================

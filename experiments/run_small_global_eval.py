@@ -1410,7 +1410,7 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --enable-flex \
   --flex-solver 'knitro' \
   --flex-formulation 'dual,kkt' \
-  --flex-lambda-theta-anchor '0.00001,0.001,0.1,10,1000' \
+  --flex-lambda-theta-anchor '0' \
   --flex-lambda-w-anchor 0 \
   --flex-lambda-theta-iso 0.0 \
   --flex-lambda-w-iso 0.0 \
