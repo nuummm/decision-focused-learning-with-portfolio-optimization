@@ -491,6 +491,185 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
+def compute_benchmark_series(bundle, ticker: str) -> Optional[Dict[str, object]]:
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return None
+    returns_df = bundle.dataset.returns
+    if ticker not in returns_df.columns:
+        print(f"[benchmark] ticker '{ticker}' not found in returns; skipping benchmark.")
+        return None
+    series = returns_df[ticker].dropna()
+    if series.empty:
+        print(f"[benchmark] ticker '{ticker}' has no valid returns; skipping benchmark.")
+        return None
+    dates = pd.to_datetime(series.index)
+    returns = series.to_numpy(dtype=float)
+    wealth = np.cumprod(1.0 + returns)
+    dates_list = list(dates)
+    wealth_list = list(wealth)
+    dates_list.insert(0, dates_list[0])
+    wealth_list.insert(0, 1.0)
+    wealth_df = pd.DataFrame({"date": dates_list, "wealth": wealth_list})
+    mean_return = float(np.mean(returns))
+    std_return = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+    sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
+    label = f"benchmark_{ticker}"
+    stats = {
+        "model": label,
+        "n_cycles": int(len(returns)),
+        "n_steps": int(len(returns)),
+        "mean_return": mean_return,
+        "std_return": std_return,
+        "sharpe": sharpe,
+        "max_drawdown": max_drawdown(wealth_list),
+        "final_wealth": float(wealth_list[-1]),
+        "train_window": 0,
+        "rebal_interval": 0,
+    }
+    return {"label": label, "wealth_df": wealth_df, "stats": stats}
+def compute_correlation_stats(corr_df: pd.DataFrame) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
+    if corr_df.empty:
+        return stats
+    n = corr_df.shape[0]
+    corr_values = corr_df.to_numpy(dtype=float)
+    if n > 1:
+        upper = corr_values[np.triu_indices(n, 1)]
+        if upper.size > 0:
+            stats["mean_corr"] = float(np.mean(upper))
+            stats["mean_abs_corr"] = float(np.mean(np.abs(upper)))
+    try:
+        det = float(np.linalg.det(corr_values))
+        stats["determinant"] = det
+    except np.linalg.LinAlgError:
+        stats["determinant"] = float("nan")
+    try:
+        eigvals = np.linalg.eigvalsh(corr_values)
+        eigvals = eigvals[eigvals > 0]
+        if eigvals.size > 0:
+            entropy = -np.sum((eigvals / eigvals.sum()) * np.log(eigvals / eigvals.sum()))
+            stats["entropy"] = float(entropy)
+    except np.linalg.LinAlgError:
+        stats["entropy"] = float("nan")
+    return stats
+
+
+def plot_asset_correlation(corr_df: pd.DataFrame, path: Path, stats: Optional[Dict[str, float]] = None) -> None:
+    if plt is None or corr_df.empty:
+        return
+    fig, ax = plt.subplots(figsize=(5, 4))
+    data = corr_df.to_numpy()
+    cax = ax.imshow(data, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(corr_df.columns)))
+    ax.set_xticklabels(corr_df.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(corr_df.index)))
+    ax.set_yticklabels(corr_df.index)
+    title = "Asset return correlation"
+    if stats:
+        mean_abs = stats.get("mean_abs_corr")
+        if mean_abs is not None and not np.isnan(mean_abs):
+            title += f" (avg |ρ|={mean_abs:.2f})"
+    ax.set_title(title)
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
+    fig.colorbar(cax)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def update_experiment_ledger(
+    outdir: Path,
+    args: argparse.Namespace,
+    summary_df: pd.DataFrame,
+    analysis_csv_dir: Path,
+    bundle_summary: Dict[str, object],
+) -> None:
+    if summary_df.empty:
+        return
+    ledger_dir = RESULTS_ROOT / "experiment_ledger"
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = ledger_dir / "ledger.csv"
+    asset_corr_csv = analysis_csv_dir / "asset_return_correlation.csv"
+    asset_corr_summary_csv = analysis_csv_dir / "asset_return_correlation_summary.csv"
+    corr_json = ""
+    if asset_corr_csv.exists():
+        try:
+            corr_df = pd.read_csv(asset_corr_csv, index_col=0)
+            corr_json = corr_df.to_json()
+        except Exception:
+            corr_json = ""
+    corr_summary_json = ""
+    if asset_corr_summary_csv.exists():
+        try:
+            _corr_summary_df = pd.read_csv(
+                asset_corr_summary_csv, index_col=0, header=None
+            )
+            corr_summary_series = _corr_summary_df.iloc[:, 0]
+            corr_summary_json = corr_summary_series.to_json()
+        except Exception:
+            corr_summary_json = ""
+    summary_path = analysis_csv_dir / "summary.csv"
+    period_path = analysis_csv_dir / "period_metrics.csv"
+    wealth_csv_path = analysis_csv_dir / "wealth_comparison.csv"
+    rebalance_csv_path = analysis_csv_dir / "rebalance_summary.csv"
+    base_record = {
+        "experiment_id": outdir.name,
+        "experiment_path": str(outdir),
+        "timestamp": datetime.now().isoformat(),
+        "tickers": args.tickers,
+        "start": args.start,
+        "end": args.end,
+        "interval": args.interval,
+        "frequency": args.frequency,
+        "resample_rule": args.resample_rule,
+        "momentum_window": args.momentum_window,
+        "return_horizon": args.return_horizon,
+        "cov_window": args.cov_window,
+        "cov_method": args.cov_method,
+        "cov_shrinkage": args.cov_shrinkage,
+        "delta": args.delta,
+        "train_window_default": args.train_window,
+        "rebal_interval": args.rebal_interval,
+        "models": args.models,
+        "benchmark_ticker": getattr(args, "benchmark_ticker", ""),
+        "asset_corr_csv": str(asset_corr_csv) if asset_corr_csv.exists() else "",
+        "asset_corr_json": corr_json,
+        "asset_corr_summary_csv": (
+            str(asset_corr_summary_csv) if asset_corr_summary_csv.exists() else ""
+        ),
+        "asset_corr_summary_json": corr_summary_json,
+        "summary_csv": str(summary_path),
+        "period_metrics_csv": str(period_path),
+        "wealth_comparison_csv": str(wealth_csv_path),
+        "rebalance_summary_csv": str(rebalance_csv_path),
+        "covariance_samples": bundle_summary.get("covariance_samples", ""),
+        "n_assets": bundle_summary.get("n_assets", ""),
+    }
+    rows: List[Dict[str, object]] = []
+    for _, row in summary_df.iterrows():
+        entry = dict(base_record)
+        for key, value in row.items():
+            entry[key] = value
+        rows.append(entry)
+    if not rows:
+        return
+    ledger_df = pd.DataFrame(rows)
+    ledger_df["experiment_id"] = ledger_df["experiment_id"].astype(str)
+    if ledger_path.exists():
+        try:
+            existing = pd.read_csv(ledger_path)
+        except Exception:
+            existing = pd.DataFrame()
+        combined = pd.concat([existing, ledger_df], ignore_index=True)
+        combined.drop_duplicates(subset=["experiment_id", "model"], keep="last", inplace=True)
+        combined.to_csv(ledger_path, index=False)
+    else:
+        ledger_df.to_csv(ledger_path, index=False)
+
+
 def export_weight_threshold_frequency(
     weight_dict: Dict[str, pd.DataFrame],
     threshold: float,
@@ -993,6 +1172,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flex-w-clamp-penalty", type=float, default=0.0)
     parser.add_argument("--tee", action="store_true")
     parser.add_argument("--debug-roll", action="store_true")
+    parser.add_argument(
+        "--benchmark-ticker",
+        type=str,
+        default="SPY",
+        help="Ticker used for buy-and-hold benchmark (leave empty to disable).",
+    )
 
     parser.add_argument("--outdir", type=Path, default=None)
     parser.add_argument("--no-debug", action="store_true")
@@ -1084,6 +1269,19 @@ def main() -> None:
         start_ts,
         analysis_fig_dir / "data_momentum.png",
     )
+    returns_matrix = bundle.dataset.returns.dropna(how="all")
+    if not returns_matrix.empty:
+        corr_df = returns_matrix.corr()
+        corr_df.to_csv(analysis_csv_dir / "asset_return_correlation.csv")
+        corr_stats = compute_correlation_stats(corr_df)
+        pd.Series(corr_stats).to_csv(
+            analysis_csv_dir / "asset_return_correlation_summary.csv", header=False
+        )
+        plot_asset_correlation(
+            corr_df,
+            analysis_fig_dir / "asset_return_correlation.png",
+            corr_stats,
+        )
 
     stats_results: List[Dict[str, object]] = []
     period_rows: List[Dict[str, object]] = []
@@ -1194,10 +1392,19 @@ def main() -> None:
                 if not run_result["weights_df"].empty:
                     weight_dict[label] = run_result["weights_df"]
 
-    if stats_results:
-        df = pd.DataFrame(stats_results)
-        df["max_drawdown"] = df["max_drawdown"].astype(float)
-        df.to_csv(analysis_csv_dir / "summary.csv", index=False)
+    benchmark_spec = (args.benchmark_ticker or "").strip()
+    if benchmark_spec:
+        benchmark_info = compute_benchmark_series(bundle, benchmark_spec)
+        if benchmark_info:
+            stats_results.append(benchmark_info["stats"])
+            wealth_dict[benchmark_info["label"]] = benchmark_info["wealth_df"]
+
+    summary_df = pd.DataFrame(stats_results)
+    if not summary_df.empty:
+        summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
+        summary_df.to_csv(analysis_csv_dir / "summary.csv", index=False)
+    else:
+        (analysis_csv_dir / "summary.csv").write_text("")
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)
@@ -1253,6 +1460,8 @@ def main() -> None:
         flex_debug_df = rebalance_df[rebalance_df["base_model"] == "flex"]
         if not flex_debug_df.empty:
             plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
+    if not summary_df.empty:
+        update_experiment_ledger(outdir, args, summary_df, analysis_csv_dir, bundle_summary)
 
     print(f"[real-data] finished. outputs -> {outdir}")
     print(f"[real-data] debug artifacts -> {debug_dir}")
@@ -1291,6 +1500,7 @@ python -m experiments.real_data.run_real_eval \
   --flex-theta-anchor-mode ols \
   --flex-w-anchor-mode ols \
   --flex-theta-init-mode none \
+  --benchmark-ticker SPY \
   --debug-roll \
   
 #   --model-train-window ols:100
