@@ -491,7 +491,11 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def compute_benchmark_series(bundle, ticker: str) -> Optional[Dict[str, object]]:
+def compute_benchmark_series(
+    bundle,
+    ticker: str,
+    start_date: Optional[pd.Timestamp] = None,
+) -> Optional[Dict[str, object]]:
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return None
@@ -500,6 +504,9 @@ def compute_benchmark_series(bundle, ticker: str) -> Optional[Dict[str, object]]
         print(f"[benchmark] ticker '{ticker}' not found in returns; skipping benchmark.")
         return None
     series = returns_df[ticker].dropna()
+    start_ts = pd.Timestamp(start_date) if start_date is not None else None
+    if start_ts is not None:
+        series = series.loc[series.index >= start_ts]
     if series.empty:
         print(f"[benchmark] ticker '{ticker}' has no valid returns; skipping benchmark.")
         return None
@@ -508,7 +515,8 @@ def compute_benchmark_series(bundle, ticker: str) -> Optional[Dict[str, object]]
     wealth = np.cumprod(1.0 + returns)
     dates_list = list(dates)
     wealth_list = list(wealth)
-    dates_list.insert(0, dates_list[0])
+    initial_date = start_ts if start_ts is not None else dates_list[0]
+    dates_list.insert(0, initial_date)
     wealth_list.insert(0, 1.0)
     wealth_df = pd.DataFrame({"date": dates_list, "wealth": wealth_list})
     mean_return = float(np.mean(returns))
@@ -1393,8 +1401,20 @@ def main() -> None:
                     weight_dict[label] = run_result["weights_df"]
 
     benchmark_spec = (args.benchmark_ticker or "").strip()
-    if benchmark_spec:
-        benchmark_info = compute_benchmark_series(bundle, benchmark_spec)
+    if benchmark_spec and wealth_dict:
+        min_date: Optional[pd.Timestamp] = None
+        for df in wealth_dict.values():
+            if df.empty:
+                continue
+            dates = pd.to_datetime(df["date"])
+            if dates.empty:
+                continue
+            current_min = dates.min()
+            if pd.isna(current_min):
+                continue
+            if min_date is None or current_min < min_date:
+                min_date = current_min
+        benchmark_info = compute_benchmark_series(bundle, benchmark_spec, start_date=min_date)
         if benchmark_info:
             stats_results.append(benchmark_info["stats"])
             wealth_dict[benchmark_info["label"]] = benchmark_info["wealth_df"]
