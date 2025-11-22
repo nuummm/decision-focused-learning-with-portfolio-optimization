@@ -1404,13 +1404,12 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --sigma 0.0125 \
   --res 0 \
   --delta 1.0 \
-  --runs 100 \
-  --seed0 0 \
+  --seed-list '0,1,2,3,4,5,6,7,9,10,11,12,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,33,34,35,36,37,38,39,40,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,61,62,63,64,65,66,67,68,69,70,71,73,74,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109' \
   --tee \
   --enable-flex \
   --flex-solver 'knitro' \
   --flex-formulation 'dual,kkt' \
-  --flex-lambda-theta-anchor '0' \
+  --flex-lambda-theta-anchor 0 \
   --flex-lambda-w-anchor 0 \
   --flex-lambda-theta-iso 0.0 \
   --flex-lambda-w-iso 0.0 \
@@ -1420,17 +1419,21 @@ python /Users/kensei/VScode/GraduationResearch/DFL_Portfolio_Optimization2/exper
   --no-ensemble \
   --disable-dual \
   --disable-kkt \
+    --flex-theta-clamp-enable --flex-theta-clamp-source ols \
+  --flex-anchor-clamp-tol 10,5,1,0.5,0.25,0.1,0.05,0.01 --flex-anchor-clamp-floor 0.0
+  
   --flex-w-clamp-enable --flex-w-clamp-source ols \
-  --flex-anchor-clamp-tol 1,0.5,0.25,0.1,0.05,0.01 --flex-anchor-clamp-floor 0.0 \
-  --flex-theta-clamp-enable --flex-theta-clamp-source ols \
-  --flex-anchor-clamp-tol 1,0.5,0.25,0.1,0.05,0.01 --flex-anchor-clamp-floor 0.0
+  --flex-anchor-clamp-tol 10,5,1,0.5,0.25,0.1,0.05,0.01 --flex-anchor-clamp-floor 0.0 \
+
+
 
   
 
 
+  --runs 100 \
+  --seed0 0 \
 
-
-  --seed-list '1,2,3,4,5,6,7,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31' \
+  --seed-list '0,1,2,3,4,5,6,7,9,10,11,12,14,15,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,33,34,35,36,37,38,39,40,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,61,62,63,64,65,66,67,68,69,70,71,73,74,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109' \
   
   flex-theta-init-mode：ols,ipo,none
 '''

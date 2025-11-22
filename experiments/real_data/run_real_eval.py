@@ -522,6 +522,7 @@ def compute_benchmark_series(
     mean_return = float(np.mean(returns))
     std_return = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
+    sortino = compute_sortino_ratio(returns)
     label = f"benchmark_{ticker}"
     stats = {
         "model": label,
@@ -530,6 +531,7 @@ def compute_benchmark_series(
         "mean_return": mean_return,
         "std_return": std_return,
         "sharpe": sharpe,
+        "sortino": sortino,
         "max_drawdown": max_drawdown(wealth_list),
         "final_wealth": float(wealth_list[-1]),
         "train_window": 0,
@@ -586,6 +588,20 @@ def plot_asset_correlation(corr_df: pd.DataFrame, path: Path, stats: Optional[Di
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def compute_sortino_ratio(returns: Sequence[float], target: float = 0.0) -> float:
+    arr = np.asarray(returns, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    downside = arr - target
+    downside = downside[downside < 0.0]
+    if downside.size == 0:
+        return np.nan
+    downside_dev = np.sqrt(np.mean(np.square(downside)))
+    if downside_dev <= 1e-12:
+        return np.nan
+    return float((np.mean(arr) - target) / downside_dev)
 
 
 def update_experiment_ledger(
@@ -1030,6 +1046,7 @@ def run_rolling_experiment(
     mean_return = float(np.mean(returns))
     std_return = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
+    sortino = compute_sortino_ratio(returns)
 
     model_debug_dir = debug_dir / f"model_{model_label}"
     model_debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1088,6 +1105,7 @@ def run_rolling_experiment(
         "mean_return": mean_return,
         "std_return": std_return,
         "sharpe": sharpe,
+        "sortino": sortino,
         "max_drawdown": max_drawdown(wealth_values),
         "final_wealth": float(wealth_values[-1]) if wealth_values else 1.0,
         "train_window": train_window,
