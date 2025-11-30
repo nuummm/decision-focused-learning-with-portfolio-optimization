@@ -44,6 +44,7 @@ PERIOD_WINDOWS = [
 ]
 
 WEIGHT_THRESHOLD = 0.95
+WEIGHT_PLOT_MAX_POINTS = 60  # latest samples to display in weight comparison
 
 
 def mvo_cost(z: np.ndarray, y: np.ndarray, V: np.ndarray, delta: float = 1.0) -> float:
@@ -203,6 +204,8 @@ def plot_weight_comparison(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
         axes = [axes]
     for ax, model in zip(axes, models):
         df = weight_dict[model]
+        if len(df) > WEIGHT_PLOT_MAX_POINTS:
+            df = df.tail(WEIGHT_PLOT_MAX_POINTS)
         dates = pd.to_datetime(df["date"])
         value_cols = [c for c in df.columns if c not in {"date", "portfolio_return_sq"}]
         values = df[value_cols].astype(float)
@@ -421,6 +424,11 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
 
 
 def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+    """モデル×資産ごとの weight 分布を箱ひげ図で可視化する。
+
+    行方向にモデル、列方向に資産を並べ、各セルに
+    そのモデル・資産の weight の箱ひげ図を描画する。
+    """
     if plt is None or not weight_dict:
         return
     models = list(weight_dict.keys())
@@ -438,12 +446,17 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
         values, _ = reduce_weight_columns(weight_dict[model])
         for c, ticker in enumerate(tickers):
             ax = axes[r, c]
-            ax.hist(values[ticker].dropna(), bins=20, range=(0, 1), color="tab:blue", alpha=0.7)
+            data = values[ticker].dropna().to_numpy()
+            if data.size == 0:
+                ax.set_visible(False)
+                continue
+            ax.boxplot(data, vert=True, showfliers=True)
+            ax.set_ylim(0, 1)
             if r == n_rows - 1:
                 ax.set_xlabel(ticker)
             if c == 0:
                 ax.set_ylabel(model)
-    fig.suptitle("Weight distributions")
+    fig.suptitle("Weight distributions (boxplots)")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -654,6 +667,11 @@ def update_experiment_ledger(
         "cov_window": args.cov_window,
         "cov_method": args.cov_method,
         "cov_shrinkage": args.cov_shrinkage,
+        "cov_eps": args.cov_eps,
+        "cov_ewma_alpha": args.cov_ewma_alpha,
+        "cov_robust_huber_k": args.cov_robust_huber_k,
+        "cov_factor_rank": args.cov_factor_rank,
+        "cov_factor_shrinkage": args.cov_factor_shrinkage,
         "delta": args.delta,
         "train_window_default": args.train_window,
         "rebal_interval": args.rebal_interval,
@@ -1154,9 +1172,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--momentum-window", type=int, default=52)
     parser.add_argument("--return-horizon", type=int, default=1)
     parser.add_argument("--cov-window", type=int, default=60)
-    parser.add_argument("--cov-method", type=str, default="diag", choices=["diag", "ledoit_wolf"])
+    parser.add_argument(
+        "--cov-method",
+        type=str,
+        default="diag",
+        choices=["diag", "ledoit_wolf", "ewma", "oas", "robust_lw", "mini_factor"],
+    )
     parser.add_argument("--cov-shrinkage", type=float, default=0.94)
     parser.add_argument("--cov-eps", type=float, default=1e-6)
+    parser.add_argument("--cov-ewma-alpha", type=float, default=0.94)
+    parser.add_argument("--cov-robust-huber-k", type=float, default=1.5)
+    parser.add_argument("--cov-factor-rank", type=int, default=1)
+    parser.add_argument("--cov-factor-shrinkage", type=float, default=0.5)
     parser.add_argument("--no-auto-adjust", action="store_true")
     parser.add_argument("--force-refresh", action="store_true")
 
@@ -1250,6 +1277,10 @@ def main() -> None:
         cov_method=args.cov_method,  # type: ignore[arg-type]
         cov_shrinkage=args.cov_shrinkage,
         cov_eps=args.cov_eps,
+        cov_ewma_alpha=args.cov_ewma_alpha,
+        cov_robust_huber_k=args.cov_robust_huber_k,
+        cov_factor_rank=args.cov_factor_rank,
+        cov_factor_shrinkage=args.cov_factor_shrinkage,
         auto_adjust=not args.no_auto_adjust,
         cache_dir=None,
         force_refresh=args.force_refresh,
@@ -1265,6 +1296,12 @@ def main() -> None:
             "rebal_interval": args.rebal_interval,
             "covariance_samples": len(bundle.cov_indices),
             "train_window_overrides": model_train_windows,
+            "cov_method": args.cov_method,
+            "cov_shrinkage": args.cov_shrinkage,
+            "cov_ewma_alpha": args.cov_ewma_alpha,
+            "cov_robust_huber_k": args.cov_robust_huber_k,
+            "cov_factor_rank": args.cov_factor_rank,
+            "cov_factor_shrinkage": args.cov_factor_shrinkage,
         }
     )
 
@@ -1558,8 +1595,12 @@ python -m experiments.real_data.run_real_eval \
 --momentum-window : モメンタム期間
 --return-horizon : 予測先 (例: 1 = 1 期間先)
 --cov-window : 共分散のローリング窓
---cov-method : diag / ledoit_wolf
+--cov-method : diag / ledoit_wolf / ewma / oas / robust_lw / mini_factor
 --cov-shrinkage : diag shrinkage の λ
+--cov-ewma-alpha : cov-method=ewma の指数重み α
+--cov-robust-huber-k : cov-method=robust_lw の Huber クリップ係数
+--cov-factor-rank : cov-method=mini_factor で抽出する因子数
+--cov-factor-shrinkage : mini_factor の残差共分散に適用するシュリンク係数
 --cov-eps : 数値安定化用 epsilon
 --no-auto-adjust : Yahoo の調整終値を使わない
 --force-refresh : キャッシュ無視で再取得

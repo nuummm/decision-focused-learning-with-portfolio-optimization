@@ -28,9 +28,20 @@ class MarketLoaderConfig:
     momentum_window: int = 52
     return_horizon: int = 1
     cov_window: int = 30
-    cov_method: Literal["diag", "ledoit_wolf"] = "diag"
+    cov_method: Literal[
+        "diag",
+        "ledoit_wolf",
+        "ewma",
+        "oas",
+        "robust_lw",
+        "mini_factor",
+    ] = "diag"
     cov_shrinkage: float = 0.94
     cov_eps: float = 1e-6
+    cov_ewma_alpha: float = 0.94
+    cov_robust_huber_k: float = 1.5
+    cov_factor_rank: int = 1
+    cov_factor_shrinkage: float = 0.5
     auto_adjust: bool = True
     cache_dir: Optional[Path] = None
     force_refresh: bool = False
@@ -72,6 +83,9 @@ class MarketDataset:
             "frequency": self.config.frequency,
             "cov_method": self.config.cov_method,
             "cov_shrinkage": self.config.cov_shrinkage,
+            "cov_ewma_alpha": self.config.cov_ewma_alpha,
+            "cov_robust_huber_k": self.config.cov_robust_huber_k,
+            "cov_factor_rank": self.config.cov_factor_rank,
             "timeline": [self.timestamps[0].isoformat(), self.timestamps[-1].isoformat()],
             "tickers": self.config.tickers,
         }
@@ -168,6 +182,10 @@ def load_market_dataset(config: MarketLoaderConfig) -> MarketDataset:
         method=config.cov_method,
         shrinkage=config.cov_shrinkage,
         eps=config.cov_eps,
+        ewma_alpha=config.cov_ewma_alpha,
+        robust_huber_k=config.cov_robust_huber_k,
+        factor_rank=config.cov_factor_rank,
+        factor_shrinkage=config.cov_factor_shrinkage,
     )
 
     if config.debug:

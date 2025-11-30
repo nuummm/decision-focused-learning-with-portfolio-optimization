@@ -1,3 +1,36 @@
+"""共分散推定ユーティリティ
+================================
+
+実データ実験で使用する共分散行列 (V) を推定するための関数群。
+以下の手法をサポートしており、どれも ``estimate_shrinkage_covariances``
+から選択・利用できる。
+
+1. ``diag``
+   標本共分散を対角方向にシュリンク (λ) し、`eps` を足して正定値化。
+2. ``ledoit_wolf``
+   scikit-learn の Ledoit-Wolf 推定器。
+3. ``ewma``
+   指定した ``alpha`` で指数加重移動平均 (EWMA)。
+4. ``oas``
+   scikit-learn の Oracle Approximating Shrinkage 推定器。
+5. ``robust_lw``
+   リターンを Huber 化してから Ledoit-Wolf を適用 (ロバスト共分散)。
+6. ``mini_factor``
+   PCA による 1-2 因子の近似 + 残差を対角シュリンク。
+
+使い方の例::
+
+    covs, times, stats = estimate_shrinkage_covariances(
+        returns_df,
+        window=10,
+        method="ewma",
+        ewma_alpha=0.97,
+    )
+
+戻り値 ``covs`` はローリング共分散行列のリスト、``times`` は対応する
+タイムスタンプ、``stats`` は ``CovarianceStats`` (最小/最大固有値)。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,12 +40,20 @@ import numpy as np
 import pandas as pd
 
 try:  # optional dependency
-    from sklearn.covariance import LedoitWolf
+    from sklearn.covariance import LedoitWolf, OAS
 except ImportError:  # pragma: no cover
     LedoitWolf = None
+    OAS = None
 
 
-ShrinkMethod = Literal["diag", "ledoit_wolf"]
+ShrinkMethod = Literal[
+    "diag",
+    "ledoit_wolf",
+    "ewma",
+    "oas",
+    "robust_lw",
+    "mini_factor",
+]
 
 
 @dataclass
@@ -41,6 +82,71 @@ def _ledoit_wolf_cov(window_vals: np.ndarray, eps: float) -> np.ndarray:
     return cov
 
 
+def _oas_cov(window_vals: np.ndarray, eps: float) -> np.ndarray:
+    if OAS is None:
+        raise RuntimeError("sklearn がインストールされていないため OAS を使用できません。")
+    oas = OAS(store_precision=False, assume_centered=False)
+    oas.fit(window_vals)
+    cov = oas.covariance_
+    cov = 0.5 * (cov + cov.T)
+    cov += eps * np.eye(cov.shape[0])
+    return cov
+
+
+def _ewma_cov(window_vals: np.ndarray, alpha: float, eps: float) -> np.ndarray:
+    alpha = float(np.clip(alpha, 0.0, 0.9999))
+    d = window_vals.shape[1]
+    cov = np.zeros((d, d), dtype=float)
+    for row in window_vals:
+        centered = row - np.mean(row)
+        vec = centered.reshape(-1, 1)
+        cov = alpha * cov + (1.0 - alpha) * (vec @ vec.T)
+    cov = 0.5 * (cov + cov.T)
+    cov += eps * np.eye(d)
+    return cov
+
+
+def _apply_huber(window_vals: np.ndarray, k: float) -> np.ndarray:
+    median = np.median(window_vals, axis=0)
+    mad = np.median(np.abs(window_vals - median), axis=0)
+    mad = np.where(mad < 1e-6, 1e-6, mad)
+    normalized = (window_vals - median) / mad
+    clipped = np.clip(normalized, -k, k)
+    return clipped * mad + median
+
+
+def _robust_ledoit_wolf_cov(window_vals: np.ndarray, huber_k: float, eps: float) -> np.ndarray:
+    huber_vals = _apply_huber(window_vals, huber_k)
+    return _ledoit_wolf_cov(huber_vals, eps)
+
+
+def _mini_factor_cov(
+    window_vals: np.ndarray,
+    rank: int,
+    residual_shrinkage: float,
+    eps: float,
+) -> np.ndarray:
+    d = window_vals.shape[1]
+    rank = max(1, min(rank, d))
+    centered = window_vals - np.mean(window_vals, axis=0)
+    sample_cov = np.cov(centered, rowvar=False)
+    eigvals, eigvecs = np.linalg.eigh(sample_cov)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+    B = eigvecs[:, :rank]
+    Sigma_f = np.diag(np.maximum(eigvals[:rank], eps))
+    factor_cov = B @ Sigma_f @ B.T
+    factor_scores = centered @ B
+    residuals = centered - factor_scores @ B.T
+    resid_cov = np.cov(residuals, rowvar=False)
+    resid_cov = _shrink_to_diag(resid_cov, shrinkage=residual_shrinkage, eps=eps)
+    cov = factor_cov + resid_cov
+    cov = 0.5 * (cov + cov.T)
+    cov += eps * np.eye(d)
+    return cov
+
+
 def estimate_shrinkage_covariances(
     returns: pd.DataFrame,
     window: int,
@@ -48,6 +154,10 @@ def estimate_shrinkage_covariances(
     method: ShrinkMethod = "diag",
     shrinkage: float = 0.94,
     eps: float = 1e-6,
+    ewma_alpha: float = 0.94,
+    robust_huber_k: float = 1.5,
+    factor_rank: int = 1,
+    factor_shrinkage: float = 0.5,
 ) -> Tuple[List[np.ndarray], List[pd.Timestamp], List[CovarianceStats]]:
     if window < 2:
         raise ValueError("window は 2 以上を指定してください。")
@@ -67,6 +177,19 @@ def estimate_shrinkage_covariances(
         sample_cov = np.cov(window_vals, rowvar=False)
         if method == "ledoit_wolf":
             cov = _ledoit_wolf_cov(window_vals, eps)
+        elif method == "ewma":
+            cov = _ewma_cov(window_vals, alpha=ewma_alpha, eps=eps)
+        elif method == "oas":
+            cov = _oas_cov(window_vals, eps)
+        elif method == "robust_lw":
+            cov = _robust_ledoit_wolf_cov(window_vals, huber_k=robust_huber_k, eps=eps)
+        elif method == "mini_factor":
+            cov = _mini_factor_cov(
+                window_vals,
+                rank=factor_rank,
+                residual_shrinkage=factor_shrinkage,
+                eps=eps,
+            )
         else:
             cov = _shrink_to_diag(sample_cov, shrinkage=shrinkage, eps=eps)
         eigvals = np.linalg.eigvalsh(cov)
