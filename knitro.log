@@ -1,0 +1,79 @@
+
+=======================================
+           Academic License
+       (NOT FOR COMMERCIAL USE)
+         Artelys Knitro 15.0.0
+=======================================
+
+Knitro using 1 thread.
+Knitro presolve eliminated 0 variables and 0 constraints.
+
+bar_initmu               0.1
+bar_murule               4
+concurrent_evals         0
+datacheck                0
+feastol                  1e-06
+feastol_abs              0.001
+findiff_numthreads       1
+hessian_no_f             1
+hessopt                  4
+honorbnds                1
+linsolver                3
+maxit                    20000
+maxtime_real             180
+nlp_algorithm            3
+numthreads               1
+opttol                   1e-06
+opttol_abs               0.001
+outdir                   knitro_logs/
+outlev                   3
+outmode                  1
+xtol                     1e-10
+The problem is identified as a QCQP.
+
+Problem Characteristics                                 (   Presolved)
+-----------------------
+Objective goal:  Minimize
+Objective type:  quadratic
+Number of variables:                                229 (         229)
+    bounded below only:                             200 (         200)
+    bounded above only:                               0 (           0)
+    bounded below and above:                          0 (           0)
+    fixed:                                            0 (           0)
+    free:                                            29 (          29)
+Number of constraints:                              150 (         150)
+    linear equalities:                              125 (         125)
+    quadratic equalities:                            25 (          25)
+    gen. nonlinear equalities:                        0 (           0)
+    linear one-sided inequalities:                    0 (           0)
+    quadratic one-sided inequalities:                 0 (           0)
+    gen. nonlinear one-sided inequalities:            0 (           0)
+    linear two-sided inequalities:                    0 (           0)
+    quadratic two-sided inequalities:                 0 (           0)
+    gen. nonlinear two-sided inequalities:            0 (           0)
+Number of nonzeros in Jacobian:                    1025 (        1025)
+Number of nonzeros in Hessian:                        0 (           0)
+
+Knitro using the Active-Set Conjugate Gradient algorithm.
+
+  Iter      Objective      FeasError   OptError    ||Step||    CGits 
+--------  --------------  ----------  ----------  ----------  -------
+       0    1.458861e-04   1.286e-04
+       1   -3.906794e-03   1.062e-04   2.324e+00   2.285e+00        0
+       2   -3.178295e-03   7.517e-05   2.229e+00   1.318e+00        2
+       3   -2.284453e-03   1.103e-04   3.699e-02   1.162e+00        2
+       4   -2.113536e-03   6.908e-05   1.845e+00   8.292e-01        3
+       5   -1.761431e-03   2.748e-05   5.782e+00   1.003e+00        1
+       6   -1.552853e-03   1.354e-05   4.755e+00   4.855e-01        5
+       7   -1.459328e-03   5.767e-06   9.467e-01   7.165e-01        3
+       8   -1.488918e-03   3.729e-06   2.990e+00   1.955e-01        2
+       9   -1.523863e-03   1.869e-06   3.518e+00   2.892e-01        2
+      10   -1.714270e-03   1.932e-06   2.433e+00   3.246e-01        1
+      11   -1.770734e-03   1.046e-06   1.199e+00   1.824e-01        2
+      12   -1.801242e-03   3.717e-07   2.414e-01   6.985e-02        3
+      13   -1.848910e-03   8.843e-08   8.906e-01   1.397e-01        1
+      14   -1.951462e-03   5.722e-07   9.305e-01   1.520e-01        1
+      15   -2.052443e-03   6.546e-07   5.310e-01   1.145e-01        2
+      16   -2.145958e-03   1.634e-07   1.125e+00   1.809e-01        1
+      17   -2.426250e-03   7.224e-07   4.713e+00   4.559e-01        1
+      18   -2.639447e-03   1.612e-06   1.689e+00   2.028e-01        3
