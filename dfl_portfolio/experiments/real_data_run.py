@@ -766,10 +766,10 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.real_data_run \
   --tickers "SPY,GLD,EEM,TLT" \
-  --start 2006-01-01 --end 2025-12-01 \
+  --start 2008-01-01 --end 2025-12-01 \
   --frequency weekly \
   --resample-rule W-FRI \
-  --momentum-window 30 \
+  --momentum-window 13 \
   --return-horizon 1 \
   --cov-window 10 \
   --cov-method diag \
