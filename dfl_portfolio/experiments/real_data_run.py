@@ -769,7 +769,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --start 2008-01-01 --end 2025-12-01 \
   --frequency weekly \
   --resample-rule W-FRI \
-  --momentum-window 13 \
+  --momentum-window 30 \
   --return-horizon 1 \
   --cov-window 10 \
   --cov-method diag \
