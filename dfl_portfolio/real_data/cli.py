@@ -63,9 +63,9 @@ def parse_delta_0_1(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Real-data rolling experiment runner")
-    parser.add_argument("--tickers", type=str, default="SPY,TLT,DBC,BIL")
-    parser.add_argument("--start", type=str, default="2010-01-01")
-    parser.add_argument("--end", type=str, default="2024-12-31")
+    parser.add_argument("--tickers", type=str, default="SPY,GLD,EEM,TLT")
+    parser.add_argument("--start", type=str, default="2006-01-01")
+    parser.add_argument("--end", type=str, default="2025-12-01")
     parser.add_argument("--interval", type=str, default="1d")
     parser.add_argument("--price-field", type=str, default="Close")
     parser.add_argument("--return-kind", type=str, default="log", choices=["simple", "log"])
@@ -76,9 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["daily", "weekly", "monthly"],
     )
     parser.add_argument("--resample-rule", type=str, default="W-FRI")
-    parser.add_argument("--momentum-window", type=int, default=52)
+    parser.add_argument("--momentum-window", type=int, default=30)
     parser.add_argument("--return-horizon", type=int, default=1)
-    parser.add_argument("--cov-window", type=int, default=60)
+    parser.add_argument("--cov-window", type=int, default=10)
     parser.add_argument(
         "--cov-method",
         type=str,
@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-refresh", action="store_true")
 
     parser.add_argument("--train-window", type=int, default=25)
-    parser.add_argument("--rebal-interval", type=int, default=1)
+    parser.add_argument("--rebal-interval", type=int, default=4)
     parser.add_argument(
         "--model-train-window",
         type=str,
@@ -104,11 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--delta", type=parse_delta_0_1, default=0.5)
     parser.add_argument("--models", type=str, default="ols,ipo,flex")
-    parser.add_argument("--flex-solver", type=str, default="gurobi")
+    parser.add_argument("--flex-solver", type=str, default="knitro")
     parser.add_argument(
         "--flex-formulation",
         type=str,
-        default="dual",
+        default="dual,kkt,dual&kkt",
         help=(
             "Comma-separated flex base models to run "
             "(e.g., 'dual', 'dual,kkt', or 'dual,kkt,dual&kkt' for dual/kkt+ensemble)."
@@ -117,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0)
     parser.add_argument("--flex-lambda-theta-iso", type=float, default=0.0)
     parser.add_argument("--flex-theta-anchor-mode", type=str, default="ols")
-    parser.add_argument("--flex-theta-init-mode", type=str, default="ols")
+    parser.add_argument("--flex-theta-init-mode", type=str, default="none")
     parser.add_argument(
         "--flex-ensemble-weight-dual",
         type=parse_delta_0_1,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -40,14 +41,31 @@ def build_rebalance_schedule(
     bundle,
     train_window: int,
     rebal_interval: int,
+    eval_start: Optional[pd.Timestamp] = None,
 ) -> List[ScheduleItem]:
-    """共通のローリング・リバランススケジュール構築ロジック。"""
+    """共通のローリング・リバランススケジュール構築ロジック。
+
+    eval_start を指定した場合、その日付以上のタイムスタンプを持つ
+    最初のサンプルを評価開始日とし、それ以前はスキップする。
+    """
     cov_indices = bundle.cov_indices.tolist()
     cov_set = set(cov_indices)
     test_cov = cov_indices[:]
 
+    # 評価開始位置（cov_indices 上のインデックス）を決める
+    start_pos = 0
+    if eval_start is not None:
+        ts_list = bundle.dataset.timestamps
+        for p, idx in enumerate(test_cov):
+            if ts_list[idx] >= eval_start:
+                start_pos = p
+                break
+        else:
+            # eval_start 以降に有効な共分散が無ければスケジュールは空
+            return []
+
     schedule: List[ScheduleItem] = []
-    pos = 0
+    pos = start_pos
     while pos < len(test_cov):
         rebalance_idx = test_cov[pos]
         train_end = rebalance_idx - 1
@@ -285,14 +303,28 @@ def build_flex_dual_kkt_ensemble(
         weights_df = pd.DataFrame()
 
     returns = ens_df["portfolio_return"].to_numpy()
-    mean_return = float(np.mean(returns)) if returns.size else 0.0
-    std_return = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+    mean_step = float(np.mean(returns)) if returns.size else 0.0
+    std_step = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+    # 年率換算: dual / kkt と同じく「全期間のステップ数 / 年数」でスケール
+    if wealth_series_dates and len(wealth_series_dates) >= 2:
+        horizon_days = (wealth_series_dates[-1] - wealth_series_dates[0]).days
+        horizon_years = max(horizon_days / 365.25, 1e-9)
+        steps_per_year = len(ens_df) / horizon_years
+    else:
+        steps_per_year = 1.0
+    mean_return = mean_step * steps_per_year
+    std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
-    sortino = compute_sortino_ratio(returns)
+    sortino_step = compute_sortino_ratio(returns)
+    sortino = (
+        float(sortino_step) * math.sqrt(steps_per_year)
+        if np.isfinite(sortino_step)
+        else np.nan
+    )
 
     stats_report = {
         "model": display_model_name(ens_label),
-        "n_cycles": None,
+        "n_cycles": int(len(ens_df)),
         "n_steps": int(len(ens_df)),
         "mean_return": mean_return,
         "std_return": std_return,

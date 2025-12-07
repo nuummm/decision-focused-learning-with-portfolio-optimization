@@ -32,6 +32,7 @@ from dfl_portfolio.real_data.reporting import (
     compute_correlation_stats,
     compute_period_metrics,
     compute_pairwise_mean_return_tests,
+    compute_pairwise_performance_tests,
     compute_sortino_ratio,
     display_model_name,
     export_average_weights,
@@ -50,6 +51,7 @@ from dfl_portfolio.real_data.reporting import (
     plot_weight_paths,
     update_experiment_ledger,
     run_extended_analysis,
+    summarize_dfl_performance_significance,
 )
 from dfl_portfolio.registry import SolverSpec, get_trainer
 from dfl_portfolio.models.ols import predict_yhat, train_ols
@@ -129,9 +131,10 @@ def run_rolling_experiment(
     results_model_dir: Path,
     tee: bool,
     asset_pred_dir: Path | None = None,
+    eval_start: Optional[pd.Timestamp] = None,
 ) -> Dict[str, object]:
     trainer = get_trainer(model_key, solver_spec)
-    schedule = build_rebalance_schedule(bundle, train_window, rebal_interval)
+    schedule = build_rebalance_schedule(bundle, train_window, rebal_interval, eval_start=eval_start)
     cov_lookup = {
         idx: (cov, stat)
         for idx, cov, stat in zip(
@@ -265,7 +268,13 @@ def run_rolling_experiment(
     mean_return = mean_step * steps_per_year
     std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
-    sortino = compute_sortino_ratio(returns)
+    # Sortino も Sharpe と整合するように年率換算する
+    sortino_step = compute_sortino_ratio(returns)
+    sortino = (
+        float(sortino_step) * math.sqrt(steps_per_year)
+        if np.isfinite(sortino_step)
+        else np.nan
+    )
 
     model_debug_dir = debug_dir / f"model_{model_label}"
     model_debug_dir.mkdir(parents=True, exist_ok=True)
@@ -427,6 +436,7 @@ def main() -> None:
         cache_dir=None,
         force_refresh=args.force_refresh,
         debug=not args.no_debug,
+        train_window=args.train_window,
     )
 
     pipeline_cfg = PipelineConfig(loader=loader_cfg, debug=not args.no_debug)
@@ -508,6 +518,8 @@ def main() -> None:
         raise ValueError("delta=0 is not supported for IPO closed-form model (ipo). "
                          "Use delta>0 or remove 'ipo' from --models.")
 
+    eval_start_ts = pd.Timestamp(args.start)
+
     for model_key in model_list:
         if model_key not in {"ols", "ipo", "flex"}:
             print(f"[real-data] skipping unsupported model '{model_key}'")
@@ -553,6 +565,7 @@ def main() -> None:
                 results_model_dir=results_dir,
                 tee=args.tee,
                 asset_pred_dir=asset_pred_dir,
+                eval_start=eval_start_ts,
             )
             stats_results.append(run_result["stats"])
             reb_summary = run_result.get("rebalance_summary", {})
@@ -659,6 +672,8 @@ def main() -> None:
                 wealth_merge = wealth_merge.merge(df_model, on="date", how="outer")
         if wealth_merge is not None:
             wealth_merge = wealth_merge.sort_values("date")
+            # 同一日付に複数行（初期値とステップ後など）があるので、日付ごとに最後の行を採用して正規化する
+            wealth_merge = wealth_merge.groupby("date", as_index=False).last()
             wealth_merge.to_csv(analysis_csv_dir / "wealth_comparison.csv", index=False)
             plot_multi_wealth({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_comparison.png")
             plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_events.png")
@@ -677,6 +692,13 @@ def main() -> None:
                         if col in sig_df.columns:
                             sig_df[col] = sig_df[col].map(display_model_name)
                     sig_df.to_csv(analysis_csv_dir / "return_significance.csv", index=False)
+                perf_df = compute_pairwise_performance_tests(wealth_returns)
+                if not perf_df.empty:
+                    for col in ("model_a", "model_b"):
+                        if col in perf_df.columns:
+                            perf_df[col] = perf_df[col].map(display_model_name)
+                    perf_df.to_csv(analysis_csv_dir / "performance_significance.csv", index=False)
+                    summarize_dfl_performance_significance(analysis_csv_dir)
 
     if weight_dict:
         plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")
@@ -744,10 +766,7 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.real_data_run \
   --tickers "SPY,GLD,EEM,TLT" \
-  --start 2006-10-31 --end 2025-10-31 \
-  --interval 1d \
-  --price-field Close \
-  --return-kind log \
+  --start 2006-01-01 --end 2025-12-01 \
   --frequency weekly \
   --resample-rule W-FRI \
   --momentum-window 30 \
@@ -755,7 +774,6 @@ python -m dfl_portfolio.experiments.real_data_run \
   --cov-window 10 \
   --cov-method diag \
   --cov-shrinkage 0.94 \
-  --cov-eps 1e-6 \
   --train-window 25 \
   --rebal-interval 4 \
   --delta 0.5 \
@@ -764,7 +782,6 @@ python -m dfl_portfolio.experiments.real_data_run \
   --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-ensemble-weight-dual 0.5 \
   --flex-lambda-theta-anchor 0.0 \
-  --flex-lambda-theta-iso 0.0 \
   --flex-theta-anchor-mode ols \
   --flex-theta-init-mode none \
   --benchmark-ticker SPY \

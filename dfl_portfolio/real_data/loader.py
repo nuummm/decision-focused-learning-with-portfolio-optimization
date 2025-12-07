@@ -18,6 +18,7 @@ FrequencyKind = Literal["daily", "weekly", "monthly"]
 @dataclass
 class MarketLoaderConfig:
     tickers: List[str]
+    # 評価開始日（運用開始日）。fetch はこの日付より前まで遡って行われる。
     start: str
     end: str
     interval: str = "1d"
@@ -28,6 +29,8 @@ class MarketLoaderConfig:
     momentum_window: int = 52
     return_horizon: int = 1
     cov_window: int = 30
+    # ローリング学習に使う train_window（週数など）。fetch 開始日を決める際に使う。
+    train_window: int = 0
     cov_method: Literal[
         "diag",
         "oas",
@@ -89,7 +92,14 @@ class MarketDataset:
 
 def _determine_fetch_start(config: MarketLoaderConfig) -> str:
     start_ts = pd.Timestamp(config.start)
-    buffer = config.momentum_window + config.return_horizon + config.cov_window
+    # 評価開始日からどれだけ遡って取得するかを決めるバッファ。
+    # train_window が指定されていれば、それ + max(momentum, cov, horizon) を使用。
+    extra = max(config.momentum_window, config.cov_window, config.return_horizon)
+    if config.train_window and config.train_window > 0:
+        buffer = int(config.train_window) + int(extra)
+    else:
+        # 従来の挙動への後方互換
+        buffer = config.momentum_window + config.return_horizon + config.cov_window
     if config.frequency == "weekly":
         offset = pd.DateOffset(weeks=buffer)
     elif config.frequency == "monthly":
@@ -176,7 +186,21 @@ def load_market_dataset(config: MarketLoaderConfig) -> MarketDataset:
 
     returns = _compute_returns(prices, config.return_kind)
     momentum = _compute_momentum(prices, config.momentum_window)
-    start_cutoff = pd.Timestamp(config.start)
+
+    # 学習に使う特徴量 X,Y の開始日。
+    # train_window があれば、評価開始日 (config.start) から train_window 分だけ遡った日付を起点とする。
+    eval_start_ts = pd.Timestamp(config.start)
+    if config.train_window and config.train_window > 0:
+        if config.frequency == "weekly":
+            start_cutoff = eval_start_ts - pd.DateOffset(weeks=config.train_window)
+        elif config.frequency == "monthly":
+            start_cutoff = eval_start_ts - pd.DateOffset(months=config.train_window)
+        else:
+            # daily の場合は営業日換算として 1週≈5日 とみなす
+            start_cutoff = eval_start_ts - pd.DateOffset(days=config.train_window * 5)
+    else:
+        start_cutoff = eval_start_ts
+
     X, Y, idx = _build_xy(momentum, returns, config.return_horizon, start_cutoff)
     returns_clean = returns.dropna()
     covs, cov_times, cov_stats = estimate_shrinkage_covariances(

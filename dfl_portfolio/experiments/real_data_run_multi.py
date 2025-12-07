@@ -41,6 +41,8 @@ from dfl_portfolio.real_data.reporting import (
     plot_weight_histograms,
     plot_weight_paths,
     run_extended_analysis,
+    compute_pairwise_performance_tests,
+    summarize_dfl_performance_significance,
 )
 from dfl_portfolio.models.ols_gurobi import solve_mvo_gurobi
 from dfl_portfolio.models.ols_multi import train_ols_multi, predict_yhat_multi
@@ -104,9 +106,10 @@ def run_rolling_experiment_multi(
     results_model_dir: Path,
     asset_pred_dir: Path | None = None,
     formulation: Optional[str] = None,
+    eval_start: Optional[pd.Timestamp] = None,
 ) -> Dict[str, Any]:
     """OLS / flex (multi-feature) 用ローリング実験ループ。"""
-    schedule = build_rebalance_schedule(bundle, train_window, rebal_interval)
+    schedule = build_rebalance_schedule(bundle, train_window, rebal_interval, eval_start=eval_start)
     if debug_roll:
         print(f"[real-data-multi] schedule length = {len(schedule)}")
     cov_lookup = {
@@ -260,7 +263,12 @@ def run_rolling_experiment_multi(
     mean_return = mean_step * steps_per_year
     std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
-    sortino = compute_sortino_ratio(returns)
+    sortino_step = compute_sortino_ratio(returns)
+    sortino = (
+        float(sortino_step) * math.sqrt(steps_per_year)
+        if np.isfinite(sortino_step)
+        else np.nan
+    )
 
     model_debug_dir = debug_dir / f"model_{model_label}"
     model_debug_dir.mkdir(parents=True, exist_ok=True)
@@ -396,6 +404,7 @@ def main() -> None:
         cache_dir=None,
         force_refresh=args.force_refresh,
         debug=not args.no_debug,
+        train_window=args.train_window,
     )
     pipe_cfg = PipelineConfig(loader=loader_cfg, debug=not args.no_debug)
     bundle = build_data_bundle(pipe_cfg)
@@ -482,6 +491,7 @@ def main() -> None:
                 f"{effective_train_window} (default {args.train_window})"
             )
 
+        eval_start_ts = pd.Timestamp(args.start)
         run_result = run_rolling_experiment_multi(
             model_key=model_key,
             model_label=label,
@@ -495,6 +505,7 @@ def main() -> None:
             results_model_dir=results_dir,
             asset_pred_dir=asset_pred_dir,
             formulation=formulation,
+            eval_start=eval_start_ts,
         )
         stats_results.append(run_result["stats"])
         reb_summary = run_result.get("rebalance_summary", {})
@@ -604,6 +615,7 @@ def main() -> None:
                 wealth_merge = wealth_merge.merge(df_model, on="date", how="outer")
         if wealth_merge is not None:
             wealth_merge = wealth_merge.sort_values("date")
+            wealth_merge = wealth_merge.groupby("date", as_index=False).last()
             wealth_merge.to_csv(analysis_csv_dir / "wealth_comparison.csv", index=False)
             plot_multi_wealth({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_comparison.png")
             plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_events.png")
@@ -622,6 +634,13 @@ def main() -> None:
                         if col in sig_df.columns:
                             sig_df[col] = sig_df[col].map(display_model_name)
                     sig_df.to_csv(analysis_csv_dir / "return_significance.csv", index=False)
+                perf_df = compute_pairwise_performance_tests(wealth_returns)
+                if not perf_df.empty:
+                    for col in ("model_a", "model_b"):
+                        if col in perf_df.columns:
+                            perf_df[col] = perf_df[col].map(display_model_name)
+                    perf_df.to_csv(analysis_csv_dir / "performance_significance.csv", index=False)
+                    summarize_dfl_performance_significance(analysis_csv_dir)
 
     if weight_dict:
         plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")

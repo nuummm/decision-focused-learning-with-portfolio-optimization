@@ -523,6 +523,10 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
         axes = np.array([axes])
     elif n_cols == 1:
         axes = np.array([[ax] for ax in axes])
+
+    # 共通のビン（0〜1 の範囲を等間隔に分割）
+    bins = np.linspace(0.0, 1.0, 21)
+
     for r, model in enumerate(models):
         values, _ = reduce_weight_columns(weight_dict[model])
         for c, ticker in enumerate(tickers):
@@ -531,13 +535,13 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
             if data.size == 0:
                 ax.set_visible(False)
                 continue
-            ax.boxplot(data, vert=True, showfliers=True)
-            ax.set_ylim(0, 1)
+            ax.hist(data, bins=bins, range=(0.0, 1.0), color="tab:blue", alpha=0.7)
+            ax.set_xlim(0.0, 1.0)
             if r == n_rows - 1:
                 ax.set_xlabel(ticker)
             if c == 0:
                 ax.set_ylabel(model)
-    fig.suptitle("Weight distributions (boxplots)")
+    fig.suptitle("Weight distributions (histograms)")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -621,7 +625,12 @@ def compute_benchmark_series(
     mean_return = mean_step * steps_per_year
     std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
-    sortino = compute_sortino_ratio(returns)
+    sortino_step = compute_sortino_ratio(returns)
+    sortino = (
+        float(sortino_step) * math.sqrt(steps_per_year)
+        if np.isfinite(sortino_step)
+        else np.nan
+    )
     label = f"benchmark_{ticker}"
     stats = {
         "model": label,
@@ -668,7 +677,12 @@ def compute_equal_weight_benchmark(
     mean_return = mean_step * steps_per_year
     std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
-    sortino = compute_sortino_ratio(returns)
+    sortino_step = compute_sortino_ratio(returns)
+    sortino = (
+        float(sortino_step) * math.sqrt(steps_per_year)
+        if np.isfinite(sortino_step)
+        else np.nan
+    )
     label = "benchmark_equal_weight"
     stats = {
         # 表示名としては 1/N を使う
@@ -766,6 +780,158 @@ def compute_pairwise_mean_return_tests(
     return pd.DataFrame(rows)
 
 
+def compute_pairwise_performance_tests(
+    wealth_returns: pd.DataFrame,
+    n_bootstrap: int = 1000,
+) -> pd.DataFrame:
+    """平均リターン・分散・Sharpe・Sortino・累積リターンの差の有意性を
+    ブートストラップで評価する。
+
+    - 各ペア (model_a, model_b) について、同じ日付のリターン差を前提に
+      時点方向の再標本化（ブートストラップ）を行う。
+    - 各ブートストラップサンプルごとにメトリクス差を計算し、
+      その符号が 0 からどれだけ安定して離れているかで両側 p 値を近似する。
+    """
+    if wealth_returns.empty or wealth_returns.shape[1] < 2:
+        return pd.DataFrame()
+
+    models = list(wealth_returns.columns)
+    rows: List[Dict[str, object]] = []
+    rng = np.random.default_rng(42)
+
+    def _metrics(r: np.ndarray) -> Dict[str, float]:
+        r = np.asarray(r, dtype=float)
+        mean = float(np.mean(r))
+        std = float(np.std(r, ddof=1)) if r.size > 1 else float("nan")
+        sharpe = mean / std if std > 1e-12 else float("nan")
+        sortino = compute_sortino_ratio(r)
+        final_wealth = float(np.prod(1.0 + r))
+        return {
+            "mean": mean,
+            "std": std,
+            "sharpe": sharpe,
+            "sortino": sortino,
+            "final_wealth": final_wealth,
+        }
+
+    for i in range(len(models)):
+        for j in range(i + 1, len(models)):
+            a, b = models[i], models[j]
+            ra = wealth_returns[a]
+            rb = wealth_returns[b]
+            mask = ra.notna() & rb.notna()
+            ra = ra[mask].to_numpy(dtype=float)
+            rb = rb[mask].to_numpy(dtype=float)
+            n = int(ra.shape[0])
+            if n < 2:
+                continue
+
+            m_a = _metrics(ra)
+            m_b = _metrics(rb)
+            diff_obs = {k: m_a[k] - m_b[k] for k in m_a.keys()}
+
+            diff_boot: Dict[str, List[float]] = {k: [] for k in m_a.keys()}
+            for _ in range(n_bootstrap):
+                idx = rng.integers(0, n, size=n)
+                m_a_b = _metrics(ra[idx])
+                m_b_b = _metrics(rb[idx])
+                for k in diff_boot.keys():
+                    diff_boot[k].append(m_a_b[k] - m_b_b[k])
+
+            row: Dict[str, object] = {
+                "model_a": a,
+                "model_b": b,
+                "n_obs": n,
+            }
+            for k in ["mean", "std", "sharpe", "sortino", "final_wealth"]:
+                obs = diff_obs.get(k, float("nan"))
+                boot_arr = np.asarray(diff_boot.get(k, []), dtype=float)
+                boot_arr = boot_arr[np.isfinite(boot_arr)]
+                if boot_arr.size == 0 or not np.isfinite(obs):
+                    p_val = float("nan")
+                else:
+                    greater = float(np.mean(boot_arr >= 0.0))
+                    less = float(np.mean(boot_arr <= 0.0))
+                    p_val = 2.0 * min(greater, less)
+                    p_val = min(p_val, 1.0)
+                row[f"{k}_diff"] = obs
+                row[f"{k}_p_5pct"] = p_val
+                row[f"{k}_p_1pct"] = p_val
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------
+def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
+    """提案手法（DFL-QCQP 系）が他モデルと比べて有意かどうかの概要 CSV を作成する。
+
+    入力: performance_significance.csv
+    出力: performance_significance_dfl_summary.csv
+    """
+    perf_path = Path(analysis_csv_dir) / "performance_significance.csv"
+    if not perf_path.exists():
+        return
+    df = pd.read_csv(perf_path)
+    if df.empty:
+        return
+
+    all_models: set[str] = set(df["model_a"]).union(set(df["model_b"]))
+    # 提案手法モデル（display 名ベース）。display 前の "flex" もフォールバックとして拾う。
+    dfl_models = [m for m in all_models if "DFL-QCQP" in str(m)]
+    if not dfl_models:
+        dfl_models = [m for m in all_models if "flex" in str(m)]
+    if not dfl_models:
+        return
+
+    rows_out: list[dict[str, object]] = []
+    metrics = ["mean", "std", "sharpe", "sortino", "final_wealth"]
+
+    for dfl in dfl_models:
+        for other in sorted(m for m in all_models if m != dfl):
+            mask_ab = (df["model_a"] == dfl) & (df["model_b"] == other)
+            mask_ba = (df["model_a"] == other) & (df["model_b"] == dfl)
+            if mask_ab.any():
+                rec = df.loc[mask_ab].iloc[0]
+                sign = 1.0
+            elif mask_ba.any():
+                rec = df.loc[mask_ba].iloc[0]
+                sign = -1.0
+            else:
+                continue
+
+            row: dict[str, object] = {
+                "model_dfl": dfl,
+                "model_other": other,
+                "n_obs": int(rec.get("n_obs", 0)),
+            }
+            for k in metrics:
+                diff_col = f"{k}_diff"
+                p_col = f"{k}_p_5pct"
+                diff_val = rec.get(diff_col, np.nan)
+                try:
+                    diff = float(diff_val) * sign
+                except Exception:
+                    diff = float("nan")
+                p_val_raw = rec.get(p_col, np.nan)
+                try:
+                    p_val = float(p_val_raw)
+                except Exception:
+                    p_val = float("nan")
+                row[f"{k}_diff"] = diff
+                row[f"{k}_p"] = p_val
+                row[f"{k}_sig_5pct"] = bool(np.isfinite(p_val) and p_val < 0.05)
+                row[f"{k}_sig_1pct"] = bool(np.isfinite(p_val) and p_val < 0.01)
+            rows_out.append(row)
+
+    if rows_out:
+        out_df = pd.DataFrame(rows_out)
+        out_df.to_csv(
+            Path(analysis_csv_dir) / "performance_significance_dfl_summary.csv",
+            index=False,
+        )
+
+
 # ------------------------------------------------------------
 # 追加分析: 集中度・MSE・バイアス
 # ------------------------------------------------------------
@@ -826,32 +992,52 @@ def run_concentration_analysis(
     if plt is None:
         return
 
-    plt.figure()
-    plt.bar(x, conc_df["N_eff_mean"])
-    plt.xticks(x, models, rotation=45, ha="right")
-    plt.ylabel("Effective number of assets (avg)")
-    plt.title("Average effective holdings by model")
-    plt.tight_layout()
-    plt.savefig(analysis_fig_dir / "concentration_Neff_bar.png")
-    plt.close()
+    # 一枚の図に 3 つの指標を並べて表示
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharex=True)
+    if len(axes.shape) == 0:  # pragma: no cover - defensive
+        axes = [axes]
 
-    plt.figure()
-    plt.bar(x, conc_df["max_w_mean"])
-    plt.xticks(x, models, rotation=45, ha="right")
-    plt.ylabel("Average max weight")
-    plt.title("Average max weight by model")
-    plt.tight_layout()
-    plt.savefig(analysis_fig_dir / "concentration_maxw_bar.png")
-    plt.close()
+    # モデルごとの色を固定
+    color_map = {
+        "ols": "blue",
+        "ipo": "orange",
+        "DFL-QCQP-dual": "green",
+        "DFL-QCQP-kkt": "red",
+        "DFL-QCQP-ens": "black",
+        "1/N": "grey",
+    }
+    bar_colors = []
+    for i, m in enumerate(models):
+        c = color_map.get(m)
+        if c is None:
+            c = f"C{i % 10}"
+        bar_colors.append(c)
 
-    plt.figure()
-    plt.bar(x, conc_df["cap_hit_freq"])
-    plt.xticks(x, models, rotation=45, ha="right")
-    plt.ylabel("Frequency of w_max ≥ 0.95")
-    plt.title("Concentration frequency by model")
-    plt.tight_layout()
-    plt.savefig(analysis_fig_dir / "concentration_capfreq_bar.png")
-    plt.close()
+    # Neff
+    ax = axes[0]
+    ax.bar(x, conc_df["N_eff_mean"], color=bar_colors)
+    ax.set_ylabel("Effective #assets (avg)")
+    ax.set_title("Neff")
+
+    # max weight
+    ax = axes[1]
+    ax.bar(x, conc_df["max_w_mean"], color=bar_colors)
+    ax.set_ylabel("Average max weight")
+    ax.set_title("Max weight")
+
+    # cap frequency
+    ax = axes[2]
+    ax.bar(x, conc_df["cap_hit_freq"], color=bar_colors)
+    ax.set_ylabel("Freq. of w_max ≥ 0.95")
+    ax.set_title("Concentration freq.")
+
+    for ax in axes:
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=45, ha="right")
+
+    fig.tight_layout()
+    fig.savefig(analysis_fig_dir / "concentration_summary_bar.png")
+    plt.close(fig)
 
 
 def run_mse_and_bias_analysis(
@@ -895,15 +1081,29 @@ def run_mse_and_bias_analysis(
     if "model" not in summary.columns:
         return
     summary = summary.set_index("model")
-    plot_df = summary.join(mse_df, how="inner")
+    # left join にして、1/N など「MSE を持たない」ベンチマークも残す
+    plot_df = summary.join(mse_df, how="left")
     if plot_df.empty or plt is None:
         return
 
     # MSE vs Sharpe scatter
     plt.figure()
+    max_mse = float(plot_df["mse"].max(skipna=True)) if "mse" in plot_df.columns else float("nan")
+    default_x = 0.0 if not np.isfinite(max_mse) else max_mse * 1.05
     for model, row in plot_df.iterrows():
-        plt.scatter(row["mse"], row["sharpe"])
-        plt.text(row["mse"], row["sharpe"], model, fontsize=8)
+        # ベンチマーク系は散布図から除外（SPY, 1/N）
+        mstr = str(model)
+        if ("SPY" in mstr and "benchmark" in mstr) or mstr in {"1/N", "[SPY]", "benchmark_SPY"}:
+            continue
+        x = row.get("mse", np.nan)
+        if not np.isfinite(x):
+            # MSE が定義されないベンチマーク（1/N など）は右端にプロット
+            x = default_x
+        y = row.get("sharpe", np.nan)
+        if not np.isfinite(y):
+            continue
+        plt.scatter(x, y)
+        plt.text(x, y, model, fontsize=8)
     plt.xlabel("Prediction MSE (per step)")
     plt.ylabel("Sharpe ratio (annualized)")
     plt.title("Prediction accuracy vs decision quality")
@@ -931,6 +1131,7 @@ def run_mse_and_bias_analysis(
         plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
         plt.ylabel("Bias = pred_ret - real_ret")
         plt.title("Prediction bias by Up/Down group")
+        plt.yscale("symlog", linthresh=1e-2)
         plt.tight_layout()
         plt.savefig(analysis_fig_dir / "updown_bias_boxplot.png")
         plt.close()
@@ -953,9 +1154,104 @@ def run_mse_and_bias_analysis(
         plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
         plt.ylabel("Bias = pred_ret - real_ret")
         plt.title("Prediction bias for IN/OUT assets")
+        plt.yscale("symlog", linthresh=1e-2)
         plt.tight_layout()
         plt.savefig(analysis_fig_dir / "inout_bias_boxplot.png")
         plt.close()
+
+    # ---- flex 系モデルに対するヒストグラム（Up/Down, IN/OUT） ----
+    flex_models = [m for m in df["model"].unique() if "DFL-QCQP" in str(m)]
+    if not flex_models:
+        # まだ display_model_name を通していない実験では "flex" ラベルを拾う
+        flex_models = [m for m in df["model"].unique() if "flex" in str(m)]
+    if plt is not None and flex_models:
+        # 共通のビンを決める（全体の 1〜99% 区間）
+        bias_q01 = float(df["bias"].quantile(0.01))
+        bias_q99 = float(df["bias"].quantile(0.99))
+        if not np.isfinite(bias_q01) or not np.isfinite(bias_q99) or bias_q01 == bias_q99:
+            bias_q01, bias_q99 = -0.1, 0.1
+        bins = np.linspace(bias_q01, bias_q99, 40)
+
+        # Up/Down ヒストグラム
+        n = len(flex_models)
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharex=True, sharey=True)
+        if n == 1:
+            axes = [axes]
+        for ax, model in zip(axes, flex_models):
+            sub = df[df["model"] == model]
+            up = sub[sub["updown"] == "Up"]["bias"].to_numpy()
+            down = sub[sub["updown"] == "Down"]["bias"].to_numpy()
+            if up.size == 0 and down.size == 0:
+                continue
+            if down.size > 0:
+                ax.hist(
+                    down,
+                    bins=bins,
+                    alpha=0.5,
+                    density=True,
+                    color="red",
+                    label="Down",
+                )
+            if up.size > 0:
+                ax.hist(
+                    up,
+                    bins=bins,
+                    alpha=0.5,
+                    density=True,
+                    color="green",
+                    label="Up",
+                )
+            ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
+            ax.set_title(model)
+            ax.set_xlim(bias_q01, bias_q99)
+        axes[0].set_ylabel("Density")
+        fig.suptitle("Prediction bias (Up vs Down) for DFL-QCQP models")
+        handles, labels = axes[-1].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper right")
+        fig.tight_layout(rect=[0, 0, 0.95, 0.9])
+        fig.savefig(analysis_fig_dir / "updown_bias_hist_flex.png")
+        plt.close(fig)
+
+        # IN/OUT ヒストグラム
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharex=True, sharey=True)
+        if n == 1:
+            axes = [axes]
+        for ax, model in zip(axes, flex_models):
+            sub = df[df["model"] == model]
+            inside = sub[sub["inout"] == "IN"]["bias"].to_numpy()
+            outside = sub[sub["inout"] == "OUT"]["bias"].to_numpy()
+            if inside.size == 0 and outside.size == 0:
+                continue
+            if outside.size > 0:
+                ax.hist(
+                    outside,
+                    bins=bins,
+                    alpha=0.5,
+                    density=True,
+                    color="red",
+                    label="OUT",
+                )
+            if inside.size > 0:
+                ax.hist(
+                    inside,
+                    bins=bins,
+                    alpha=0.5,
+                    density=True,
+                    color="green",
+                    label="IN",
+                )
+            ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
+            ax.set_title(model)
+            ax.set_xlim(bias_q01, bias_q99)
+        axes[0].set_ylabel("Density")
+        fig.suptitle("Prediction bias (IN vs OUT) for DFL-QCQP models")
+        handles, labels = axes[-1].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper right")
+        fig.tight_layout(rect=[0, 0, 0.95, 0.9])
+        fig.savefig(analysis_fig_dir / "inout_bias_hist_flex.png")
+        plt.close(fig)
 
     # Top/Bottom bias timeseries
     def _top_bottom_bias(group: pd.DataFrame) -> pd.Series:
@@ -965,7 +1261,7 @@ def run_mse_and_bias_analysis(
         return pd.Series({"top_bias": top_bias, "bottom_bias": bottom_bias})
 
     tb = (
-        df.groupby(["model", "date"])
+        df.groupby(["model", "date"])[["weight", "bias"]]
         .apply(_top_bottom_bias)
         .reset_index()
         .sort_values("date")
@@ -974,14 +1270,24 @@ def run_mse_and_bias_analysis(
 
     if plt is not None and not tb.empty:
         plt.figure(figsize=(10, 5))
-        for model in tb["model"].unique():
-            sub = tb[tb["model"] == model]
-            plt.plot(sub["date"], sub["top_bias"], label=f"{model} Top", linestyle="-")
-            plt.plot(sub["date"], sub["bottom_bias"], label=f"{model} Bottom", linestyle="--")
+        # 提案手法（DFL-QCQP 系）のうち 1 モデルだけ可視化（優先的に dual）
+        candidates = [m for m in tb["model"].unique() if "DFL-QCQP" in str(m)]
+        if "DFL-QCQP-dual" in candidates:
+            target_model = "DFL-QCQP-dual"
+        elif candidates:
+            target_model = sorted(candidates)[0]
+        else:
+            # DFL-QCQP が無い場合は、先頭のモデルだけを対象にする
+            target_model = str(tb["model"].iloc[0])
+
+        sub = tb[tb["model"] == target_model]
+        plt.plot(sub["date"], sub["top_bias"], label=f"{target_model} Top", linestyle="-")
+        plt.plot(sub["date"], sub["bottom_bias"], label=f"{target_model} Bottom", linestyle="--")
         plt.axhline(0.0, linestyle=":", linewidth=1, color="black")
         plt.ylabel("Bias = pred_ret - real_ret")
         plt.xlabel("date")
         plt.title("Bias of top/bottom-weighted assets over time")
+        plt.yscale("symlog", linthresh=1e-2)
         plt.legend()
         plt.tight_layout()
         plt.savefig(analysis_fig_dir / "topbottom_bias_timeseries.png")
