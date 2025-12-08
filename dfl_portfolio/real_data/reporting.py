@@ -270,17 +270,23 @@ def compute_period_metrics(step_df: pd.DataFrame) -> List[Dict[str, object]]:
 def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     """summary.csv 用にメトリクスを人間が読みやすい形に整形する。
 
-    - mean_return, std_return, sharpe, sortino, max_drawdown を年率[%]として扱い、
+    - mean_return, std_return, max_drawdown を年率[%]として扱い、
       100 倍して小数第 2 位までに丸める。
+    - sharpe, sortino はスケーリングせず生の値を小数第 4 位までに丸める。
     - max_drawdown は「下落率」を表現するために負の値に変換（例: 0.25 → -25.00）。
     - final_wealth も小数第 2 位までに丸める。
     """
     if summary_df.empty:
         return summary_df
     df = summary_df.copy()
-    for col in ["mean_return", "std_return", "sharpe", "sortino"]:
+    # 年率 % として表示する列
+    for col in ["mean_return", "std_return"]:
         if col in df.columns:
             df[col] = (df[col].astype(float) * 100.0).round(2)
+    # Sharpe / Sortino は生値のまま 4 桁表示
+    for col in ["sharpe", "sortino"]:
+        if col in df.columns:
+            df[col] = df[col].astype(float).round(4)
     if "max_drawdown" in df.columns:
         df["max_drawdown"] = (-df["max_drawdown"].astype(float) * 100.0).round(2)
     if "final_wealth" in df.columns:
