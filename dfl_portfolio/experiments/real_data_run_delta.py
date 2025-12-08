@@ -53,6 +53,7 @@ from dfl_portfolio.real_data.reporting import (
     update_experiment_ledger,
     run_extended_analysis,
     summarize_dfl_performance_significance,
+    format_summary_for_output,
 )
 from dfl_portfolio.registry import SolverSpec, get_trainer
 from dfl_portfolio.models.ols import predict_yhat, train_ols
@@ -478,6 +479,7 @@ def main() -> None:
         cov_robust_huber_k=args.cov_robust_huber_k,
         cov_factor_rank=args.cov_factor_rank,
         cov_factor_shrinkage=args.cov_factor_shrinkage,
+        cov_ewma_alpha=getattr(args, "cov_ewma_alpha", 0.94),
         auto_adjust=not args.no_auto_adjust,
         cache_dir=None,
         force_refresh=args.force_refresh,
@@ -740,6 +742,7 @@ def main() -> None:
         if "model" in summary_df.columns:
             summary_df["model"] = summary_df["model"].map(display_model_name)
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
+        summary_df = format_summary_for_output(summary_df)
         summary_df.to_csv(analysis_csv_dir / "summary.csv", index=False)
     else:
         (analysis_csv_dir / "summary.csv").write_text("")

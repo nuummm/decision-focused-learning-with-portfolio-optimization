@@ -50,9 +50,11 @@ from dfl_portfolio.real_data.reporting import (
     plot_weight_histograms,
     plot_weight_paths,
     plot_phi_paths,
+    plot_beta_paths,
     update_experiment_ledger,
     run_extended_analysis,
     summarize_dfl_performance_significance,
+    format_summary_for_output,
 )
 from dfl_portfolio.real_data.covariance import estimate_shrinkage_covariances
 from dfl_portfolio.registry import SolverSpec, get_trainer
@@ -361,12 +363,25 @@ def run_rolling_experiment(
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
+    # real_data_run_V 専用: 共分散の時間減衰率 β（EWMA）
+    parser.add_argument(
+        "--cov-ewma-beta",
+        type=float,
+        default=0.94,
+        help=(
+            "EWMA 共分散の時間減衰率 β (0<β<1)。"
+            "β が小さいほど短期寄り、β が 1 に近いほど長期寄りの共分散となる。"
+            "real_data_run_V のみ有効。"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.cov_method != "diag":
         raise ValueError("real_data_run_V は cov-method=diag のみ対応です。")
     if str(args.flex_solver).lower() != "knitro":
         raise ValueError("real_data_run_V は --flex-solver knitro のみ対応です。")
+    if not (0.0 < float(args.cov_ewma_beta) < 1.0):
+        raise ValueError("--cov-ewma-beta は 0 と 1 の間の値を指定してください。")
 
     tickers = parse_tickers(args.tickers)
     loader_cfg = MarketLoaderConfig(
@@ -400,17 +415,33 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     bundle = build_data_bundle(pipeline_cfg)
     bundle_summary = bundle.summary()
 
-    # V 学習用に、パイプラインと同じ shrinkage を用いた sample 共分散とその対角を構成
-    returns_df = bundle.dataset.returns
+    # V 学習用に、等重みではなく時間減衰率 β を用いた EWMA 共分散 S_t(β) を構成。
+    # Shrinkage φ 自体は DFL モデル内部 (fit_dfl_p1_flex_V) で学習させる。
+    returns_df = bundle.dataset.returns.dropna(how="any")
     cfg = bundle.dataset.config
-    covs_sample, times_sample, _ = estimate_shrinkage_covariances(
-        returns_df,
-        window=cfg.cov_window,
-        method="diag",
-        shrinkage=cfg.cov_shrinkage,
-        eps=cfg.cov_eps,
-    )
-    sample_by_ts = {ts: cov for ts, cov in zip(times_sample, covs_sample)}
+    beta = float(args.cov_ewma_beta)
+
+    values = returns_df.to_numpy(dtype=float)
+    times = list(returns_df.index)
+    d = values.shape[1]
+    window = int(cfg.cov_window)
+    if window < 2:
+        raise ValueError("cov_window は 2 以上を指定してください。")
+
+    sample_by_ts: Dict[pd.Timestamp, np.ndarray] = {}
+    for i in range(len(values)):
+        if i + 1 < window:
+            continue
+        window_vals = values[i - window + 1 : i + 1]
+        # S_t(β) = (1-β) * Σ_{k=0}^{W-1} β^k r_{t-k} r_{t-k}^T
+        S = np.zeros((d, d), dtype=float)
+        # 直近から過去へさかのぼって加重
+        for k in range(window_vals.shape[0]):
+            r = window_vals[-1 - k].reshape(-1, 1)
+            w = (1.0 - beta) * (beta ** k)
+            S += w * (r @ r.T)
+        S = 0.5 * (S + S.T) + cfg.cov_eps * np.eye(d)
+        sample_by_ts[times[i]] = S
 
     V_sample_all: List[np.ndarray] = []
     V_diag_all: List[np.ndarray] = []
@@ -418,11 +449,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ts = bundle.dataset.timestamps[idx]
         cov_sample = sample_by_ts.get(ts)
         if cov_sample is None:
-            raise RuntimeError(f"no sample covariance found for timestamp {ts}")
+            raise RuntimeError(f"no EWMA covariance found for timestamp {ts}")
         V_sample_all.append(cov_sample)
         V_diag_all.append(np.diag(np.diag(cov_sample)))
-
-    cov_stats = bundle.cov_stats
 
     model_specs = parse_commalist(args.models)
     flex_formulations = parse_commalist(args.flex_formulation) if args.flex_formulation else ["dual"]
@@ -502,6 +531,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     rebalance_records: List[Dict[str, object]] = []
     train_window_records: List[Dict[str, object]] = []
     phi_records: List[Dict[str, object]] = []
+    beta_records: List[Dict[str, object]] = []
 
     wealth_dict: Dict[str, pd.DataFrame] = {}
     weight_dict: Dict[str, pd.DataFrame] = {}
@@ -606,6 +636,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                                 "solver_term": row.get("solver_term", ""),
                             }
                         )
+                        # beta は CLI で指定された定数だが、phi と同じ軸で推移を可視化できるよう記録する
+                        beta_records.append(
+                            {
+                                "model": label,
+                                "cycle": int(row.get("cycle", 0)),
+                                "rebalance_idx": int(row.get("rebalance_idx", -1)),
+                                "rebalance_date": row.get("rebalance_date", ""),
+                                "train_start": int(row.get("train_start", -1)),
+                                "train_end": int(row.get("train_end", -1)),
+                                "beta_used": float(args.cov_ewma_beta),
+                                "elapsed_sec": float(row.get("elapsed_sec", 0.0)),
+                                "solver_status": row.get("solver_status", ""),
+                                "solver_term": row.get("solver_term", ""),
+                            }
+                        )
             for row in run_result["period_metrics"]:
                 period_entry = dict(row)
                 period_entry["model"] = display_model_name(label)
@@ -673,6 +718,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if "model" in summary_df.columns:
             summary_df["model"] = summary_df["model"].map(display_model_name)
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
+        summary_df = format_summary_for_output(summary_df)
         summary_df.to_csv(analysis_csv_dir / "summary.csv", index=False)
     else:
         (analysis_csv_dir / "summary.csv").write_text("")
@@ -770,6 +816,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         phi_df = pd.DataFrame(phi_records)
         phi_df.to_csv(analysis_csv_dir / "phi_trajectory.csv", index=False)
         plot_phi_paths(phi_df, analysis_fig_dir / "phi_paths.png")
+    if beta_records:
+        beta_df = pd.DataFrame(beta_records)
+        beta_df.to_csv(analysis_csv_dir / "beta_trajectory.csv", index=False)
+        plot_beta_paths(beta_df, analysis_fig_dir / "beta_paths.png")
     if not summary_df.empty:
         update_experiment_ledger(RESULTS_ROOT, outdir, args, summary_df, analysis_csv_dir, bundle_summary)
 
@@ -793,13 +843,14 @@ python -m dfl_portfolio.experiments.real_data_run_V \
   --return-kind log \
   --frequency weekly \
   --resample-rule W-FRI \
-  --momentum-window 30 \
+  --momentum-window 26 \
   --return-horizon 1 \
-  --cov-window 10 \
+  --cov-window 13 \
   --cov-method diag \
   --cov-shrinkage 0.94 \
+  --cov-ewma-beta 0.94 \
   --cov-eps 1e-6 \
-  --train-window 25 \
+  --train-window 26 \
   --rebal-interval 4 \
   --delta 0.5 \
   --models ols,ipo,flex \

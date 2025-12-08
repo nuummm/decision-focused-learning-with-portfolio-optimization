@@ -138,6 +138,7 @@ def estimate_shrinkage_covariances(
     robust_huber_k: float = 1.5,
     factor_rank: int = 1,
     factor_shrinkage: float = 0.5,
+    ewma_alpha: float | None = None,
 ) -> Tuple[List[np.ndarray], List[pd.Timestamp], List[CovarianceStats]]:
     if window < 2:
         raise ValueError("window は 2 以上を指定してください。")
@@ -156,7 +157,47 @@ def estimate_shrinkage_covariances(
             continue
         sample_cov = np.cov(window_vals, rowvar=False)
         if method == "oas":
-            cov = _oas_cov(window_vals, eps)
+            # OAS × EWMA: 0<α<1 のときだけ EWMA 共分散 S_t^{(α)} に OAS を適用。
+            # α>=1 や α<=0 のときは従来どおり等重み OAS にフォールバックする。
+            if ewma_alpha is not None and 0.0 < float(ewma_alpha) < 1.0:
+                alpha = float(ewma_alpha)
+                w = window_vals.shape[0]
+                d = sample_cov.shape[0]
+                # 中心化
+                centered = window_vals - np.mean(window_vals, axis=0)
+                # EWMA 重み ω_k(α) = (1-α) α^k / (1-α^w), k=0..w-1, k=0 が直近
+                ks = np.arange(w - 1, -1, -1, dtype=float)  # 行 0 が最も古く, w-1 が最新
+                raw = (1.0 - alpha) * (alpha ** ks)
+                denom = 1.0 - alpha ** w
+                omega = raw / denom
+                # 有効サンプルサイズ n_eff
+                n_eff = 1.0 / float(np.sum(omega**2))
+                # 時間重み付き共分散 S_t^{(α)}
+                S = np.zeros((d, d), dtype=float)
+                for i_row in range(w):
+                    r = centered[i_row].reshape(-1, 1)
+                    S += float(omega[i_row]) * (r @ r.T)
+                S = 0.5 * (S + S.T)
+                # OAS shrinkage
+                tr_S = float(np.trace(S))
+                tr_S2 = float(np.sum(S * S))
+                if tr_S2 <= 0.0:
+                    cov = S + eps * np.eye(d)
+                else:
+                    num = (1.0 - 2.0 / d) * tr_S2 + tr_S**2
+                    den = (n_eff + 1.0 - 2.0 / d) * (tr_S2 - tr_S**2 / d)
+                    if den <= 0.0:
+                        delta_oas = 0.0
+                    else:
+                        delta_oas = float(num / den)
+                        delta_oas = float(np.clip(delta_oas, 0.0, 1.0))
+                    F = (tr_S / d) * np.eye(d, dtype=float)
+                    cov = (1.0 - delta_oas) * S + delta_oas * F
+                    cov = 0.5 * (cov + cov.T)
+                    cov += eps * np.eye(d)
+            else:
+                # α が指定されていないか 1 のときは、sklearn.OAS による標準的な OAS 共分散。
+                cov = _oas_cov(window_vals, eps)
         elif method == "robust_lw":
             cov = _robust_ledoit_wolf_cov(window_vals, huber_k=robust_huber_k, eps=eps)
         elif method == "mini_factor":

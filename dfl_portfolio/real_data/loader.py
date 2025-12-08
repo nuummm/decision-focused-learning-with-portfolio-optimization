@@ -37,6 +37,8 @@ class MarketLoaderConfig:
         "robust_lw",
         "mini_factor",
     ] = "diag"
+    # OAS 用の時間減衰率 α（EWMA）。0 の場合は従来の等重み OAS を使用。
+    cov_ewma_alpha: float = 0.94
     cov_shrinkage: float = 0.94
     cov_eps: float = 1e-6
     cov_robust_huber_k: float = 1.5
@@ -212,6 +214,7 @@ def load_market_dataset(config: MarketLoaderConfig) -> MarketDataset:
         robust_huber_k=config.cov_robust_huber_k,
         factor_rank=config.cov_factor_rank,
         factor_shrinkage=config.cov_factor_shrinkage,
+        ewma_alpha=config.cov_ewma_alpha if config.cov_ewma_alpha > 0.0 else None,
     )
 
     if config.debug:

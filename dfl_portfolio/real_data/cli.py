@@ -85,6 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="diag",
         choices=["diag", "oas", "robust_lw", "mini_factor"],
     )
+    parser.add_argument(
+        "--cov-ewma-alpha",
+        type=float,
+        default=0.94,
+        help=(
+            "EWMA の時間減衰率 α (0<α<1)。cov-method=oas のときにのみ使用され、"
+            "時間重み付き共分散 S_t^{(α)} に対して OAS shrinkage を適用する。"
+        ),
+    )
     parser.add_argument("--cov-shrinkage", type=float, default=0.94)
     parser.add_argument("--cov-eps", type=float, default=1e-6)
     parser.add_argument("--cov-robust-huber-k", type=float, default=1.5)

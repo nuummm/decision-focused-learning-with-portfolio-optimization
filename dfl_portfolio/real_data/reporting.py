@@ -34,10 +34,23 @@ WEIGHT_PLOT_MAX_POINTS = 60
 
 # 表示用のモデル名マッピング
 _MODEL_DISPLAY_MAP = {
+    "flex": "DFL-QCQP",
     "flex_dual": "DFL-QCQP-dual",
     "flex_kkt": "DFL-QCQP-kkt",
     "flex_dual_kkt_ens": "DFL-QCQP-ens",
     "benchmark_equal_weight": "1/N",
+}
+
+# 一貫した色指定（内部名ベース）
+MODEL_COLOR_MAP: Dict[str, str] = {
+    "ols": "tab:blue",
+    "ipo": "tab:orange",
+    "flex": "tab:green",
+    "flex_dual": "tab:green",
+    "flex_kkt": "tab:red",
+    "flex_dual_kkt_ens": "black",
+    "benchmark_SPY": "tab:purple",
+    "benchmark_equal_weight": "grey",
 }
 
 
@@ -218,6 +231,7 @@ def max_drawdown(wealth_series: Sequence[float]) -> float:
         return np.nan
     running_max = np.maximum.accumulate(arr)
     dd = 1.0 - arr / running_max
+    # 内部では正の割合（例: 0.25）を返す。CSV 出力時に -25.00 のように符号・%変換する。
     return float(np.nanmax(dd))
 
 
@@ -251,6 +265,27 @@ def compute_period_metrics(step_df: pd.DataFrame) -> List[Dict[str, object]]:
             }
         )
     return results
+
+
+def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """summary.csv 用にメトリクスを人間が読みやすい形に整形する。
+
+    - mean_return, std_return, sharpe, sortino, max_drawdown を年率[%]として扱い、
+      100 倍して小数第 2 位までに丸める。
+    - max_drawdown は「下落率」を表現するために負の値に変換（例: 0.25 → -25.00）。
+    - final_wealth も小数第 2 位までに丸める。
+    """
+    if summary_df.empty:
+        return summary_df
+    df = summary_df.copy()
+    for col in ["mean_return", "std_return", "sharpe", "sortino"]:
+        if col in df.columns:
+            df[col] = (df[col].astype(float) * 100.0).round(2)
+    if "max_drawdown" in df.columns:
+        df["max_drawdown"] = (-df["max_drawdown"].astype(float) * 100.0).round(2)
+    if "final_wealth" in df.columns:
+        df["final_wealth"] = df["final_wealth"].astype(float).round(2)
+    return df
 
 
 def plot_delta_paths(delta_df: pd.DataFrame, path: Path) -> None:
@@ -336,21 +371,52 @@ def plot_phi_paths(phi_df: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
+def plot_beta_paths(beta_df: pd.DataFrame, path: Path) -> None:
+    """Plot EWMA decay parameter beta trajectories per model over time."""
+    if plt is None or beta_df.empty:
+        return
+    if "beta_used" not in beta_df.columns:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4))
+    use_date_axis = "rebalance_date" in beta_df.columns
+    for model, sub in beta_df.groupby("model"):
+        sub_sorted = sub.sort_values("cycle") if "cycle" in sub.columns else sub.copy()
+        if use_date_axis:
+            x = pd.to_datetime(sub_sorted["rebalance_date"])
+        else:
+            if "cycle" not in sub_sorted.columns:
+                continue
+            x = sub_sorted["cycle"]
+        ax.plot(x, sub_sorted["beta_used"], label=model)
+
+    if use_date_axis:
+        for name, start, end in PERIOD_WINDOWS:
+            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15, label=name)
+
+    ax.set_xlabel("date" if use_date_axis else "cycle")
+    ax.set_ylabel("beta")
+    ax.set_title("EWMA beta trajectories per model")
+    ax.set_ylim(0.0, 1.0)
+    handles, labels = ax.get_legend_handles_labels()
+    seen = set()
+    uniq_h, uniq_l = [], []
+    for h, l in zip(handles, labels):
+        if l not in seen:
+            uniq_h.append(h)
+            uniq_l.append(l)
+            seen.add(l)
+    ax.legend(uniq_h, uniq_l, loc="best")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
 def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
     if plt is None:
         return
     plt.figure(figsize=(10, 4))
-    color_map = {
-        "ols": "blue",
-        "ipo": "orange",
-        "flex_dual": "green",
-        "flex_kkt": "red",
-        "flex_dual_kkt_ens": "black",
-        "benchmark_SPY": "purple",
-        "benchmark_equal_weight": "grey",
-    }
     for model, df in wealth_dict.items():
-        color = color_map.get(model, None)
+        color = MODEL_COLOR_MAP.get(model, None)
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
         if color is not None:
@@ -373,17 +439,8 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
     if plt is None:
         return
     plt.figure(figsize=(10, 4))
-    color_map = {
-        "ols": "blue",
-        "ipo": "orange",
-        "flex_dual": "green",
-        "flex_kkt": "red",
-        "flex_dual_kkt_ens": "black",
-        "benchmark_SPY": "purple",
-        "benchmark_equal_weight": "grey",
-    }
     for model, df in wealth_dict.items():
-        color = color_map.get(model, None)
+        color = MODEL_COLOR_MAP.get(model, None)
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
         if color is not None:
@@ -1127,7 +1184,8 @@ def run_mse_and_bias_analysis(
 
     if sns is not None and plt is not None:
         plt.figure(figsize=(8, 5))
-        sns.boxplot(data=df, x="updown", y="bias", hue="model")
+        palette = {m: MODEL_COLOR_MAP.get(m, None) for m in df["model"].unique()}
+        sns.boxplot(data=df, x="updown", y="bias", hue="model", palette=palette)
         plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
         plt.ylabel("Bias = pred_ret - real_ret")
         plt.title("Prediction bias by Up/Down group")
@@ -1150,7 +1208,8 @@ def run_mse_and_bias_analysis(
 
     if sns is not None and plt is not None:
         plt.figure(figsize=(8, 5))
-        sns.boxplot(data=df, x="inout", y="bias", hue="model")
+        palette = {m: MODEL_COLOR_MAP.get(m, None) for m in df["model"].unique()}
+        sns.boxplot(data=df, x="inout", y="bias", hue="model", palette=palette)
         plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
         plt.ylabel("Bias = pred_ret - real_ret")
         plt.title("Prediction bias for IN/OUT assets")

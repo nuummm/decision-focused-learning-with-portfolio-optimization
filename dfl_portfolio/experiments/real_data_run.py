@@ -52,6 +52,7 @@ from dfl_portfolio.real_data.reporting import (
     update_experiment_ledger,
     run_extended_analysis,
     summarize_dfl_performance_significance,
+    format_summary_for_output,
 )
 from dfl_portfolio.registry import SolverSpec, get_trainer
 from dfl_portfolio.models.ols import predict_yhat, train_ols
@@ -432,6 +433,7 @@ def main() -> None:
         cov_robust_huber_k=args.cov_robust_huber_k,
         cov_factor_rank=args.cov_factor_rank,
         cov_factor_shrinkage=args.cov_factor_shrinkage,
+        cov_ewma_alpha=getattr(args, "cov_ewma_alpha", 0.94),
         auto_adjust=not args.no_auto_adjust,
         cache_dir=None,
         force_refresh=args.force_refresh,
@@ -653,6 +655,7 @@ def main() -> None:
     summary_df = pd.DataFrame(stats_results)
     if not summary_df.empty:
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
+        summary_df = format_summary_for_output(summary_df)
         summary_df.to_csv(analysis_csv_dir / "summary.csv", index=False)
     else:
         (analysis_csv_dir / "summary.csv").write_text("")
@@ -766,7 +769,7 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.real_data_run \
   --tickers "SPY,GLD,EEM,TLT" \
-  --start 2008-01-01 --end 2025-12-01 \
+  --start 2006-01-01 --end 2025-12-01 \
   --frequency weekly \
   --resample-rule W-FRI \
   --momentum-window 30 \
@@ -782,7 +785,33 @@ python -m dfl_portfolio.experiments.real_data_run \
   --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-ensemble-weight-dual 0.5 \
   --flex-lambda-theta-anchor 0.0 \
-  --flex-theta-anchor-mode ols \
+  --flex-theta-anchor-mode ipo \
+  --flex-theta-init-mode none \
+  --benchmark-ticker SPY \
+  --benchmark-equal-weight \
+  --debug-roll
+
+cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
+
+python -m dfl_portfolio.experiments.real_data_run \
+  --tickers "SPY,GLD,EEM,TLT" \
+  --start 2006-01-01 --end 2025-12-01 \
+  --frequency weekly \
+  --resample-rule W-FRI \
+  --momentum-window 26 \
+  --return-horizon 1 \
+  --cov-window 13 \
+  --cov-method oas \
+  --cov-ewma-alpha 0.94 \
+  --train-window 26 \
+  --rebal-interval 4 \
+  --delta 0.5 \
+  --models ols,ipo,flex \
+  --flex-solver knitro \
+  --flex-formulation 'dual' \
+  --flex-ensemble-weight-dual 0.5 \
+  --flex-lambda-theta-anchor 0.0 \
+  --flex-theta-anchor-mode ipo \
   --flex-theta-init-mode none \
   --benchmark-ticker SPY \
   --benchmark-equal-weight \
@@ -813,6 +842,7 @@ Yahoo Finance から価格を取るときの元データの足。1d なら日足
 --cov-robust-huber-k (float, default 1.5)
 --cov-factor-rank (int, default 1)
 --cov-factor-shrinkage (float, default 0.5)
+--cov-ewma-alpha (float, default 0.94)
 ローリング設定
 
 --train-window (int, default 25)
