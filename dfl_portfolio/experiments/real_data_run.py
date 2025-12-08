@@ -170,11 +170,13 @@ def run_rolling_experiment(
         if debug_roll:
             progress = (cycle_id + 1) / max(total_cycles, 1)
             bar = "#" * int(progress * 20)
-            print(
-                f"[roll-debug] model={model_label} cycle={cycle_id+1}/{total_cycles} "
-                f"idx={item.rebalance_idx} train=[{item.train_start},{item.train_end}] "
-                f"n_eval={len(item.eval_indices)} [{bar:<20}] {progress:.0%}"
-            )
+            # ログは負荷軽減のため 20 サイクルごと＋最初／最後のみ出力する
+            if (cycle_id + 1) % 20 == 0 or cycle_id == 0 or (cycle_id + 1) == total_cycles:
+                print(
+                    f"[roll-debug] model={model_label} cycle={cycle_id+1}/{total_cycles} "
+                    f"idx={item.rebalance_idx} train=[{item.train_start},{item.train_end}] "
+                    f"n_eval={len(item.eval_indices)} [{bar:<20}] {progress:.0%}"
+                )
 
         rebalance_rows.append(
             {
@@ -464,7 +466,7 @@ def main() -> None:
     config_records = []
     for key, value in sorted(vars(args).items()):
         config_records.append({"parameter": key, "value": value})
-    pd.DataFrame(config_records).to_csv(analysis_csv_dir / "experiment_config.csv", index=False)
+    pd.DataFrame(config_records).to_csv(analysis_csv_dir / "2-experiment_config.csv", index=False)
 
     start_ts = pd.Timestamp(loader_cfg.start)
     plot_time_series(
@@ -656,9 +658,9 @@ def main() -> None:
     if not summary_df.empty:
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
         summary_df = format_summary_for_output(summary_df)
-        summary_df.to_csv(analysis_csv_dir / "summary.csv", index=False)
+        summary_df.to_csv(analysis_csv_dir / "1-summary.csv", index=False)
     else:
-        (analysis_csv_dir / "summary.csv").write_text("")
+        (analysis_csv_dir / "1-summary.csv").write_text("")
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)
@@ -707,6 +709,8 @@ def main() -> None:
         plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")
         # 主要イベント期間ごとの weights_comparison も追加
         for name, start, end in [
+            # リーマンショック〜世界金融危機
+            ("lehman_2008", "2007-07-01", "2009-06-30"),
             ("covid_2020", "2020-02-01", "2020-12-31"),
             ("inflation_2022", "2022-01-01", "2023-12-31"),
         ]:
@@ -765,31 +769,6 @@ if __name__ == "__main__":  # pragma: no cover
     main()
 
 """
-cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
-
-python -m dfl_portfolio.experiments.real_data_run \
-  --tickers "SPY,GLD,EEM,TLT" \
-  --start 2006-01-01 --end 2025-12-01 \
-  --frequency weekly \
-  --resample-rule W-FRI \
-  --momentum-window 30 \
-  --return-horizon 1 \
-  --cov-window 10 \
-  --cov-method diag \
-  --cov-shrinkage 0.94 \
-  --train-window 25 \
-  --rebal-interval 4 \
-  --delta 0.5 \
-  --models ols,ipo,flex \
-  --flex-solver knitro \
-  --flex-formulation 'dual,kkt,dual&kkt' \
-  --flex-ensemble-weight-dual 0.5 \
-  --flex-lambda-theta-anchor 0.0 \
-  --flex-theta-anchor-mode ipo \
-  --flex-theta-init-mode none \
-  --benchmark-ticker SPY \
-  --benchmark-equal-weight \
-  --debug-roll
 
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
@@ -802,13 +781,13 @@ python -m dfl_portfolio.experiments.real_data_run \
   --return-horizon 1 \
   --cov-window 13 \
   --cov-method oas \
-  --cov-ewma-alpha 0.94 \
+  --cov-ewma-alpha 0.97 \
   --train-window 26 \
   --rebal-interval 4 \
   --delta 0.5 \
   --models ols,ipo,flex \
   --flex-solver knitro \
-  --flex-formulation 'dual' \
+  --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-ensemble-weight-dual 0.5 \
   --flex-lambda-theta-anchor 0.0 \
   --flex-theta-anchor-mode ipo \

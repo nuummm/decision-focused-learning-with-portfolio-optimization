@@ -76,19 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["daily", "weekly", "monthly"],
     )
     parser.add_argument("--resample-rule", type=str, default="W-FRI")
-    parser.add_argument("--momentum-window", type=int, default=30)
+    parser.add_argument("--momentum-window", type=int, default=26)
     parser.add_argument("--return-horizon", type=int, default=1)
-    parser.add_argument("--cov-window", type=int, default=10)
+    parser.add_argument("--cov-window", type=int, default=13)
     parser.add_argument(
         "--cov-method",
         type=str,
-        default="diag",
+        default="oas",
         choices=["diag", "oas", "robust_lw", "mini_factor"],
     )
     parser.add_argument(
         "--cov-ewma-alpha",
         type=float,
-        default=0.94,
+        default=0.97,
         help=(
             "EWMA の時間減衰率 α (0<α<1)。cov-method=oas のときにのみ使用され、"
             "時間重み付き共分散 S_t^{(α)} に対して OAS shrinkage を適用する。"
@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-auto-adjust", action="store_true")
     parser.add_argument("--force-refresh", action="store_true")
 
-    parser.add_argument("--train-window", type=int, default=25)
+    parser.add_argument("--train-window", type=int, default=26)
     parser.add_argument("--rebal-interval", type=int, default=4)
     parser.add_argument(
         "--model-train-window",
@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0)
     parser.add_argument("--flex-lambda-theta-iso", type=float, default=0.0)
-    parser.add_argument("--flex-theta-anchor-mode", type=str, default="ols")
+    parser.add_argument("--flex-theta-anchor-mode", type=str, default="ipo")
     parser.add_argument("--flex-theta-init-mode", type=str, default="none")
     parser.add_argument(
         "--flex-ensemble-weight-dual",

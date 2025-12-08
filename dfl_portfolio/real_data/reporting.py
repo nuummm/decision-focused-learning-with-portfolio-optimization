@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
 from dfl_portfolio.registry import KNITRO_DEFAULTS, GUROBI_DEFAULTS
 
 PERIOD_WINDOWS = [
-    ("gfc_2008", "2007-01-01", "2009-12-31"),
+    ("lehman_2008", "2007-01-01", "2009-12-31"),
     ("covid_2020", "2020-02-01", "2020-12-31"),
     ("inflation_2022", "2022-01-01", "2023-12-31"),
 ]
@@ -57,10 +57,10 @@ MODEL_COLOR_MAP: Dict[str, str] = {
 def display_model_name(model: str) -> str:
     """集計・可視化用にモデル名を整形する."""
     name = str(model)
-    # ベンチマークティッカー系: benchmark_SPY → [SPY]
+    # ベンチマークティッカー系: benchmark_SPY → Buy&Hold SPY
     if name.startswith("benchmark_") and name != "benchmark_equal_weight":
         ticker = name[len("benchmark_") :]
-        return f"[{ticker}]"
+        return f"Buy&Hold {ticker}"
     return _MODEL_DISPLAY_MAP.get(name, name)
 
 
@@ -153,7 +153,7 @@ def plot_weight_comparison(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
         ax.set_ylabel(model)
         ax.legend(loc="upper right")
     axes[-1].set_xlabel("date")
-    fig.suptitle("Weight allocation (stacked) per model")
+    fig.suptitle("Weight allocation (stacked) per model (last points)")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -164,6 +164,7 @@ def export_weight_variance_correlation(
     csv_path: Path,
     fig_path: Path,
 ) -> None:
+    """残してはおくが、現在は CSV のみ出力し図は作らない（fig_path は未使用）。"""
     rows: List[Dict[str, object]] = []
     for model, df in weight_dict.items():
         if "portfolio_return_sq" not in df.columns:
@@ -186,23 +187,6 @@ def export_weight_variance_correlation(
     if rows:
         df = pd.DataFrame(rows)
         df.to_csv(csv_path, index=False)
-        if plt is not None:
-            pivot = df.pivot(index="model", columns="ticker", values="corr_weight_vs_return_var")
-            fig, ax = plt.subplots(figsize=(6, 4))
-            data = pivot.to_numpy()
-            cax = ax.imshow(data, cmap="coolwarm", vmin=-1, vmax=1)
-            ax.set_xticks(range(len(pivot.columns)))
-            ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
-            ax.set_yticks(range(len(pivot.index)))
-            ax.set_yticklabels(pivot.index)
-            ax.set_title("Weight vs variance correlation")
-            for i in range(data.shape[0]):
-                for j in range(data.shape[1]):
-                    ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
-            fig.colorbar(cax)
-            fig.tight_layout()
-            fig.savefig(fig_path)
-            plt.close(fig)
 
 
 def plot_wealth_correlation_heatmap(corr_df: pd.DataFrame, path: Path) -> None:
@@ -437,7 +421,10 @@ def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
     plt.title("Wealth comparison")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(path)
+    fig_path = path
+    if path.name == "wealth_comparison.png":
+        fig_path = path.with_name("1-wealth_comparison.png")
+    plt.savefig(fig_path)
     plt.close()
 
 
@@ -471,7 +458,10 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
             seen.add(l)
     plt.legend(unique_handles, unique_labels, loc="best")
     plt.tight_layout()
-    plt.savefig(path)
+    fig_path = path
+    if path.name == "wealth_events.png":
+        fig_path = path.with_name("2-wealth_events.png")
+    plt.savefig(fig_path)
     plt.close()
 
 
@@ -510,7 +500,10 @@ def export_weight_threshold_frequency(
     csv_path: Path,
     fig_path: Path,
 ) -> None:
-    """Export frequency with which weights exceed a given threshold, plus heatmap."""
+    """Export frequency with which weights exceed a given threshold.
+
+    現在は CSV のみを出力し、図は生成しない（fig_path は未使用）。
+    """
     rows: List[Dict[str, object]] = []
     for model, df in weight_dict.items():
         values, cols = reduce_weight_columns(df)
@@ -523,53 +516,65 @@ def export_weight_threshold_frequency(
         return
     freq_df = pd.DataFrame(rows)
     freq_df.to_csv(csv_path, index=False)
-    if plt is None:
-        return
-    pivot = freq_df.pivot(index="model", columns="ticker", values="freq_ge_thresh").fillna(0.0)
-    fig, ax = plt.subplots(figsize=(5, 4))
-    data = pivot.to_numpy()
-    cax = ax.imshow(data, cmap="Blues", vmin=0, vmax=1)
-    ax.set_xticks(range(len(pivot.columns)))
-    ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
-    ax.set_yticks(range(len(pivot.index)))
-    ax.set_yticklabels(pivot.index)
-    ax.set_title(f"Freq(weight >= {threshold:.2f})")
-    for i in range(data.shape[0]):
-        for j in range(data.shape[1]):
-            ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
-    fig.colorbar(cax)
-    fig.tight_layout()
-    fig.savefig(fig_path)
-    plt.close(fig)
 
 
 def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path, fig_path: Path) -> None:
     rows: List[Dict[str, object]] = []
     for model, df in weight_dict.items():
         values, cols = reduce_weight_columns(df)
+        if values.empty:
+            continue
         mean_vals = values.mean(skipna=True)
+        # 資産ごとの「w >= WEIGHT_THRESHOLD」の頻度
+        freq_vals = (values >= WEIGHT_THRESHOLD).mean(axis=0)
         for ticker in cols:
-            rows.append({"model": model, "ticker": ticker, "avg_weight": float(mean_vals[ticker])})
+            rows.append(
+                {
+                    "model": model,
+                    "ticker": ticker,
+                    "avg_weight": float(mean_vals[ticker]),
+                    "freq_ge_thresh": float(freq_vals[ticker]),
+                }
+            )
     if not rows:
         return
     avg_df = pd.DataFrame(rows)
     avg_df.to_csv(csv_path, index=False)
     if plt is None:
         return
-    pivot = avg_df.pivot(index="model", columns="ticker", values="avg_weight")
-    pivot = pivot.fillna(0.0)
-    ind = np.arange(len(pivot.index))
-    width = 0.8 / max(len(pivot.columns), 1)
-    plt.figure(figsize=(8, 4))
-    for i, ticker in enumerate(pivot.columns):
-        plt.bar(ind + i * width, pivot[ticker], width=width, label=ticker)
-    plt.xticks(ind + width * (len(pivot.columns) - 1) / 2, pivot.index)
-    plt.ylabel("average weight")
-    plt.title("Average allocation per model")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(fig_path)
-    plt.close()
+    # 1枚の図に avg と「w>=threshold の頻度」を並べる
+    pivot_avg = avg_df.pivot(index="model", columns="ticker", values="avg_weight").fillna(0.0)
+    pivot_freq = avg_df.pivot(index="model", columns="ticker", values="freq_ge_thresh").fillna(0.0)
+    models = list(pivot_avg.index)
+    tickers = list(pivot_avg.columns)
+    x = np.arange(len(models))
+    width = 0.8 / max(len(tickers), 1)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+    # 平均ウェイト
+    ax = axes[0]
+    for i, ticker in enumerate(tickers):
+        ax.bar(x + i * width, pivot_avg[ticker], width=width, label=ticker)
+    ax.set_title("Average weight per asset")
+    ax.set_ylabel("average weight")
+
+    # 95%以上採用頻度
+    ax = axes[1]
+    for i, ticker in enumerate(tickers):
+        ax.bar(x + i * width, pivot_freq[ticker], width=width, label=ticker)
+    ax.set_title(f"Freq(weight ≥ {WEIGHT_THRESHOLD:.2f}) per asset")
+    ax.set_ylabel("frequency")
+
+    for ax in axes:
+        ax.set_xticks(x + width * (len(tickers) - 1) / 2)
+        ax.set_xticklabels(models, rotation=45, ha="right")
+
+    handles, labels = axes[1].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper right")
+    fig.tight_layout(rect=[0, 0, 0.95, 1.0])
+    fig.savefig(fig_path)
+    plt.close(fig)
 
 
 def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
@@ -599,6 +604,7 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
                 ax.set_visible(False)
                 continue
             ax.hist(data, bins=bins, range=(0.0, 1.0), color="tab:blue", alpha=0.7)
+            ax.set_yscale("log")
             ax.set_xlim(0.0, 1.0)
             if r == n_rows - 1:
                 ax.set_xlabel(ticker)
@@ -930,7 +936,7 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
     """提案手法（DFL-QCQP 系）が他モデルと比べて有意かどうかの概要 CSV を作成する。
 
     入力: performance_significance.csv
-    出力: performance_significance_dfl_summary.csv
+    出力: 3-performance_significance_dfl_summary.csv
     """
     perf_path = Path(analysis_csv_dir) / "performance_significance.csv"
     if not perf_path.exists():
@@ -947,9 +953,10 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
     if not dfl_models:
         return
 
-    rows_out: list[dict[str, object]] = []
+    # 比較対象とする指標
     metrics = ["mean", "std", "sharpe", "sortino", "final_wealth"]
 
+    rows_out: list[dict[str, object]] = []
     for dfl in dfl_models:
         for other in sorted(m for m in all_models if m != dfl):
             mask_ab = (df["model_a"] == dfl) & (df["model_b"] == other)
@@ -989,8 +996,15 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
 
     if rows_out:
         out_df = pd.DataFrame(rows_out)
+        # 出力は True/False の有意フラグのみ（値や p 値は不要）
+        keep_cols: list[str] = ["model_dfl", "model_other", "n_obs"]
+        for k in metrics:
+            keep_cols.append(f"{k}_sig_5pct")
+            keep_cols.append(f"{k}_sig_1pct")
+        keep_cols = [c for c in keep_cols if c in out_df.columns]
+        out_df = out_df[keep_cols]
         out_df.to_csv(
-            Path(analysis_csv_dir) / "performance_significance_dfl_summary.csv",
+            Path(analysis_csv_dir) / "3-performance_significance_dfl_summary.csv",
             index=False,
         )
 
@@ -1136,8 +1150,8 @@ def run_mse_and_bias_analysis(
     df["err2"] = (df["pred_ret"] - df["real_ret"]) ** 2
     mse_df = df.groupby("model")["err2"].mean().to_frame("mse")
 
-    # Sharpe from summary.csv
-    summary_path = Path(analysis_csv_dir) / "summary.csv"
+    # Sharpe from 1-summary.csv
+    summary_path = Path(analysis_csv_dir) / "1-summary.csv"
     if not summary_path.exists():
         return
     summary = pd.read_csv(summary_path)
@@ -1156,7 +1170,10 @@ def run_mse_and_bias_analysis(
     for model, row in plot_df.iterrows():
         # ベンチマーク系は散布図から除外（SPY, 1/N）
         mstr = str(model)
-        if ("SPY" in mstr and "benchmark" in mstr) or mstr in {"1/N", "[SPY]", "benchmark_SPY"}:
+        if (
+            ("SPY" in mstr and "benchmark" in mstr)
+            or mstr in {"1/N", "[SPY]", "benchmark_SPY", "Buy&Hold SPY"}
+        ):
             continue
         x = row.get("mse", np.nan)
         if not np.isfinite(x):
@@ -1188,17 +1205,38 @@ def run_mse_and_bias_analysis(
     )
     updown_stats.to_csv(analysis_csv_dir / "updown_bias_stats.csv")
 
-    if sns is not None and plt is not None:
-        plt.figure(figsize=(8, 5))
-        palette = {m: MODEL_COLOR_MAP.get(m, None) for m in df["model"].unique()}
-        sns.boxplot(data=df, x="updown", y="bias", hue="model", palette=palette)
-        plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
-        plt.ylabel("Bias = pred_ret - real_ret")
-        plt.title("Prediction bias by Up/Down group")
-        plt.yscale("symlog", linthresh=1e-2)
-        plt.tight_layout()
-        plt.savefig(analysis_fig_dir / "updown_bias_boxplot.png")
-        plt.close()
+    if plt is not None:
+        try:
+            plt.figure(figsize=(8, 5))
+            # Up/Down をモデル横断で 2 つの箱ひげに集約。
+            down_bias = df[df["updown"] == "Down"]["bias"].to_numpy()
+            up_bias = df[df["updown"] == "Up"]["bias"].to_numpy()
+            data: List[np.ndarray] = []
+            labels: List[str] = []
+            colors = []
+            if down_bias.size:
+                data.append(down_bias)
+                labels.append("Down")
+                colors.append("red")
+            if up_bias.size:
+                data.append(up_bias)
+                labels.append("Up")
+                colors.append("green")
+            if data:
+                box = plt.boxplot(data, labels=labels, patch_artist=True)
+                for patch, c in zip(box["boxes"], colors):
+                    patch.set_facecolor(c)
+                    patch.set_alpha(0.6)
+            plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
+            plt.ylabel("Bias = pred_ret - real_ret")
+            plt.title("Prediction bias by Up/Down group")
+            plt.yscale("symlog", linthresh=1e-2)
+            plt.tight_layout()
+            plt.savefig(analysis_fig_dir / "updown_bias_boxplot.png")
+        except Exception as exc:  # pragma: no cover - 図生成失敗時も後続解析は続行
+            print(f"[analysis] updown bias boxplot failed: {exc}")
+        finally:
+            plt.close()
 
     # IN / OUT (weight threshold)
     TAU = 0.05
@@ -1212,17 +1250,38 @@ def run_mse_and_bias_analysis(
     )
     inout_stats.to_csv(analysis_csv_dir / "inout_bias_stats.csv")
 
-    if sns is not None and plt is not None:
-        plt.figure(figsize=(8, 5))
-        palette = {m: MODEL_COLOR_MAP.get(m, None) for m in df["model"].unique()}
-        sns.boxplot(data=df, x="inout", y="bias", hue="model", palette=palette)
-        plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
-        plt.ylabel("Bias = pred_ret - real_ret")
-        plt.title("Prediction bias for IN/OUT assets")
-        plt.yscale("symlog", linthresh=1e-2)
-        plt.tight_layout()
-        plt.savefig(analysis_fig_dir / "inout_bias_boxplot.png")
-        plt.close()
+    if plt is not None:
+        try:
+            plt.figure(figsize=(8, 5))
+            # IN/OUT もモデル横断で 2 つの箱ひげに集約。
+            out_bias = df[df["inout"] == "OUT"]["bias"].to_numpy()
+            in_bias = df[df["inout"] == "IN"]["bias"].to_numpy()
+            data: List[np.ndarray] = []
+            labels: List[str] = []
+            colors = []
+            if out_bias.size:
+                data.append(out_bias)
+                labels.append("OUT")
+                colors.append("red")
+            if in_bias.size:
+                data.append(in_bias)
+                labels.append("IN")
+                colors.append("green")
+            if data:
+                box = plt.boxplot(data, labels=labels, patch_artist=True)
+                for patch, c in zip(box["boxes"], colors):
+                    patch.set_facecolor(c)
+                    patch.set_alpha(0.6)
+            plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
+            plt.ylabel("Bias = pred_ret - real_ret")
+            plt.title("Prediction bias for IN/OUT assets")
+            plt.yscale("symlog", linthresh=1e-2)
+            plt.tight_layout()
+            plt.savefig(analysis_fig_dir / "inout_bias_boxplot.png")
+        except Exception as exc:  # pragma: no cover
+            print(f"[analysis] inout bias boxplot failed: {exc}")
+        finally:
+            plt.close()
 
     # ---- flex 系モデルに対するヒストグラム（Up/Down, IN/OUT） ----
     flex_models = [m for m in df["model"].unique() if "DFL-QCQP" in str(m)]
@@ -1235,11 +1294,12 @@ def run_mse_and_bias_analysis(
         bias_q99 = float(df["bias"].quantile(0.99))
         if not np.isfinite(bias_q01) or not np.isfinite(bias_q99) or bias_q01 == bias_q99:
             bias_q01, bias_q99 = -0.1, 0.1
-        bins = np.linspace(bias_q01, bias_q99, 40)
+        # 分布形状をなめらかに見るため、ビン数はやや多めに設定
+        bins = np.linspace(bias_q01, bias_q99, 80)
 
         # Up/Down ヒストグラム
         n = len(flex_models)
-        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharex=True, sharey=True)
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.5), sharex=True, sharey=True)
         if n == 1:
             axes = [axes]
         for ax, model in zip(axes, flex_models):
@@ -1269,17 +1329,18 @@ def run_mse_and_bias_analysis(
             ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
             ax.set_title(model)
             ax.set_xlim(bias_q01, bias_q99)
-        axes[0].set_ylabel("Density")
-        fig.suptitle("Prediction bias (Up vs Down) for DFL-QCQP models")
-        handles, labels = axes[-1].get_legend_handles_labels()
+            ax.set_yscale("log")
+        axes[0].set_ylabel("Density (log scale)")
+        # 凡例は最初の軸にまとめて表示
+        handles, labels = axes[0].get_legend_handles_labels()
         if handles:
-            fig.legend(handles, labels, loc="upper right")
-        fig.tight_layout(rect=[0, 0, 0.95, 0.9])
+            axes[0].legend(handles, labels, loc="upper right")
+        fig.tight_layout()
         fig.savefig(analysis_fig_dir / "updown_bias_hist_flex.png")
         plt.close(fig)
 
         # IN/OUT ヒストグラム
-        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3), sharex=True, sharey=True)
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.5), sharex=True, sharey=True)
         if n == 1:
             axes = [axes]
         for ax, model in zip(axes, flex_models):
@@ -1309,12 +1370,12 @@ def run_mse_and_bias_analysis(
             ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
             ax.set_title(model)
             ax.set_xlim(bias_q01, bias_q99)
-        axes[0].set_ylabel("Density")
-        fig.suptitle("Prediction bias (IN vs OUT) for DFL-QCQP models")
-        handles, labels = axes[-1].get_legend_handles_labels()
+            ax.set_yscale("log")
+        axes[0].set_ylabel("Density (log scale)")
+        handles, labels = axes[0].get_legend_handles_labels()
         if handles:
-            fig.legend(handles, labels, loc="upper right")
-        fig.tight_layout(rect=[0, 0, 0.95, 0.9])
+            axes[0].legend(handles, labels, loc="upper right")
+        fig.tight_layout()
         fig.savefig(analysis_fig_dir / "inout_bias_hist_flex.png")
         plt.close(fig)
 
@@ -1331,32 +1392,8 @@ def run_mse_and_bias_analysis(
         .reset_index()
         .sort_values("date")
     )
+    # 将来の解析用に CSV は残すが、図は生成しない
     tb.to_csv(analysis_csv_dir / "topbottom_bias_timeseries.csv", index=False)
-
-    if plt is not None and not tb.empty:
-        plt.figure(figsize=(10, 5))
-        # 提案手法（DFL-QCQP 系）のうち 1 モデルだけ可視化（優先的に dual）
-        candidates = [m for m in tb["model"].unique() if "DFL-QCQP" in str(m)]
-        if "DFL-QCQP-dual" in candidates:
-            target_model = "DFL-QCQP-dual"
-        elif candidates:
-            target_model = sorted(candidates)[0]
-        else:
-            # DFL-QCQP が無い場合は、先頭のモデルだけを対象にする
-            target_model = str(tb["model"].iloc[0])
-
-        sub = tb[tb["model"] == target_model]
-        plt.plot(sub["date"], sub["top_bias"], label=f"{target_model} Top", linestyle="-")
-        plt.plot(sub["date"], sub["bottom_bias"], label=f"{target_model} Bottom", linestyle="--")
-        plt.axhline(0.0, linestyle=":", linewidth=1, color="black")
-        plt.ylabel("Bias = pred_ret - real_ret")
-        plt.xlabel("date")
-        plt.title("Bias of top/bottom-weighted assets over time")
-        plt.yscale("symlog", linthresh=1e-2)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(analysis_fig_dir / "topbottom_bias_timeseries.png")
-        plt.close()
 
 
 def run_extended_analysis(
@@ -1447,7 +1484,7 @@ def update_experiment_ledger(
             corr_summary_json = corr_summary_series.to_json()
         except Exception:
             corr_summary_json = ""
-    summary_path = analysis_csv_dir / "summary.csv"
+    summary_path = analysis_csv_dir / "1-summary.csv"
     period_path = analysis_csv_dir / "period_metrics.csv"
     wealth_csv_path = analysis_csv_dir / "wealth_comparison.csv"
     rebalance_csv_path = analysis_csv_dir / "rebalance_summary.csv"

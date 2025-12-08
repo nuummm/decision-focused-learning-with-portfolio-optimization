@@ -743,9 +743,9 @@ def main() -> None:
             summary_df["model"] = summary_df["model"].map(display_model_name)
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
         summary_df = format_summary_for_output(summary_df)
-        summary_df.to_csv(analysis_csv_dir / "summary.csv", index=False)
+        summary_df.to_csv(analysis_csv_dir / "1-summary.csv", index=False)
     else:
-        (analysis_csv_dir / "summary.csv").write_text("")
+        (analysis_csv_dir / "1-summary.csv").write_text("")
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)
