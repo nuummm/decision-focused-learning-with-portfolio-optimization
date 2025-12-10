@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
-
 import pyomo.environ as pyo
 
 def _make_gurobi(model, tee: bool, options: dict | None):
@@ -41,15 +39,6 @@ def _make_knitro(model, tee: bool, options: dict | None):
     opt.set_executable(exe)
     opt.options['solver'] = 'knitro'
 
-    # Knitro のログをスペースを含まない相対パスに出力する
-    # （ディレクトリ名にスペースがあると Knitro が "Unknown keyword" エラーを出すため）
-    log_dir = Path("knitro_logs")
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        outdir_str = str(log_dir)
-    except Exception:
-        outdir_str = "."
-
     base = {
         "outlev": 3,
         "nlp_algorithm": 1,
@@ -67,8 +56,8 @@ def _make_knitro(model, tee: bool, options: dict | None):
         "ms_enable": 0,
         "bar_initmu": 1e-1,
         "bar_murule": 4,
-        "outmode": 1,
-        "outdir": outdir_str,
+        # outmode=0 にしてファイル出力を完全に抑止する
+        "outmode": 0,
     }
 
     KNOWN = {

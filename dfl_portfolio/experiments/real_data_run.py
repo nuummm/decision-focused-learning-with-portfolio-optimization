@@ -80,17 +80,6 @@ logging.getLogger("pyomo").setLevel(logging.ERROR)
 logging.getLogger("pyomo.solvers").setLevel(logging.ERROR)
 
 
-def mirror_to_analysis_root(src: Path, analysis_dir: Path) -> None:
-    """Copy ``src`` to the top-level ``analysis_dir`` for quick access."""
-
-    if not src.exists():
-        return
-    dest = analysis_dir / src.name
-    if dest == src:
-        return
-    shutil.copy2(src, dest)
-
-
 def train_model_window(
     model_key: str,
     trainer,
@@ -435,10 +424,10 @@ def main() -> None:
     asset_pred_dir = analysis_csv_dir / "asset_predictions"
     analysis_csv_dir.mkdir(parents=True, exist_ok=True)
     analysis_fig_dir.mkdir(parents=True, exist_ok=True)
-    model_outputs_dir = outdir / "model_outputs"
-    model_outputs_dir.mkdir(parents=True, exist_ok=True)
     debug_dir = DEBUG_ROOT / f"{outdir.name}_rolling"
     debug_dir.mkdir(parents=True, exist_ok=True)
+    model_outputs_dir = debug_dir
+    model_outputs_dir.mkdir(parents=True, exist_ok=True)
 
     # Safety check: delta in [0,1] (enforced by CLI type) and IPO+delta=0 is invalid
     if args.delta < 0.0 or args.delta > 1.0:
@@ -710,15 +699,16 @@ def main() -> None:
             stats_results.append(eq_info["stats"])
             wealth_dict[eq_info["label"]] = eq_info["wealth_df"]
 
+    summary_output_path = analysis_dir / "1-summary.csv"
     summary_csv_path = analysis_csv_dir / "1-summary.csv"
     summary_df = pd.DataFrame(stats_results)
     if not summary_df.empty:
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
         summary_df = format_summary_for_output(summary_df)
-        summary_df.to_csv(summary_csv_path, index=False)
+        summary_df.to_csv(summary_output_path, index=False)
     else:
-        summary_csv_path.write_text("")
-    mirror_to_analysis_root(summary_csv_path, analysis_dir)
+        summary_output_path.write_text("")
+    shutil.copy2(summary_output_path, summary_csv_path)
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)
@@ -767,14 +757,18 @@ def main() -> None:
                 {m: df for m, df in wealth_dict.items()},
                 analysis_fig_dir / "wealth_comparison.png",
             )
-            wealth_events_base_path = analysis_fig_dir / "wealth_events.png"
-            wealth_events_output_path = wealth_events_base_path.with_name("2-wealth_events.png")
+            wealth_events_base_path = analysis_dir / "wealth_events.png"
+            wealth_events_primary_path = analysis_dir / "2-wealth_events.png"
             # 1) 全モデル版（従来どおり）
             plot_wealth_with_events(
                 {m: df for m, df in wealth_dict.items()},
                 wealth_events_base_path,
             )
-            mirror_to_analysis_root(wealth_events_output_path, analysis_dir)
+            if wealth_events_primary_path.exists():
+                shutil.copy2(
+                    wealth_events_primary_path,
+                    analysis_fig_dir / wealth_events_primary_path.name,
+                )
             # 2) DFL 系モデルのみ（flex 系だけ抽出）
             flex_only = {m: df for m, df in wealth_dict.items() if "flex" in str(m)}
             if flex_only:
@@ -827,19 +821,19 @@ def main() -> None:
                         event_fig_dir / f"wealth_window_{name}.png",
                         events_by_model=solver_events_by_model,
                     )
-            # 5) 実験全期間を 2 年ごとに区切り、各ウィンドウの開始時点を 1 に正規化した推移を出力
-            two_year_dir = analysis_fig_dir / "wealth_windows_2y"
-            two_year_dir_all = two_year_dir / "all_models"
-            two_year_dir_dfl = two_year_dir / "dfl_only"
-            two_year_dir_all.mkdir(parents=True, exist_ok=True)
-            two_year_dir_dfl.mkdir(parents=True, exist_ok=True)
+            # 5) 実験全期間を 5 年ごとに区切り、各ウィンドウの開始時点を 1 に正規化した推移を出力
+            five_year_dir = analysis_fig_dir / "wealth_windows_5y"
+            five_year_dir_all = five_year_dir / "all_models"
+            five_year_dir_dfl = five_year_dir / "dfl_only"
+            five_year_dir_all.mkdir(parents=True, exist_ok=True)
+            five_year_dir_dfl.mkdir(parents=True, exist_ok=True)
             dates_all = pd.to_datetime(wealth_merge["date"])
             if not dates_all.empty:
                 start_all = dates_all.min()
                 end_all = dates_all.max()
                 start_win = start_all
                 while start_win < end_all:
-                    end_win = start_win + pd.DateOffset(years=2)
+                    end_win = start_win + pd.DateOffset(years=5)
                     # 最終ウィンドウは末尾まで含める
                     if end_win > end_all:
                         end_win = end_all
@@ -850,7 +844,7 @@ def main() -> None:
                             continue
                         tmp = df.copy()
                         tmp["date"] = pd.to_datetime(tmp["date"])
-                        # 2年ウィンドウは [start_win, end_win) とする
+                        # 5年ウィンドウは [start_win, end_win) とする
                         mask = (tmp["date"] >= start_win) & (tmp["date"] < end_win)
                         tmp = tmp.loc[mask]
                         if not tmp.empty:
@@ -861,7 +855,7 @@ def main() -> None:
                             window_label,
                             start_win,
                             end_win,
-                            two_year_dir_all / f"wealth_window_2y_{window_label}.png",
+                            five_year_dir_all / f"wealth_window_5y_{window_label}.png",
                             events_by_model=solver_events_by_model,
                         )
                         flex_only = {m: df for m, df in sub_dict.items() if "flex" in str(m)}
@@ -871,11 +865,11 @@ def main() -> None:
                                 window_label,
                                 start_win,
                                 end_win,
-                                two_year_dir_dfl / f"wealth_window_2y_{window_label}.png",
+                                five_year_dir_dfl / f"wealth_window_5y_{window_label}.png",
                                 events_by_model=solver_events_by_model,
                             )
-                    # 次の 2 年ウィンドウへ
-                    start_win = start_win + pd.DateOffset(years=2)
+                    # 次の 5 年ウィンドウへ
+                    start_win = start_win + pd.DateOffset(years=5)
             wealth_returns = wealth_merge.copy()
             wealth_returns["date"] = pd.to_datetime(wealth_returns["date"])
             wealth_returns = (
@@ -900,7 +894,6 @@ def main() -> None:
                     summarize_dfl_performance_significance(analysis_csv_dir)
 
     if weight_dict:
-        plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")
         # 主要イベント期間ごとの weights_comparison も追加
         for name, start, end in [
             # リーマンショック〜世界金融危機
@@ -922,9 +915,9 @@ def main() -> None:
                 plot_weight_comparison(
                     sub_weights, event_fig_dir / f"weights_comparison_{name}.png"
                 )
-        # 実験全期間を 2 年ごとに区切り、各ウィンドウの weights_comparison を出力
-        weights_2y_dir = analysis_fig_dir / "weights_windows_2y"
-        weights_2y_dir.mkdir(parents=True, exist_ok=True)
+        # 実験全期間を 5 年ごとに区切り、各ウィンドウの weights_comparison を出力
+        weights_5y_dir = analysis_fig_dir / "weights_windows_5y"
+        weights_5y_dir.mkdir(parents=True, exist_ok=True)
         # 全モデルの weight 日付の min/max を取得
         all_dates: List[pd.Timestamp] = []
         for df in weight_dict.values():
@@ -939,7 +932,7 @@ def main() -> None:
             end_all = max(all_dates)
             start_win = start_all
             while start_win < end_all:
-                end_win = start_win + pd.DateOffset(years=2)
+                end_win = start_win + pd.DateOffset(years=5)
                 if end_win > end_all:
                     end_win = end_all
                 window_label = f"{start_win.year}_{end_win.year}"
@@ -956,9 +949,9 @@ def main() -> None:
                 if sub_weights:
                     plot_weight_comparison(
                         sub_weights,
-                        weights_2y_dir / f"weights_comparison_2y_{window_label}.png",
+                        weights_5y_dir / f"weights_comparison_5y_{window_label}.png",
                     )
-                start_win = start_win + pd.DateOffset(years=2)
+                start_win = start_win + pd.DateOffset(years=5)
         export_weight_variance_correlation(
             weight_dict,
             analysis_csv_dir / "weight_variance_correlation.csv",

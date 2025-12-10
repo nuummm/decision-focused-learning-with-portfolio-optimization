@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import math
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,17 @@ DEBUG_ROOT = RESULTS_BASE / "debug_outputs_delta"
 # Suppress Pyomo-related warnings (only show errors)
 logging.getLogger("pyomo").setLevel(logging.ERROR)
 logging.getLogger("pyomo.solvers").setLevel(logging.ERROR)
+
+
+def mirror_to_analysis_root(src: Path, analysis_dir: Path) -> None:
+    """Copy ``src`` to the top-level ``analysis_dir`` for quick access."""
+
+    if not src.exists():
+        return
+    dest = analysis_dir / src.name
+    if dest == src:
+        return
+    shutil.copy2(src, dest)
 
 
 def train_model_window(
@@ -771,15 +783,17 @@ def main() -> None:
             stats_results.append(eq_info["stats"])
             wealth_dict[eq_info["label"]] = eq_info["wealth_df"]
 
+    summary_csv_path = analysis_csv_dir / "1-summary.csv"
     summary_df = pd.DataFrame(stats_results)
     if not summary_df.empty:
         if "model" in summary_df.columns:
             summary_df["model"] = summary_df["model"].map(display_model_name)
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
         summary_df = format_summary_for_output(summary_df)
-        summary_df.to_csv(analysis_csv_dir / "1-summary.csv", index=False)
+        summary_df.to_csv(summary_csv_path, index=False)
     else:
-        (analysis_csv_dir / "1-summary.csv").write_text("")
+        summary_csv_path.write_text("")
+    mirror_to_analysis_root(summary_csv_path, analysis_dir)
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)
@@ -800,8 +814,14 @@ def main() -> None:
             wealth_merge = wealth_merge.sort_values("date")
             wealth_merge = wealth_merge.groupby("date", as_index=False).last()
             wealth_merge.to_csv(analysis_csv_dir / "wealth_comparison.csv", index=False)
-            plot_multi_wealth({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_comparison.png")
-            plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_events.png")
+            plot_multi_wealth(
+                {m: df for m, df in wealth_dict.items()},
+                analysis_fig_dir / "wealth_comparison.png",
+            )
+            wealth_events_base_path = analysis_fig_dir / "wealth_events.png"
+            wealth_events_output_path = wealth_events_base_path.with_name("2-wealth_events.png")
+            plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, wealth_events_base_path)
+            mirror_to_analysis_root(wealth_events_output_path, analysis_dir)
             wealth_returns = wealth_merge.copy()
             wealth_returns["date"] = pd.to_datetime(wealth_returns["date"])
             wealth_returns = (
