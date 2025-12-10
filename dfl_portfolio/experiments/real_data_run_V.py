@@ -56,10 +56,12 @@ from dfl_portfolio.real_data.reporting import (
     plot_phi_paths,
     plot_beta_paths,
     plot_delta_paths,
+    plot_condition_numbers,
     update_experiment_ledger,
     run_extended_analysis,
     summarize_dfl_performance_significance,
     format_summary_for_output,
+    build_cost_adjusted_summary,
 )
 from dfl_portfolio.registry import SolverSpec, get_trainer
 from dfl_portfolio.models.ols import predict_yhat, train_ols
@@ -71,6 +73,7 @@ from dfl_portfolio.experiments.real_data_common import (
     ScheduleItem,
     build_rebalance_schedule,
     prepare_flex_training_args,
+    resolve_trading_cost_rates,
 )
 
 HERE = Path(__file__).resolve()
@@ -200,6 +203,8 @@ def run_rolling_experiment(
     bundle,
     delta_up: float,
     delta_down_candidates: Sequence[float],
+    trading_cost_enabled: bool,
+    asset_cost_overrides: Dict[str, float] | None,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     train_window: int,
@@ -222,15 +227,27 @@ def run_rolling_experiment(
         )
     }
 
+    tickers = bundle.dataset.config.tickers
+    asset_cost_rates = resolve_trading_cost_rates(
+        tickers,
+        asset_cost_overrides or {},
+        enable_default_costs=trading_cost_enabled,
+    )
+    costs_active = bool(np.any(asset_cost_rates > 0.0))
+    mean_defined_cost_bps = float(np.mean(asset_cost_rates) * 10000.0) if costs_active else 0.0
+
     wealth = 1.0
+    wealth_net = 1.0
     wealth_dates: List[pd.Timestamp] = []
     wealth_values: List[float] = []
+    wealth_net_values: List[float] = []
     wealth_labels: List[str] = []
 
     step_rows: List[Dict[str, object]] = []
     rebalance_rows: List[Dict[str, object]] = []
     asset_rows: List[Dict[str, object]] = []
     delta_history: List[Dict[str, object]] = []
+    prev_weights: Optional[np.ndarray] = None
 
     total_cycles = len(schedule)
     for cycle_id, item in enumerate(schedule):
@@ -338,6 +355,7 @@ def run_rolling_experiment(
         if not wealth_dates and item.eval_indices:
             wealth_dates.append(bundle.dataset.timestamps[item.eval_indices[0]])
             wealth_values.append(wealth)
+            wealth_net_values.append(wealth_net)
             wealth_labels.append("initial")
 
         for eval_idx in item.eval_indices:
@@ -362,12 +380,36 @@ def run_rolling_experiment(
             if z is None or np.isnan(z).any():
                 continue
             realized = float(z @ bundle.dataset.Y[eval_idx])
+            if prev_weights is None or prev_weights.shape != z.shape:
+                turnover = 0.0
+                trading_cost = 0.0
+            else:
+                abs_changes = np.abs(z - prev_weights)
+                turnover = float(0.5 * np.sum(abs_changes))
+                if costs_active and asset_cost_rates.shape[0] == abs_changes.shape[0]:
+                    trading_cost = float(0.5 * np.sum(abs_changes * asset_cost_rates))
+                elif costs_active:
+                    trading_cost = turnover * float(np.mean(asset_cost_rates))
+                else:
+                    trading_cost = 0.0
+            prev_weights = z.copy()
+            net_return = realized - trading_cost
+
             wealth *= (1.0 + realized)
+            wealth_net *= (1.0 + net_return)
             wealth_dates.append(bundle.dataset.timestamps[eval_idx])
             wealth_values.append(wealth)
+            wealth_net_values.append(wealth_net)
             wealth_labels.append("after_step")
 
             cost = mvo_cost(z, bundle.dataset.Y[eval_idx], V_used, delta_up)
+            eigvals = np.linalg.eigvalsh(V_used)
+            if eigvals.size == 0:
+                cond_number = float("nan")
+            else:
+                eig_min = float(np.max([np.min(eigvals), 1e-12]))
+                eig_max = float(np.max(eigvals))
+                cond_number = float(eig_max / eig_min) if eig_min > 0 else float("inf")
             step_rows.append(
                 {
                     "cycle": cycle_id,
@@ -376,13 +418,18 @@ def run_rolling_experiment(
                     "eval_idx": eval_idx,
                     "eig_min": stat.eigen_min,
                     "portfolio_return": realized,
+                    "trading_cost": trading_cost,
+                    "net_return": net_return,
                     "wealth": wealth,
+                    "wealth_net": wealth_net,
                     "mvo_cost": cost,
                     "theta": json.dumps(theta_hat.tolist()),
                     "weights": json.dumps(z.tolist()),
                     "weight_sum": float(np.sum(z)),
                     "weight_min": float(np.min(z)),
                     "weight_max": float(np.max(z)),
+                    "turnover": turnover,
+                    "condition_number": cond_number,
                 }
             )
 
@@ -409,8 +456,24 @@ def run_rolling_experiment(
 
     step_df = pd.DataFrame(step_rows)
     returns = step_df["portfolio_return"].to_numpy()
+    returns_net = step_df["net_return"].to_numpy() if "net_return" in step_df.columns else returns.copy()
+    avg_turnover = (
+        float(step_df["turnover"].mean()) if "turnover" in step_df.columns and not step_df.empty else float("nan")
+    )
+    avg_trading_cost = (
+        float(step_df["trading_cost"].mean())
+        if "trading_cost" in step_df.columns and not step_df.empty
+        else 0.0
+    )
+    avg_condition = (
+        float(step_df["condition_number"].mean())
+        if "condition_number" in step_df.columns and not step_df.empty
+        else float("nan")
+    )
     mean_step = float(np.mean(returns))
     std_step = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
+    mean_step_net = float(np.mean(returns_net))
+    std_step_net = float(np.std(returns_net, ddof=1)) if returns_net.size > 1 else 0.0
     if wealth_dates and len(wealth_dates) >= 2:
         horizon_days = (wealth_dates[-1] - wealth_dates[0]).days
         horizon_years = max(horizon_days / 365.25, 1e-9)
@@ -420,10 +483,19 @@ def run_rolling_experiment(
     mean_return = mean_step * steps_per_year
     std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
+    mean_return_net = mean_step_net * steps_per_year
+    std_return_net = std_step_net * math.sqrt(steps_per_year) if std_step_net > 0.0 else 0.0
+    sharpe_net = mean_return_net / std_return_net if std_return_net > 1e-12 else np.nan
     sortino_step = compute_sortino_ratio(returns)
     sortino = (
         float(sortino_step) * math.sqrt(steps_per_year)
         if np.isfinite(sortino_step)
+        else np.nan
+    )
+    sortino_step_net = compute_sortino_ratio(returns_net)
+    sortino_net = (
+        float(sortino_step_net) * math.sqrt(steps_per_year)
+        if np.isfinite(sortino_step_net)
         else np.nan
     )
 
@@ -457,9 +529,17 @@ def run_rolling_experiment(
     rebalance_df = pd.DataFrame(rebalance_rows)
     rebalance_df.to_csv(model_debug_dir / "rebalance_log.csv", index=False)
 
-    wealth_df = pd.DataFrame({"date": wealth_dates, "wealth": wealth_values, "label": wealth_labels})
+    wealth_df = pd.DataFrame(
+        {
+            "date": wealth_dates,
+            "wealth": wealth_values,
+            "wealth_net": wealth_net_values,
+            "label": wealth_labels,
+        }
+    )
     wealth_df.to_csv(model_debug_dir / "wealth.csv", index=False)
     plot_wealth_curve(wealth_dates, wealth_values, model_debug_dir / "wealth.png")
+    plot_condition_numbers(step_df, model_debug_dir / "condition_numbers.png")
 
     if step_df.empty:
         weights_df = pd.DataFrame()
@@ -480,7 +560,9 @@ def run_rolling_experiment(
         weights_df = pd.DataFrame(weight_records)
 
     terminal_wealth = float(wealth_values[-1]) if wealth_values else 1.0
+    terminal_wealth_net = float(wealth_net_values[-1]) if wealth_net_values else 1.0
     total_return = terminal_wealth - 1.0
+    total_return_net = terminal_wealth_net - 1.0
 
     stats_report = {
         "model": display_model_name(model_label),
@@ -490,13 +572,23 @@ def run_rolling_experiment(
         "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "ann_return_net": mean_return_net,
+        "ann_volatility_net": std_return_net,
+        "sharpe_net": sharpe_net,
+        "sortino_net": sortino_net,
         "cvar_95": cvar_95,
         "r2": r2,
         "max_drawdown": max_drawdown(wealth_values),
         "terminal_wealth": terminal_wealth,
+        "terminal_wealth_net": terminal_wealth_net,
         "total_return": total_return,
+        "total_return_net": total_return_net,
         "train_window": train_window,
         "rebal_interval": rebal_interval,
+        "avg_turnover": avg_turnover,
+        "avg_trading_cost": avg_trading_cost,
+        "trading_cost_bps": mean_defined_cost_bps,
+        "avg_condition_number": avg_condition,
     }
 
     period_metrics = compute_period_metrics(step_df)
@@ -538,6 +630,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     delta_up_list = _parse_delta_list(cli_delta_up, base_delta, allow_multiple=False)
     delta_up = float(delta_up_list[0])
     delta_down_list = _parse_delta_list(cli_delta_down, delta_up, allow_multiple=True)
+    trading_costs_enabled = float(getattr(args, "trading_cost_bps", 0.0)) > 0.0
+    raw_asset_costs: Dict[str, float] = getattr(args, "trading_cost_per_asset", {}) or {}
+    asset_cost_overrides_dec = {
+        ticker.upper(): max(float(rate), 0.0) / 10000.0 for ticker, rate in raw_asset_costs.items()
+    }
     loader_cfg = MarketLoaderConfig(
         tickers=tickers,
         start=args.start,
@@ -723,6 +820,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 bundle=bundle,
                 delta_up=delta_up,
                 delta_down_candidates=delta_down_list,
+                trading_cost_enabled=trading_costs_enabled,
+                asset_cost_overrides=asset_cost_overrides_dec,
                 solver_spec=solver_spec,
                 flex_options=flex_options,
                 train_window=effective_train_window,
@@ -857,16 +956,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             wealth_dict[eq_info["label"]] = eq_info["wealth_df"]
 
     summary_csv_path = analysis_csv_dir / "1-summary.csv"
-    summary_df = pd.DataFrame(stats_results)
-    if not summary_df.empty:
-        if "model" in summary_df.columns:
-            summary_df["model"] = summary_df["model"].map(display_model_name)
-        summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
-        summary_df = format_summary_for_output(summary_df)
+    summary_cost_csv_path = analysis_csv_dir / "1-summary_cost.csv"
+    summary_raw_df = pd.DataFrame(stats_results)
+    if not summary_raw_df.empty:
+        if "model" in summary_raw_df.columns:
+            summary_raw_df["model"] = summary_raw_df["model"].map(display_model_name)
+        summary_raw_df["max_drawdown"] = summary_raw_df["max_drawdown"].astype(float)
+        summary_df = format_summary_for_output(summary_raw_df)
         summary_df.to_csv(summary_csv_path, index=False)
+        summary_cost_df = format_summary_for_output(
+            build_cost_adjusted_summary(summary_raw_df)
+        )
+        summary_cost_df.to_csv(summary_cost_csv_path, index=False)
     else:
         summary_csv_path.write_text("")
+        summary_cost_csv_path.write_text("")
     mirror_to_analysis_root(summary_csv_path, analysis_dir)
+    mirror_to_analysis_root(summary_cost_csv_path, analysis_dir)
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)

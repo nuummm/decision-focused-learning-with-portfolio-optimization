@@ -39,6 +39,31 @@ def parse_model_train_window_spec(value: str) -> Dict[str, int]:
     return mapping
 
 
+def parse_trading_cost_map(value: str | None) -> Dict[str, float]:
+    mapping: Dict[str, float] = {}
+    text = (value or "").strip()
+    if not text:
+        return mapping
+    for token in text.split(","):
+        entry = token.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(f"Invalid trading-cost spec '{entry}'. Use 'TICKER:bps'.")
+        ticker, val = entry.split(":", 1)
+        ticker_key = ticker.strip().upper()
+        if not ticker_key:
+            raise ValueError(f"Missing ticker in trading-cost spec '{entry}'.")
+        try:
+            rate_bps = float(val.strip())
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise ValueError(f"Invalid bps '{val}' for ticker '{ticker_key}'.") from exc
+        if rate_bps < 0.0:
+            raise ValueError(f"Trading cost for '{ticker_key}' must be non-negative.")
+        mapping[ticker_key] = rate_bps
+    return mapping
+
+
 def make_output_dir(results_root: Path, base: Path | None) -> Path:
     """Create a timestamped output directory under the given results root.
 
@@ -163,6 +188,22 @@ def build_parser() -> argparse.ArgumentParser:
             "coefficient phi in the V-learning flex model. "
             "Penalizes deviation of phi from 0.0 (the OAS+EWMA baseline)."
         ),
+    )
+    parser.add_argument(
+        "--trading-cost-bps",
+        type=float,
+        default=0.0,
+        help=(
+            "Set to a positive value to enable the built-in per-asset trading cost table "
+            "(values expressed in basis points). "
+            "Specify --trading-cost-per-asset for custom overrides."
+        ),
+    )
+    parser.add_argument(
+        "--trading-cost-per-asset",
+        type=parse_trading_cost_map,
+        default=None,
+        help="Optional overrides like 'SPY:5,GLD:8' (basis points) applied per ticker.",
     )
     parser.add_argument("--tee", action="store_true")
     parser.add_argument(

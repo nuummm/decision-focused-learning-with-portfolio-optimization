@@ -29,6 +29,44 @@ def mvo_cost(z: np.ndarray, y: np.ndarray, V: np.ndarray, delta: float = 1.0) ->
     return float(-(1.0 - delta) * (z @ y) + 0.5 * delta * (z @ V @ z))
 
 
+DEFAULT_TRADING_COST_BPS: Dict[str, float] = {
+    "SPY": 5.0,
+    "TLT": 5.0,
+    "GLD": 10.0,
+    "EEM": 10.0,
+    "EURUSD=X": 2.0,
+}
+DEFAULT_TRADING_COST_RATES: Dict[str, float] = {
+    ticker: bps / 10000.0 for ticker, bps in DEFAULT_TRADING_COST_BPS.items()
+}
+
+
+def resolve_trading_cost_rates(
+    tickers: Sequence[str],
+    overrides: Dict[str, float] | None,
+    *,
+    enable_default_costs: bool,
+) -> np.ndarray:
+    """Return per-asset trading cost rates (decimal) with safety checks."""
+    overrides_upper = {str(k).upper(): float(v) for k, v in (overrides or {}).items()}
+    rates: List[float] = []
+    for ticker in tickers:
+        key = ticker.upper()
+        if key in overrides_upper:
+            rates.append(max(overrides_upper[key], 0.0))
+            continue
+        if enable_default_costs:
+            if key not in DEFAULT_TRADING_COST_RATES:
+                raise ValueError(
+                    f"Trading cost is enabled but ticker '{ticker}' has no default cost entry. "
+                    "Specify the cost via --trading-cost-per-asset."
+                )
+            rates.append(DEFAULT_TRADING_COST_RATES[key])
+        else:
+            rates.append(0.0)
+    return np.asarray(rates, dtype=float)
+
+
 @dataclass
 class ScheduleItem:
     rebalance_idx: int
@@ -188,6 +226,7 @@ __all__ = [
     "build_rebalance_schedule",
     "prepare_flex_training_args",
     "build_flex_dual_kkt_ensemble",
+    "resolve_trading_cost_rates",
 ]
 
 

@@ -299,7 +299,17 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df = df.drop(columns=[col])
     # % として表示する列（年率リターン・年率ボラティリティ・累積リターン）
-    for col in ["ann_return", "ann_volatility", "total_return"]:
+    percent_cols = [
+        "ann_return",
+        "ann_volatility",
+        "total_return",
+        "ann_return_net",
+        "ann_volatility_net",
+        "total_return_net",
+        "avg_turnover",
+        "avg_trading_cost",
+    ]
+    for col in percent_cols:
         if col in df.columns:
             df[col] = (df[col].astype(float) * 100.0).round(2)
     # Sharpe / Sortino / R^2 は生値のまま 4 桁表示
@@ -313,6 +323,8 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         df["max_drawdown"] = (-df["max_drawdown"].astype(float) * 100.0).round(2)
     if "terminal_wealth" in df.columns:
         df["terminal_wealth"] = df["terminal_wealth"].astype(float).round(2)
+    if "terminal_wealth_net" in df.columns:
+        df["terminal_wealth_net"] = df["terminal_wealth_net"].astype(float).round(2)
 
     # 列の並び替え: 投資成績→リスク→補助指標→カウント系の順に並べる
     preferred_order = [
@@ -321,12 +333,20 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         "ann_return",
         "total_return",
         "terminal_wealth",
+        "ann_return_net",
+        "total_return_net",
+        "terminal_wealth_net",
         "sharpe",
+        "sharpe_net",
         "sortino",
+        "sortino_net",
         # リスク系
         "ann_volatility",
+        "ann_volatility_net",
         "max_drawdown",
         "cvar_95",
+        "avg_turnover",
+        "avg_trading_cost",
         # サブ指標
         "r2",
         # カウント系
@@ -338,6 +358,27 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     # 上記以外の列があれば末尾に付ける
     remaining = [c for c in existing_cols if c not in ordered_cols]
     df = df[ordered_cols + remaining]
+    return df
+
+
+def build_cost_adjusted_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Construct a cost-adjusted view by swapping gross metrics with their net counterparts."""
+    if summary_df.empty:
+        return summary_df.copy()
+    df = summary_df.copy()
+    replacements = {
+        "ann_return": "ann_return_net",
+        "total_return": "total_return_net",
+        "terminal_wealth": "terminal_wealth_net",
+        "ann_volatility": "ann_volatility_net",
+        "sharpe": "sharpe_net",
+        "sortino": "sortino_net",
+    }
+    for gross_col, net_col in replacements.items():
+        if net_col in df.columns:
+            df[gross_col] = df[net_col]
+    drop_cols = [net for net in replacements.values() if net in df.columns]
+    df = df.drop(columns=drop_cols, errors="ignore")
     return df
 
 
@@ -838,6 +879,35 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
     plt.close(fig)
 
 
+def plot_condition_numbers(step_df: pd.DataFrame, path: Path, *, max_points: int = 400) -> None:
+    """Plot covariance condition numbers over time as a bar chart."""
+    if plt is None or step_df.empty:
+        return
+    required_cols = {"date", "condition_number"}
+    if not required_cols.issubset(step_df.columns):
+        return
+    df = step_df[list(required_cols)].copy()
+    df = df.dropna()
+    if df.empty:
+        return
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    if max_points and len(df) > max_points:
+        df = df.iloc[-max_points:]
+    dates = df["date"]
+    values = df["condition_number"].astype(float)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(dates, values, width=3, color="tab:blue", alpha=0.8)
+    ax.set_xlabel("date")
+    ax.set_ylabel("condition number")
+    ax.set_title("Covariance condition number over time")
+    ax.grid(axis="y", alpha=0.3)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
 def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
     """Visualize flex solver behavior over time (per rebalance).
 
@@ -852,6 +922,15 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
     flex_df = df.copy()
     if "model" not in flex_df.columns:
         return
+    def _display_model_name(model: object) -> str:
+        name = str(model)
+        if "flex_dual" in name:
+            return "DFL-QCQP-dual"
+        if "flex_kkt" in name:
+            return "DFL-QCQP-kkt"
+        return name
+
+    flex_df["model_display"] = flex_df["model"].map(_display_model_name)
     # 時系列ソート
     if "rebalance_date" in flex_df.columns:
         flex_df["rebalance_date"] = pd.to_datetime(flex_df["rebalance_date"])
@@ -879,7 +958,7 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
     non_ok = flex_df[~flex_df["solver_status_str"].map(_is_ok)]
     if not non_ok.empty:
         # モデルごとに Y 軸を離して配置（flex_dual / flex_kkt の違いを見る）
-        uniq_models = sorted(non_ok["model"].astype(str).unique())
+        uniq_models = sorted(non_ok["model_display"].astype(str).unique())
         y_map = {m: i for i, m in enumerate(uniq_models)}
         marker_cycle = ["x", "^", "v", "s", "D", "P", "*", "o"]
         marker_map = {}
@@ -892,7 +971,7 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
 
         for status, sub in non_ok.groupby("solver_status_str"):
             x_vals = sub[x_col]
-            y_vals = [y_map[str(m)] for m in sub["model"]]
+            y_vals = [y_map[str(m)] for m in sub["model_display"]]
             ax_status.scatter(
                 x_vals,
                 y_vals,
@@ -902,32 +981,72 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
             )
         ax_status.set_yticks(list(y_map.values()))
         ax_status.set_yticklabels(list(y_map.keys()))
-        ax_status.legend(loc="best", fontsize=8)
+        legend_labels = []
+        for status in sorted(non_ok["solver_status_str"].unique()):
+            parts = []
+            sub = non_ok[non_ok["solver_status_str"] == status]
+            for model, cnt in sub["model_display"].value_counts().items():
+                parts.append(f"{model}: {cnt}")
+            label = f"{status} ({', '.join(parts)})"
+            legend_labels.append(label)
+        handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker=marker_map.get(status, "x"),
+                color=color_map.get(status, "C0"),
+                linestyle="",
+            )
+            for status in sorted(non_ok["solver_status_str"].unique())
+        ]
+        ax_status.legend(handles, legend_labels, loc="best", fontsize=8)
     ax_status.set_xlabel(x_label)
     ax_status.set_ylabel("model (non-optimal statuses)")
     ax_status.set_title("Flex solver status over time")
 
-    # --- 右: elapsed time の時系列 + 平均 ---
+    # --- 右: elapsed time のヒストグラム比較 ---
     ax_time = axes[1]
     if "elapsed_sec" in flex_df.columns:
-        for model, sub in flex_df.groupby("model"):
-            sub_sorted = sub.sort_values(x_col)
-            x_vals = sub_sorted[x_col]
-            # 計算時間は対数スケールで表示するため、ゼロは小さな正値にクリップ
-            y_vals = sub_sorted["elapsed_sec"].astype(float).clip(lower=1e-6)
-            ax_time.plot(x_vals, y_vals, marker="o", linestyle="-", label=model)
-            # モデルごとの平均を点線で表示
-            mean_elapsed = float(y_vals.mean())
-            ax_time.axhline(
-                y=mean_elapsed,
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.7,
-            )
-    ax_time.set_xlabel(x_label)
-    ax_time.set_ylabel("elapsed time (sec, log scale)")
-    ax_time.set_yscale("log")
-    ax_time.set_title("Flex solver elapsed time per rebalance")
+        grouped = []
+        for model, sub in flex_df.groupby("model_display"):
+            values = sub["elapsed_sec"].astype(float).dropna()
+            if not values.empty:
+                grouped.append((str(model), values))
+        if grouped:
+            eps = 1e-3
+            min_val = min(float(vals.min()) for _, vals in grouped)
+            max_val = max(float(vals.max()) for _, vals in grouped)
+            if not np.isfinite(min_val) or not np.isfinite(max_val):
+                min_val, max_val = eps, 1.0
+            if max_val <= min_val:
+                max_val = min_val + eps
+            min_for_bins = max(min_val, eps)
+            bins = np.logspace(np.log10(min_for_bins), np.log10(max_val + eps), 80)
+            color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+            for idx, (model, values) in enumerate(grouped):
+                clipped = np.clip(values.to_numpy(dtype=float), min_for_bins, None)
+                color = color_cycle[idx % len(color_cycle)]
+                ax_time.hist(
+                    clipped,
+                    bins=bins,
+                    alpha=0.45,
+                    color=color,
+                    edgecolor=color,
+                    linewidth=0.8,
+                    label=model,
+                )
+                mean_elapsed = float(np.mean(clipped))
+                ax_time.axvline(
+                    max(mean_elapsed, min_for_bins),
+                    color=color,
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.9,
+                )
+            ax_time.set_xscale("log")
+    ax_time.set_xlabel("elapsed time (sec)")
+    ax_time.set_ylabel("frequency")
+    ax_time.set_title("Flex solver elapsed time histogram")
     ax_time.legend(loc="best", fontsize=8)
 
     fig.tight_layout()
