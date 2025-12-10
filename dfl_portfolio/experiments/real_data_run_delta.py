@@ -34,6 +34,7 @@ from dfl_portfolio.real_data.reporting import (
     compute_pairwise_mean_return_tests,
     compute_pairwise_performance_tests,
     compute_sortino_ratio,
+    compute_cvar,
     display_model_name,
     export_average_weights,
     export_weight_threshold_frequency,
@@ -178,9 +179,6 @@ def run_rolling_experiment(
     asset_rows: List[Dict[str, object]] = []
     step_rows: List[Dict[str, object]] = []
 
-    if debug_roll:
-        print(f"[real-data-delta] schedule length = {len(schedule)}")
-
     theta_init: Optional[np.ndarray] = None
     X = bundle.dataset.X
     Y = bundle.dataset.Y
@@ -190,12 +188,15 @@ def run_rolling_experiment(
 
     for cycle_id, item in enumerate(schedule, start=1):
         if debug_roll:
-            print(
-                f"[roll-debug] model={model_label} cycle={cycle_id}/{len(schedule)} "
-                f"idx={item.rebalance_idx} train=[{item.train_start},{item.train_end}] "
-                f"n_eval={len(item.eval_indices)}",
-                end="\r",
-            )
+            progress = cycle_id / max(len(schedule), 1)
+            bar = "#" * int(progress * 20)
+            # ログは負荷軽減のため 20 サイクルごと＋最初／最後のみ出力する
+            if cycle_id % 20 == 0 or cycle_id == 1 or cycle_id == len(schedule):
+                print(
+                    f"[roll-debug-delta] model={model_label} cycle={cycle_id}/{len(schedule)} "
+                    f"idx={item.rebalance_idx} train=[{item.train_start},{item.train_end}] "
+                    f"n_eval={len(item.eval_indices)} [{bar:<20}] {progress:.0%}"
+                )
 
         start_time = time.perf_counter()
         theta_hat, info, elapsed = train_model_window(
@@ -374,16 +375,40 @@ def run_rolling_experiment(
         json.dumps(reb_summary, ensure_ascii=False, indent=2)
     )
 
+    # CVaR (Expected Shortfall) at 95%: 下側 5% の平均リターン
+    cvar_95 = compute_cvar(returns, alpha=0.05)
+
+    # 決定係数 R^2（資産リターン予測の当てはまり；銘柄リターンベースの相関の2乗）
+    r2: float = float("nan")
+    try:
+        if asset_rows:
+            asset_df_r2 = pd.DataFrame(asset_rows)
+            if {"pred_ret", "real_ret"}.issubset(asset_df_r2.columns):
+                y = asset_df_r2["real_ret"].astype(float).to_numpy()
+                yhat = asset_df_r2["pred_ret"].astype(float).to_numpy()
+                if y.size > 1:
+                    corr = float(np.corrcoef(y, yhat)[0, 1])
+                    if np.isfinite(corr):
+                        r2 = corr * corr
+    except Exception:
+        r2 = float("nan")
+
+    terminal_wealth = float(wealth_values[-1]) if wealth_values else 1.0
+    total_return = terminal_wealth - 1.0
+
     stats_report = {
         "model": display_model_name(model_label),
-        "n_cycles": len(schedule),
-        "n_steps": len(step_rows),
-        "mean_return": mean_return,
-        "std_return": std_return,
+        "n_retrain": len(schedule),
+        "n_invest_steps": len(step_rows),
+        "ann_return": mean_return,
+        "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "cvar_95": cvar_95,
+        "r2": r2,
         "max_drawdown": max_drawdown(wealth_values),
-        "final_wealth": float(wealth_values[-1]) if wealth_values else 1.0,
+        "terminal_wealth": terminal_wealth,
+        "total_return": total_return,
         "train_window": train_window,
         "rebal_interval": rebal_interval,
     }
@@ -401,6 +426,7 @@ def run_rolling_experiment(
         "period_metrics": period_metrics,
         "wealth_df": wealth_df,
         "weights_df": weights_df,
+        "rebalance_df": rebalance_df,
         "rebalance_summary": reb_summary,
     }
 
@@ -510,26 +536,29 @@ def main() -> None:
     config_records = []
     for key, value in sorted(vars(args).items()):
         config_records.append({"parameter": key, "value": value})
-    pd.DataFrame(config_records).to_csv(analysis_csv_dir / "experiment_config.csv", index=False)
+    # 他の実験スクリプトと同じファイル名に揃える
+    pd.DataFrame(config_records).to_csv(analysis_csv_dir / "2-experiment_config.csv", index=False)
 
     start_ts = pd.Timestamp(loader_cfg.start)
+    data_fig_dir = analysis_fig_dir / "data_overview"
+    data_fig_dir.mkdir(parents=True, exist_ok=True)
     plot_time_series(
         bundle.dataset.prices,
         "Prices timeseries",
         start_ts,
-        analysis_fig_dir / "data_prices.png",
+        data_fig_dir / "data_prices.png",
     )
     plot_time_series(
         bundle.dataset.returns,
         "Returns timeseries",
         start_ts,
-        analysis_fig_dir / "data_returns.png",
+        data_fig_dir / "data_returns.png",
     )
     plot_time_series(
         bundle.dataset.momentum,
         "Momentum timeseries",
         start_ts,
-        analysis_fig_dir / "data_momentum.png",
+        data_fig_dir / "data_momentum.png",
     )
     returns_matrix = bundle.dataset.returns.dropna(how="all")
     if not returns_matrix.empty:
@@ -551,6 +580,8 @@ def main() -> None:
     weight_dict: Dict[str, pd.DataFrame] = {}
     train_window_records: List[Dict[str, object]] = []
     rebalance_records: List[Dict[str, object]] = []
+    # flex_delta 用のサイクルごとの rebalance ログ（solver 状態の時系列可視化用）
+    flex_rebalance_logs: List[pd.DataFrame] = []
     delta_records: List[Dict[str, object]] = []
 
     flex_base_options = dict(
@@ -635,6 +666,9 @@ def main() -> None:
                 eval_start=eval_start_ts,
             )
             stats_results.append(run_result["stats"])
+            reb_df = run_result.get("rebalance_df", pd.DataFrame())
+            if model_key == "flex" and isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
+                flex_rebalance_logs.append(reb_df.copy())
             reb_summary = run_result.get("rebalance_summary", {})
             if reb_summary:
                 record = {
@@ -835,9 +869,9 @@ def main() -> None:
     if rebalance_records:
         rebalance_df = pd.DataFrame(rebalance_records)
         rebalance_df.to_csv(analysis_csv_dir / "rebalance_summary.csv", index=False)
-        flex_debug_df = rebalance_df[rebalance_df["base_model"] == "flex"]
-        if not flex_debug_df.empty:
-            plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
+    if flex_rebalance_logs:
+        flex_debug_df = pd.concat(flex_rebalance_logs, ignore_index=True)
+        plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
     if delta_records:
         delta_df = pd.DataFrame(delta_records)
         delta_df.to_csv(analysis_csv_dir / "delta_trajectory.csv", index=False)

@@ -27,6 +27,7 @@ from dfl_portfolio.real_data.cli import (
 from dfl_portfolio.real_data.reporting import (
     WEIGHT_THRESHOLD,
     WEIGHT_PLOT_MAX_POINTS,
+    PERIOD_WINDOWS,
     compute_benchmark_series,
     compute_equal_weight_benchmark,
     compute_correlation_stats,
@@ -46,6 +47,7 @@ from dfl_portfolio.real_data.reporting import (
     plot_wealth_correlation_heatmap,
     plot_wealth_curve,
     plot_wealth_with_events,
+    plot_wealth_window_normalized,
     plot_weight_comparison,
     plot_weight_histograms,
     plot_weight_paths,
@@ -56,7 +58,6 @@ from dfl_portfolio.real_data.reporting import (
     summarize_dfl_performance_significance,
     format_summary_for_output,
 )
-from dfl_portfolio.real_data.covariance import estimate_shrinkage_covariances
 from dfl_portfolio.registry import SolverSpec, get_trainer
 from dfl_portfolio.models.ols import predict_yhat, train_ols
 from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
@@ -109,6 +110,25 @@ def train_model_window(
             bundle, train_start, train_end, delta, tee, flex_options
         )
         base_kwargs.update(resolved_flex)
+        # OAS×EWMA の shrinkage 係数 δ_t から、train window 上の平均を φ のアンカーにする。
+        phi_vals: List[float] = []
+        cov_idx_seq = bundle.cov_indices.tolist()
+        for pos, cov_idx in enumerate(cov_idx_seq):
+            if cov_idx < train_start or cov_idx > train_end:
+                continue
+            stat = bundle.cov_stats[pos]
+            delta_oas = getattr(stat, "oas_delta", None)
+            if delta_oas is None:
+                continue
+            try:
+                v = float(delta_oas)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v):
+                phi_vals.append(v)
+        phi_anchor_val = float(np.mean(phi_vals)) if phi_vals else 0.0
+        base_kwargs["phi_anchor"] = phi_anchor_val
+
     if theta_init_override is not None:
         base_kwargs["theta_init"] = theta_init_override
 
@@ -190,13 +210,16 @@ def run_rolling_experiment(
         if debug_roll:
             progress = (cycle_id + 1) / max(total_cycles, 1)
             bar = "#" * int(progress * 20)
-            print(
-                f"[roll-debug-V] model={model_label} cycle={cycle_id+1}/{total_cycles} "
-                f"idx={item.rebalance_idx} train=[{item.train_start},{item.train_end}] "
-                f"n_eval={len(item.eval_indices)} [{bar:<20}] {progress:.0%}"
-            )
+            # ログは負荷軽減のため 20 サイクルごと＋最初／最後のみ出力する
+            if (cycle_id + 1) % 20 == 0 or cycle_id == 0 or (cycle_id + 1) == total_cycles:
+                print(
+                    f"[roll-debug-V] model={model_label} cycle={cycle_id+1}/{total_cycles} "
+                    f"idx={item.rebalance_idx} train=[{item.train_start},{item.train_end}] "
+                    f"n_eval={len(item.eval_indices)} [{bar:<20}] {progress:.0%}"
+                )
 
         phi_hat = info.get("phi_hat", None)
+        phi_anchor = info.get("phi_anchor", None)
         rebalance_rows.append(
             {
                 "cycle": cycle_id,
@@ -209,6 +232,7 @@ def run_rolling_experiment(
                 "solver_term": (info or {}).get("termination_condition", ""),
                 "elapsed_sec": elapsed,
                 "phi_used": float(phi_hat) if phi_hat is not None else np.nan,
+                "phi_anchor": float(phi_anchor) if phi_anchor is not None else np.nan,
             }
         )
 
@@ -221,10 +245,17 @@ def run_rolling_experiment(
             if eval_idx not in cov_lookup:
                 continue
             cov, stat = cov_lookup[eval_idx]
+            # 学習済みの φ を用いて、テスト期間でも
+            # V_eff = (1-φ) * V + φ * diag(V) を使って配分を決定する。
+            V_used = cov
+            if model_key == "flex" and phi_hat is not None and np.isfinite(phi_hat):
+                phi_val = float(phi_hat)
+                diag_cov = np.diag(np.diag(cov))
+                V_used = (1.0 - phi_val) * cov + phi_val * diag_cov
             yhat = Yhat_all[eval_idx]
             z = solve_mvo_gurobi(
                 y_hat=yhat,
-                V_hat=cov,
+                V_hat=V_used,
                 delta=delta,
                 psd_eps=1e-9,
                 output=False,
@@ -237,7 +268,7 @@ def run_rolling_experiment(
             wealth_values.append(wealth)
             wealth_labels.append("after_step")
 
-            cost = mvo_cost(z, bundle.dataset.Y[eval_idx], cov, delta)
+            cost = mvo_cost(z, bundle.dataset.Y[eval_idx], V_used, delta)
             step_rows.append(
                 {
                     "cycle": cycle_id,
@@ -297,6 +328,27 @@ def run_rolling_experiment(
         else np.nan
     )
 
+    # CVaR (Expected Shortfall) at 95%: 下側 5% の平均リターン
+    from dfl_portfolio.real_data.reporting import compute_cvar
+
+    cvar_95 = compute_cvar(returns, alpha=0.05)
+
+    # 決定係数 R^2（資産リターン予測の当てはまり）
+    r2: float = float("nan")
+    try:
+        if asset_rows:
+            asset_df_r2 = pd.DataFrame(asset_rows)
+            if {"pred_ret", "real_ret"}.issubset(asset_df_r2.columns):
+                y = asset_df_r2["real_ret"].astype(float).to_numpy()
+                yhat = asset_df_r2["pred_ret"].astype(float).to_numpy()
+                if y.size > 1:
+                    corr = float(np.corrcoef(y, yhat)[0, 1])
+                    if np.isfinite(corr):
+                        r2 = corr * corr
+    except Exception:
+        # R^2 は診断用なので、例外時は NaN のままにして続行する
+        r2 = float("nan")
+
     model_debug_dir = debug_dir / f"model_{model_label}"
     model_debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -328,16 +380,22 @@ def run_rolling_experiment(
             weight_records.append(record)
         weights_df = pd.DataFrame(weight_records)
 
+    terminal_wealth = float(wealth_values[-1]) if wealth_values else 1.0
+    total_return = terminal_wealth - 1.0
+
     stats_report = {
         "model": display_model_name(model_label),
-        "n_cycles": len(rebalance_rows),
-        "n_steps": int(len(step_df)),
-        "mean_return": mean_return,
-        "std_return": std_return,
+        "n_retrain": len(rebalance_rows),
+        "n_invest_steps": int(len(step_df)),
+        "ann_return": mean_return,
+        "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "cvar_95": cvar_95,
+        "r2": r2,
         "max_drawdown": max_drawdown(wealth_values),
-        "final_wealth": float(wealth_values[-1]) if wealth_values else 1.0,
+        "terminal_wealth": terminal_wealth,
+        "total_return": total_return,
         "train_window": train_window,
         "rebal_interval": rebal_interval,
     }
@@ -363,25 +421,13 @@ def run_rolling_experiment(
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
-    # real_data_run_V 専用: 共分散の時間減衰率 β（EWMA）
-    parser.add_argument(
-        "--cov-ewma-beta",
-        type=float,
-        default=0.94,
-        help=(
-            "EWMA 共分散の時間減衰率 β (0<β<1)。"
-            "β が小さいほど短期寄り、β が 1 に近いほど長期寄りの共分散となる。"
-            "real_data_run_V のみ有効。"
-        ),
-    )
     args = parser.parse_args(argv)
 
-    if args.cov_method != "diag":
-        raise ValueError("real_data_run_V は cov-method=diag のみ対応です。")
+    # V 学習版でも通常版と同じ「EWMA+OAS」共分散を使う。
+    if args.cov_method != "oas":
+        raise ValueError("real_data_run_V は cov-method=oas のみ対応です。")
     if str(args.flex_solver).lower() != "knitro":
         raise ValueError("real_data_run_V は --flex-solver knitro のみ対応です。")
-    if not (0.0 < float(args.cov_ewma_beta) < 1.0):
-        raise ValueError("--cov-ewma-beta は 0 と 1 の間の値を指定してください。")
 
     tickers = parse_tickers(args.tickers)
     loader_cfg = MarketLoaderConfig(
@@ -397,6 +443,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return_horizon=args.return_horizon,
         cov_window=args.cov_window,
         cov_method=args.cov_method,
+        cov_ewma_alpha=getattr(args, "cov_ewma_alpha", 0.97),
         cov_shrinkage=args.cov_shrinkage,
         cov_eps=args.cov_eps,
         cov_robust_huber_k=args.cov_robust_huber_k,
@@ -415,43 +462,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     bundle = build_data_bundle(pipeline_cfg)
     bundle_summary = bundle.summary()
 
-    # V 学習用に、等重みではなく時間減衰率 β を用いた EWMA 共分散 S_t(β) を構成。
-    # Shrinkage φ 自体は DFL モデル内部 (fit_dfl_p1_flex_V) で学習させる。
-    returns_df = bundle.dataset.returns.dropna(how="any")
-    cfg = bundle.dataset.config
-    beta = float(args.cov_ewma_beta)
-
-    values = returns_df.to_numpy(dtype=float)
-    times = list(returns_df.index)
-    d = values.shape[1]
-    window = int(cfg.cov_window)
-    if window < 2:
-        raise ValueError("cov_window は 2 以上を指定してください。")
-
-    sample_by_ts: Dict[pd.Timestamp, np.ndarray] = {}
-    for i in range(len(values)):
-        if i + 1 < window:
-            continue
-        window_vals = values[i - window + 1 : i + 1]
-        # S_t(β) = (1-β) * Σ_{k=0}^{W-1} β^k r_{t-k} r_{t-k}^T
-        S = np.zeros((d, d), dtype=float)
-        # 直近から過去へさかのぼって加重
-        for k in range(window_vals.shape[0]):
-            r = window_vals[-1 - k].reshape(-1, 1)
-            w = (1.0 - beta) * (beta ** k)
-            S += w * (r @ r.T)
-        S = 0.5 * (S + S.T) + cfg.cov_eps * np.eye(d)
-        sample_by_ts[times[i]] = S
-
-    V_sample_all: List[np.ndarray] = []
-    V_diag_all: List[np.ndarray] = []
-    for idx in bundle.cov_indices.tolist():
-        ts = bundle.dataset.timestamps[idx]
-        cov_sample = sample_by_ts.get(ts)
-        if cov_sample is None:
-            raise RuntimeError(f"no EWMA covariance found for timestamp {ts}")
-        V_sample_all.append(cov_sample)
-        V_diag_all.append(np.diag(np.diag(cov_sample)))
+    # 通常版と同じ EWMA+OAS 共分散 Σ_t(α) をベースとして使用する。
+    # V 学習版では、この Σ_t(α) を V_sample_list として渡し、
+    # その対角成分を V_diag_list として渡す。
+    V_sample_all: List[np.ndarray] = [np.asarray(C, float) for C in bundle.covariances]
+    V_diag_all: List[np.ndarray] = [np.diag(np.diag(C)) for C in bundle.covariances]
 
     model_specs = parse_commalist(args.models)
     flex_formulations = parse_commalist(args.flex_formulation) if args.flex_formulation else ["dual"]
@@ -494,23 +509,25 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     pd.DataFrame(config_records).to_csv(analysis_csv_dir / "2-experiment_config.csv", index=False)
 
     # データの可視化（real_data_run.py と同様の構造）
+    data_fig_dir = analysis_fig_dir / "data_overview"
+    data_fig_dir.mkdir(parents=True, exist_ok=True)
     plot_time_series(
         bundle.dataset.prices,
         "Prices timeseries",
         start_ts,
-        analysis_fig_dir / "data_prices.png",
+        data_fig_dir / "data_prices.png",
     )
     plot_time_series(
         bundle.dataset.returns,
         "Returns timeseries",
         start_ts,
-        analysis_fig_dir / "data_returns.png",
+        data_fig_dir / "data_returns.png",
     )
     plot_time_series(
         bundle.dataset.momentum,
         "Momentum timeseries",
         start_ts,
-        analysis_fig_dir / "data_momentum.png",
+        data_fig_dir / "data_momentum.png",
     )
     returns_matrix = bundle.dataset.returns.dropna(how="all")
     if not returns_matrix.empty:
@@ -532,6 +549,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     train_window_records: List[Dict[str, object]] = []
     phi_records: List[Dict[str, object]] = []
     beta_records: List[Dict[str, object]] = []
+    # flex 用のサイクルごとの rebalance ログ（solver 状態の時系列可視化用）
+    flex_rebalance_logs: List[pd.DataFrame] = []
 
     wealth_dict: Dict[str, pd.DataFrame] = {}
     weight_dict: Dict[str, pd.DataFrame] = {}
@@ -565,6 +584,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     "lambda_theta_iso": args.flex_lambda_theta_iso,
                     "theta_anchor_mode": args.flex_theta_anchor_mode,
                     "theta_init_mode": args.flex_theta_init_mode,
+                    "lambda_phi_anchor": args.flex_lambda_phi_anchor,
                 }
             results_dir = model_outputs_dir / label
             effective_train_window = model_train_windows.get(model_key, args.train_window)
@@ -602,6 +622,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             stats_results.append(run_result["stats"])
             reb_df = run_result["rebalance_df"]
+            if model_key == "flex" and not reb_df.empty:
+                flex_rebalance_logs.append(reb_df.copy())
             if not reb_df.empty:
                 status_counts = reb_df["solver_status"].value_counts().to_dict()
                 record = {
@@ -631,6 +653,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                                 "train_start": int(row.get("train_start", -1)),
                                 "train_end": int(row.get("train_end", -1)),
                                 "phi_used": float(row.get("phi_used", np.nan)),
+                                "phi_anchor": float(row.get("phi_anchor", np.nan)),
                                 "elapsed_sec": float(row.get("elapsed_sec", 0.0)),
                                 "solver_status": row.get("solver_status", ""),
                                 "solver_term": row.get("solver_term", ""),
@@ -645,7 +668,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                                 "rebalance_date": row.get("rebalance_date", ""),
                                 "train_start": int(row.get("train_start", -1)),
                                 "train_end": int(row.get("train_end", -1)),
-                                "beta_used": float(args.cov_ewma_beta),
+                                "beta_used": float(getattr(args, "cov_ewma_alpha", 0.97)),
                                 "elapsed_sec": float(row.get("elapsed_sec", 0.0)),
                                 "solver_status": row.get("solver_status", ""),
                                 "solver_term": row.get("solver_term", ""),
@@ -729,6 +752,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             period_df["model"] = period_df["model"].map(display_model_name)
         period_df.to_csv(analysis_csv_dir / "period_metrics.csv", index=False)
 
+    solver_events_by_model: Dict[str, pd.DataFrame] = {}
+    if flex_rebalance_logs:
+        tmp_events: Dict[str, List[pd.DataFrame]] = {}
+        for log in flex_rebalance_logs:
+            df = log.copy()
+            if df.empty or "rebalance_date" not in df.columns:
+                continue
+            df["rebalance_date"] = pd.to_datetime(df["rebalance_date"])
+            statuses = df.get("solver_status", "").astype(str)
+            mask = ~statuses.str.contains("optimal", case=False, na=False)
+            mask &= ~statuses.str.contains("ok", case=False, na=False)
+            df = df.loc[mask]
+            if df.empty:
+                continue
+            need_cols = {"model", "rebalance_date", "solver_status"}
+            if not need_cols.issubset(df.columns):
+                continue
+            for model, sub in df[list(need_cols)].groupby("model"):
+                tmp_events.setdefault(model, []).append(sub)
+        solver_events_by_model = {
+            model: pd.concat(chunks, ignore_index=True).sort_values("rebalance_date")
+            for model, chunks in tmp_events.items()
+        }
+
     if wealth_dict:
         wealth_merge = None
         for model, wdf in wealth_dict.items():
@@ -743,7 +790,128 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             wealth_merge = wealth_merge.groupby("date", as_index=False).last()
             wealth_merge.to_csv(analysis_csv_dir / "wealth_comparison.csv", index=False)
             plot_multi_wealth({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_comparison.png")
-            plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_events.png")
+            # 1) 全モデル版（従来どおり）
+            plot_wealth_with_events(
+                {m: df for m, df in wealth_dict.items()},
+                analysis_fig_dir / "wealth_events.png",
+            )
+            # 2) DFL 系モデルのみ（flex 系だけ抽出）
+            flex_only = {m: df for m, df in wealth_dict.items() if "flex" in str(m)}
+            if flex_only:
+                plot_wealth_with_events(
+                    flex_only,
+                    analysis_fig_dir / "wealth_events_dfl_only.png",
+                )
+            # 3) DFL-dual vs その他（flex_dual を基準に比較）
+            flex_dual_key = None
+            for key in wealth_dict.keys():
+                key_str = str(key)
+                if "flex" in key_str and ("dual" in key_str or key_str == "flex"):
+                    flex_dual_key = key
+                    break
+            if flex_dual_key is not None:
+                dual_vs_others: Dict[str, pd.DataFrame] = {}
+                dual_vs_others[flex_dual_key] = wealth_dict[flex_dual_key]
+                for key, df in wealth_dict.items():
+                    if key == flex_dual_key:
+                        continue
+                    if "flex" in str(key):
+                        continue
+                    dual_vs_others[key] = df
+                if len(dual_vs_others) > 1:
+                    plot_wealth_with_events(
+                        dual_vs_others,
+                        analysis_fig_dir / "wealth_events_flex_dual_vs_baselines.png",
+                    )
+            # 4) 各危機ウィンドウごとに、期間開始時点を 1 とした累積推移を描画
+            event_fig_dir = analysis_fig_dir / "event_windows"
+            event_fig_dir.mkdir(parents=True, exist_ok=True)
+            for name, start, end in PERIOD_WINDOWS:
+                sub_dict: Dict[str, pd.DataFrame] = {}
+                for m, df in wealth_dict.items():
+                    if df.empty:
+                        continue
+                    tmp = df.copy()
+                    tmp["date"] = pd.to_datetime(tmp["date"])
+                    mask = (tmp["date"] >= pd.Timestamp(start)) & (tmp["date"] <= pd.Timestamp(end))
+                    tmp = tmp.loc[mask]
+                    if not tmp.empty:
+                        sub_dict[m] = tmp[["date", "wealth"]].copy()
+                if sub_dict:
+                    plot_wealth_window_normalized(
+                        sub_dict,
+                        name,
+                        start,
+                        end,
+                        event_fig_dir / f"wealth_window_{name}.png",
+                        events_by_model=solver_events_by_model,
+                    )
+            # 5) 実験全期間を 2 年ごとに区切り、各ウィンドウの開始時点を 1 に正規化した推移を出力
+            two_year_dir = analysis_fig_dir / "wealth_windows_2y"
+            two_year_dir_all = two_year_dir / "all_models"
+            two_year_dir_dfl = two_year_dir / "dfl_only"
+            two_year_dir_all.mkdir(parents=True, exist_ok=True)
+            two_year_dir_dfl.mkdir(parents=True, exist_ok=True)
+            dates_all = pd.to_datetime(wealth_merge["date"])
+            if not dates_all.empty:
+                start_all = dates_all.min()
+                end_all = dates_all.max()
+                start_win = start_all
+                while start_win < end_all:
+                    end_win = start_win + pd.DateOffset(years=2)
+                    if end_win > end_all:
+                        end_win = end_all
+                    window_label = f"{start_win.year}_{end_win.year}"
+                    sub_dict: Dict[str, pd.DataFrame] = {}
+                    for m, df in wealth_dict.items():
+                        if df.empty:
+                            continue
+                        tmp = df.copy()
+                        tmp["date"] = pd.to_datetime(tmp["date"])
+                        mask = (tmp["date"] >= start_win) & (tmp["date"] < end_win)
+                        tmp = tmp.loc[mask]
+                        if not tmp.empty:
+                            sub_dict[m] = tmp[["date", "wealth"]].copy()
+                    if sub_dict:
+                        plot_wealth_window_normalized(
+                            sub_dict,
+                            window_label,
+                            start_win,
+                            end_win,
+                            two_year_dir_all / f"wealth_window_2y_{window_label}.png",
+                            events_by_model=solver_events_by_model,
+                        )
+                        flex_only = {m: df for m, df in sub_dict.items() if "flex" in str(m)}
+                        if flex_only:
+                            plot_wealth_window_normalized(
+                                flex_only,
+                                window_label,
+                                start_win,
+                                end_win,
+                                two_year_dir_dfl / f"wealth_window_2y_{window_label}.png",
+                                events_by_model=solver_events_by_model,
+                            )
+                    start_win = start_win + pd.DateOffset(years=2)
+            # 4) 各危機ウィンドウごとに、期間開始時点を 1 とした累積推移を描画
+            for name, start, end in PERIOD_WINDOWS:
+                sub_dict: Dict[str, pd.DataFrame] = {}
+                for m, df in wealth_dict.items():
+                    if df.empty:
+                        continue
+                    tmp = df.copy()
+                    tmp["date"] = pd.to_datetime(tmp["date"])
+                    mask = (tmp["date"] >= pd.Timestamp(start)) & (tmp["date"] <= pd.Timestamp(end))
+                    tmp = tmp.loc[mask]
+                    if not tmp.empty:
+                        sub_dict[m] = tmp[["date", "wealth"]].copy()
+                if sub_dict:
+                    plot_wealth_window_normalized(
+                        sub_dict,
+                        name,
+                        start,
+                        end,
+                        analysis_fig_dir / f"wealth_window_{name}.png",
+                    )
             wealth_returns = wealth_merge.copy()
             wealth_returns["date"] = pd.to_datetime(wealth_returns["date"])
             wealth_returns = wealth_returns.set_index("date").pct_change(fill_method=None).dropna(how="all")
@@ -783,8 +951,44 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     sub_weights[m] = tmp
             if sub_weights:
                 plot_weight_comparison(
-                    sub_weights, analysis_fig_dir / f"weights_comparison_{name}.png"
+                    sub_weights, event_fig_dir / f"weights_comparison_{name}.png"
                 )
+        # 実験全期間を 2 年ごとに区切り、各ウィンドウの weights_comparison を出力
+        weights_2y_dir = analysis_fig_dir / "weights_windows_2y"
+        weights_2y_dir.mkdir(parents=True, exist_ok=True)
+        all_dates: List[pd.Timestamp] = []
+        for df in weight_dict.values():
+            if df.empty or "date" not in df.columns:
+                continue
+            d = pd.to_datetime(df["date"])
+            if not d.empty:
+                all_dates.append(d.min())
+                all_dates.append(d.max())
+        if all_dates:
+            start_all = min(all_dates)
+            end_all = max(all_dates)
+            start_win = start_all
+            while start_win < end_all:
+                end_win = start_win + pd.DateOffset(years=2)
+                if end_win > end_all:
+                    end_win = end_all
+                window_label = f"{start_win.year}_{end_win.year}"
+                sub_weights: Dict[str, pd.DataFrame] = {}
+                for m, df in weight_dict.items():
+                    if df.empty or "date" not in df.columns:
+                        continue
+                    tmp = df.copy()
+                    tmp["date"] = pd.to_datetime(tmp["date"])
+                    mask = (tmp["date"] >= start_win) & (tmp["date"] < end_win)
+                    tmp = tmp.loc[mask]
+                    if not tmp.empty:
+                        sub_weights[m] = tmp
+                if sub_weights:
+                    plot_weight_comparison(
+                        sub_weights,
+                        weights_2y_dir / f"weights_comparison_2y_{window_label}.png",
+                    )
+                start_win = start_win + pd.DateOffset(years=2)
         export_weight_variance_correlation(
             weight_dict,
             analysis_csv_dir / "weight_variance_correlation.csv",
@@ -809,9 +1013,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if rebalance_records:
         rebalance_df = pd.DataFrame(rebalance_records)
         rebalance_df.to_csv(analysis_csv_dir / "rebalance_summary.csv", index=False)
-        flex_debug_df = rebalance_df[rebalance_df["base_model"] == "flex"] if "base_model" in rebalance_df.columns else pd.DataFrame()
-        if not flex_debug_df.empty:
-            plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
+    if flex_rebalance_logs:
+        flex_debug_df = pd.concat(flex_rebalance_logs, ignore_index=True)
+        plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
     if phi_records:
         phi_df = pd.DataFrame(phi_records)
         phi_df.to_csv(analysis_csv_dir / "phi_trajectory.csv", index=False)
@@ -833,6 +1037,7 @@ if __name__ == "__main__":  # pragma: no cover
     main()
 
 """
+source /Users/kensei/Documents/VScode/GraduationResearch/gurobi-env/bin/activate
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.real_data_run_V \
@@ -846,9 +1051,9 @@ python -m dfl_portfolio.experiments.real_data_run_V \
   --momentum-window 26 \
   --return-horizon 1 \
   --cov-window 13 \
-  --cov-method diag \
+  --cov-method oas \
+  --cov-ewma-alpha 0.97 \
   --cov-shrinkage 0.94 \
-  --cov-ewma-beta 0.94 \
   --cov-eps 1e-6 \
   --train-window 26 \
   --rebal-interval 4 \
@@ -856,11 +1061,13 @@ python -m dfl_portfolio.experiments.real_data_run_V \
   --models ols,ipo,flex \
   --flex-solver knitro \
   --flex-formulation 'dual' \
-  --flex-lambda-theta-anchor 0.0 \
+  --flex-lambda-theta-anchor 10.0 \
   --flex-lambda-theta-iso 0.0 \
-  --flex-theta-anchor-mode ols \
+  --flex-theta-anchor-mode ipo \
   --flex-theta-init-mode none \
+  --flex-lambda-phi-anchor 0.0 \
   --benchmark-ticker SPY \
   --benchmark-equal-weight \
   --debug-roll
+
 """

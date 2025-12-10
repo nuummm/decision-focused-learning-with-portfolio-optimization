@@ -321,16 +321,20 @@ def run_rolling_experiment_multi(
         json.dumps(reb_summary, ensure_ascii=False, indent=2)
     )
 
+    terminal_wealth = float(wealth_values[-1]) if wealth_values else 1.0
+    total_return = terminal_wealth - 1.0
+
     stats_report = {
         "model": display_model_name(model_label),
-        "n_cycles": len(schedule),
-        "n_steps": len(step_rows),
-        "mean_return": mean_return,
-        "std_return": std_return,
+        "n_retrain": len(schedule),
+        "n_invest_steps": len(step_rows),
+        "ann_return": mean_return,
+        "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
         "max_drawdown": max_drawdown(wealth_values),
-        "final_wealth": float(wealth_values[-1]) if wealth_values else 1.0,
+        "terminal_wealth": terminal_wealth,
+        "total_return": total_return,
         "train_window": train_window,
         "rebal_interval": rebal_interval,
     }

@@ -93,6 +93,8 @@ def fit_dfl_p1_flex_V(
     theta_anchor: Optional[Sequence[float]] = None,
     lambda_theta_anchor_l1: float = 0.0,
     lambda_theta_iso: float = 0.0,
+    lambda_phi_anchor: float = 0.0,
+    phi_anchor: Optional[float] = None,
 ):
     """
     DFL-P1 flex モデルの「共分散縮小係数 φ 学習版」。
@@ -121,6 +123,11 @@ def fit_dfl_p1_flex_V(
     lam_theta_l2 = float(lambda_theta_anchor)
     lam_theta_l1 = float(lambda_theta_anchor_l1)
     lam_theta_iso = float(lambda_theta_iso)
+    lam_phi_anchor = float(lambda_phi_anchor)
+    # OAS+EWMA で構成された共分散 V_sample_list を基準とみなし、
+    # phi_anchor が与えられていればそれを基準とする。
+    # そうでなければ φ=0.0（追加 shrinkage 無し＝OAS のみ）をアンカーとする。
+    phi_anchor_val = float(phi_anchor) if phi_anchor is not None else 0.0
     theta_anchor_vec = None
     if lam_theta_l2 > 0.0 or lam_theta_l1 > 0.0:
         if theta_anchor is None:
@@ -160,8 +167,8 @@ def fit_dfl_p1_flex_V(
             theta_ref = np.asarray(train_ols(X_used, Y_used), float)
         try:
             yhat_all = predict_yhat(X, theta_ref)
-            # 初期化用の V は φ=0.94 の縮小版を仮に用いる
-            phi0 = 0.94
+            # 初期化用の V は φ=phi_anchor_val を仮に用いる
+            phi0 = phi_anchor_val
             V_list_init = [
                 (1.0 - phi0) * Vs + phi0 * Vd for Vs, Vd in zip(Vs_list, Vd_list)
             ]
@@ -195,7 +202,9 @@ def fit_dfl_p1_flex_V(
     m.Vd = pyo.Param(m.T, m.J, m.J, initialize=Vd_ini)
 
     # 縮小係数 φ（全時点共通）を Var として導入
-    m.phi = pyo.Var(bounds=(0.0, 1.0), initialize=0.94)
+    # φ=phi_anchor_val が初期値（アンカー）、
+    # φ=0.0 が「OAS+EWMA 共分散そのまま」、φ=1.0 が「完全対角化」に対応。
+    m.phi = pyo.Var(bounds=(0.0, 1.0), initialize=phi_anchor_val)
 
     m.theta = pyo.Var(m.J)
     m.w = pyo.Var(m.T, m.J, domain=pyo.NonNegativeReals)
@@ -227,7 +236,7 @@ def fit_dfl_p1_flex_V(
     if theta_init_vec is not None:
         try:
             yhat_all = predict_yhat(X, theta_init_vec)
-            phi0 = 0.94
+            phi0 = phi_anchor_val
             V_list_init = [
                 (1.0 - phi0) * Vs + phi0 * Vd for Vs, Vd in zip(Vs_list, Vd_list)
             ]
@@ -308,6 +317,8 @@ def fit_dfl_p1_flex_V(
             total += lam_theta_l1 * sum(m.theta_dev[j] for j in m.J)
         if lam_theta_iso > 0.0:
             total += 0.5 * lam_theta_iso * sum(m.theta[j] ** 2 for j in m.J)
+        if lam_phi_anchor > 0.0:
+            total += 0.5 * lam_phi_anchor * (m.phi - phi_anchor_val) ** 2
         return total
 
     m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
@@ -327,6 +338,7 @@ def fit_dfl_p1_flex_V(
     res = opt.solve(m, tee=tee)
     meta = _solver_metadata(opt, res, "knitro")
     meta["phi_hat"] = float(pyo.value(m.phi))
+    meta["phi_anchor"] = float(phi_anchor_val)
 
     theta_hat = np.array([pyo.value(m.theta[j]) for j in m.J], dtype=float)
     W = np.array([[pyo.value(m.w[t, j]) for j in m.J] for t in m.T], dtype=float)
@@ -334,4 +346,3 @@ def fit_dfl_p1_flex_V(
     LAM = np.array([[pyo.value(m.lam[t, j]) for j in m.J] for t in m.T], dtype=float)
 
     return theta_hat, W, MU, LAM, used_idx, meta
-

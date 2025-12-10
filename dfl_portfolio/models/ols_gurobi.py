@@ -48,6 +48,19 @@ def solve_mvo_gurobi(
     d = y_hat.shape[0]
     assert V_hat.shape == (d, d), "V_hat shape must be (d,d)"
 
+    # δ=0 のときは目的が線形
+    #   min_z  -y_hat^T z  s.t. 1^T z = 1, z>=0
+    # に退化し、最適解は「期待リターン最大の資産にフルベット」になる。
+    # この場合は Gurobi を呼ばず、解析解をそのまま返す。
+    if delta == 0.0:
+        if d == 0:
+            return np.zeros(0, dtype=float)
+        j = int(np.nanargmax(y_hat))
+        z_star = np.zeros(d, dtype=float)
+        if 0 <= j < d:
+            z_star[j] = 1.0
+        return z_star
+
     # 対称化 + PSD化（微小リッジ）
     V_hat = 0.5 * (V_hat + V_hat.T) + psd_eps * np.eye(d)
 

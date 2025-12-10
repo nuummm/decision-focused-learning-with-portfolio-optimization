@@ -134,13 +134,37 @@ def _wrap_ipo(spec: SolverSpec) -> TrainerFn:
         mode = kw.pop("ipo_mode", "budget")
         psd_eps = kw.pop("ipo_psd_eps", 1e-12)
         ridge_theta = kw.pop("ipo_ridge_theta", 1e-10)
-        ret = fit_ipo_closed_form(
-            X, Y, Vhats, idx,
-            start_index=start_index, end_index=end_index,
-            delta=delta, mode=mode, psd_eps=psd_eps,
-            ridge_theta=ridge_theta, tee=tee,
-        )
-        return ret
+        # δ=0 のときは IPO の二次問題が線形問題に退化し、
+        # 解析解ベースの正規方程式は成り立たない。
+        # この場合は「単純にリターンをよく当てるモデル」として
+        # OLS ベースラインの学習器を使う。
+        if delta == 0.0:
+            (
+                theta_hat,
+                Z,
+                MU,
+                LAM,
+                used_idx,
+                meta,
+            ) = fit_ols_baseline(
+                X, Y, Vhats, idx,
+                start_index=start_index, end_index=end_index,
+                delta=delta, theta_init=theta_init, tee=tee,
+            )
+            meta = dict(meta)
+            meta["solver"] = "ols_baseline"
+            meta["message"] = (
+                "delta=0: used OLS baseline instead of IPO closed-form."
+            )
+            return theta_hat, Z, MU, LAM, used_idx, meta
+        else:
+            ret = fit_ipo_closed_form(
+                X, Y, Vhats, idx,
+                start_index=start_index, end_index=end_index,
+                delta=delta, mode=mode, psd_eps=psd_eps,
+                ridge_theta=ridge_theta, tee=tee,
+            )
+            return ret
 
     return _runner
 

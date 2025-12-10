@@ -130,6 +130,12 @@ def prepare_flex_training_args(
                 theta_sources["ols"] = np.asarray(train_ols(X_train, Y_train), dtype=float)
             return theta_sources["ols"].copy()
         if m == "ipo":
+            # delta=0 のときは IPO 解析解が定義されないので、
+            # 「リターン項だけの解析解」として OLS 回帰係数を用いる。
+            if delta == 0.0:
+                if "ipo" not in theta_sources:
+                    theta_sources["ipo"] = np.asarray(train_ols(X_train, Y_train), dtype=float)
+                return theta_sources["ipo"].copy()
             if "ipo" in theta_sources:
                 return theta_sources["ipo"].copy()
             try:
@@ -321,17 +327,25 @@ def build_flex_dual_kkt_ensemble(
         if np.isfinite(sortino_step)
         else np.nan
     )
+    # CVaR (Expected Shortfall) at 95% for ensemble
+    from dfl_portfolio.real_data.reporting import compute_cvar
+
+    cvar_95 = compute_cvar(returns, alpha=0.05)
+    terminal_wealth = float(wealth_series_values[-1]) if wealth_series_values else 1.0
+    total_return = terminal_wealth - 1.0
 
     stats_report = {
         "model": display_model_name(ens_label),
-        "n_cycles": int(len(ens_df)),
-        "n_steps": int(len(ens_df)),
-        "mean_return": mean_return,
-        "std_return": std_return,
+        "n_retrain": int(len(ens_df)),
+        "n_invest_steps": int(len(ens_df)),
+        "ann_return": mean_return,
+        "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "cvar_95": cvar_95,
         "max_drawdown": max_drawdown(wealth_series_values),
-        "final_wealth": float(wealth_series_values[-1]) if wealth_series_values else 1.0,
+        "terminal_wealth": terminal_wealth,
+        "total_return": total_return,
         "train_window": args.train_window,
         "rebal_interval": args.rebal_interval,
     }

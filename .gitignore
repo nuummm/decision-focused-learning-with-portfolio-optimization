@@ -1,2 +1,5 @@
 knitro.log
 knitro_logs/
+dfl_portfolio/real_data/cache/
+*.pyc
+**/*.pyc

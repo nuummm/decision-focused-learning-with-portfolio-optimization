@@ -54,6 +54,9 @@ ShrinkMethod = Literal[
 class CovarianceStats:
     eigen_min: float
     eigen_max: float
+    # OAS × EWMA で推定したときの shrinkage 係数 δ_t。
+    # それ以外の手法では None のまま。
+    oas_delta: float | None = None
 
 
 def _shrink_to_diag(sample_cov: np.ndarray, shrinkage: float, eps: float) -> np.ndarray:
@@ -156,6 +159,7 @@ def estimate_shrinkage_covariances(
         if np.isnan(window_vals).any():
             continue
         sample_cov = np.cov(window_vals, rowvar=False)
+        oas_delta_value: float | None = None
         if method == "oas":
             # OAS × EWMA: 0<α<1 のときだけ EWMA 共分散 S_t^{(α)} に OAS を適用。
             # α>=1 や α<=0 のときは従来どおり等重み OAS にフォールバックする。
@@ -193,11 +197,32 @@ def estimate_shrinkage_covariances(
                         delta_oas = float(np.clip(delta_oas, 0.0, 1.0))
                     F = (tr_S / d) * np.eye(d, dtype=float)
                     cov = (1.0 - delta_oas) * S + delta_oas * F
+                    oas_delta_value = float(delta_oas)
                     cov = 0.5 * (cov + cov.T)
                     cov += eps * np.eye(d)
             else:
                 # α が指定されていないか 1 のときは、sklearn.OAS による標準的な OAS 共分散。
                 cov = _oas_cov(window_vals, eps)
+        elif method == "diag":
+            # diag × EWMA: OAS と同様に、0<α<1 のときは
+            # 時間減衰付き共分散 S_t^{(α)} を計算し、それに対して
+            # 対角シュリンクを適用する。
+            if ewma_alpha is not None and 0.0 < float(ewma_alpha) < 1.0:
+                alpha = float(ewma_alpha)
+                w = window_vals.shape[0]
+                centered = window_vals - np.mean(window_vals, axis=0)
+                ks = np.arange(w - 1, -1, -1, dtype=float)
+                raw = (1.0 - alpha) * (alpha ** ks)
+                denom = 1.0 - alpha ** w
+                omega = raw / denom
+                S = np.zeros((d, d), dtype=float)
+                for i_row in range(w):
+                    r = centered[i_row].reshape(-1, 1)
+                    S += float(omega[i_row]) * (r @ r.T)
+                S = 0.5 * (S + S.T)
+                cov = _shrink_to_diag(S, shrinkage=shrinkage, eps=eps)
+            else:
+                cov = _shrink_to_diag(sample_cov, shrinkage=shrinkage, eps=eps)
         elif method == "robust_lw":
             cov = _robust_ledoit_wolf_cov(window_vals, huber_k=robust_huber_k, eps=eps)
         elif method == "mini_factor":
@@ -208,7 +233,7 @@ def estimate_shrinkage_covariances(
                 eps=eps,
             )
         else:
-            cov = _shrink_to_diag(sample_cov, shrinkage=shrinkage, eps=eps)
+            raise ValueError(f"unknown covariance shrinkage method: {method!r}")
         eigvals = np.linalg.eigvalsh(cov)
         min_eig = float(eigvals.min())
         max_eig = float(eigvals.max())
@@ -219,7 +244,13 @@ def estimate_shrinkage_covariances(
             max_eig = float(eigvals.max())
         covs.append(cov)
         times.append(idx_list[idx - 1])
-        stats.append(CovarianceStats(eigen_min=min_eig, eigen_max=max_eig))
+        stats.append(
+            CovarianceStats(
+                eigen_min=min_eig,
+                eigen_max=max_eig,
+                oas_delta=oas_delta_value,
+            )
+        )
 
     if not covs:
         raise ValueError("共分散を推定できるウィンドウがありません。")

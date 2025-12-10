@@ -136,6 +136,16 @@ def build_parser() -> argparse.ArgumentParser:
             "w_kkt = 1 - w_dual. Only used when ensemble is requested."
         ),
     )
+    parser.add_argument(
+        "--flex-lambda-phi-anchor",
+        type=float,
+        default=0.0,
+        help=(
+            "Additional L2 regularization strength on the covariance shrinkage "
+            "coefficient phi in the V-learning flex model. "
+            "Penalizes deviation of phi from 0.0 (the OAS+EWMA baseline)."
+        ),
+    )
     parser.add_argument("--tee", action="store_true")
     parser.add_argument("--debug-roll", action="store_true")
     parser.add_argument(

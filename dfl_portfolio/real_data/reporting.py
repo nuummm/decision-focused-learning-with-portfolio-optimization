@@ -219,6 +219,32 @@ def max_drawdown(wealth_series: Sequence[float]) -> float:
     return float(np.nanmax(dd))
 
 
+def compute_cvar(
+    returns: Sequence[float],
+    alpha: float = 0.05,
+) -> float:
+    """Compute CVaR (Expected Shortfall) of returns at level alpha.
+
+    Returns are assumed to be per-period arithmetic returns. The function returns
+    the expected value of returns conditional on being in the worst ``alpha``
+    fraction (typically a negative number). When there are too few observations,
+    NaN is returned.
+    """
+    arr = np.asarray(returns, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    alpha = float(alpha)
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f"alpha must be in (0,1), got {alpha}")
+    # 並べ替えて下側 alpha 部分の平均をとる
+    sorted_ret = np.sort(arr)
+    k = int(np.floor(alpha * sorted_ret.size))
+    if k <= 0:
+        return np.nan
+    tail = sorted_ret[:k]
+    return float(np.mean(tail))
+
+
 def compute_period_metrics(step_df: pd.DataFrame) -> List[Dict[str, object]]:
     if step_df.empty:
         return []
@@ -254,8 +280,8 @@ def compute_period_metrics(step_df: pd.DataFrame) -> List[Dict[str, object]]:
 def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     """summary.csv 用にメトリクスを人間が読みやすい形に整形する。
 
-    - mean_return, std_return, max_drawdown を年率[%]として扱い、
-      100 倍して小数第 2 位までに丸める。
+    - ann_return, ann_volatility, total_return を [%] として扱い、
+      100 倍して小数第 2 位までに丸める（total_return は累積リターン）。
     - sharpe, sortino はスケーリングせず生の値を小数第 4 位までに丸める。
     - max_drawdown は「下落率」を表現するために負の値に変換（例: 0.25 → -25.00）。
     - final_wealth も小数第 2 位までに丸める。
@@ -263,18 +289,50 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     if summary_df.empty:
         return summary_df
     df = summary_df.copy()
-    # 年率 % として表示する列
-    for col in ["mean_return", "std_return"]:
+    # summary では train_window / rebal_interval は列から除外する
+    for col in ["train_window", "rebal_interval"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+    # % として表示する列（年率リターン・年率ボラティリティ・累積リターン）
+    for col in ["ann_return", "ann_volatility", "total_return"]:
         if col in df.columns:
             df[col] = (df[col].astype(float) * 100.0).round(2)
-    # Sharpe / Sortino は生値のまま 4 桁表示
-    for col in ["sharpe", "sortino"]:
+    # Sharpe / Sortino / R^2 は生値のまま 4 桁表示
+    for col in ["sharpe", "sortino", "r2"]:
         if col in df.columns:
             df[col] = df[col].astype(float).round(4)
+    # CVaR は「損失期待値」なので負の値のまま % 表示
+    if "cvar_95" in df.columns:
+        df["cvar_95"] = (df["cvar_95"].astype(float) * 100.0).round(2)
     if "max_drawdown" in df.columns:
         df["max_drawdown"] = (-df["max_drawdown"].astype(float) * 100.0).round(2)
-    if "final_wealth" in df.columns:
-        df["final_wealth"] = df["final_wealth"].astype(float).round(2)
+    if "terminal_wealth" in df.columns:
+        df["terminal_wealth"] = df["terminal_wealth"].astype(float).round(2)
+
+    # 列の並び替え: 投資成績→リスク→補助指標→カウント系の順に並べる
+    preferred_order = [
+        "model",
+        # 成果・リターン系
+        "ann_return",
+        "total_return",
+        "terminal_wealth",
+        "sharpe",
+        "sortino",
+        # リスク系
+        "ann_volatility",
+        "max_drawdown",
+        "cvar_95",
+        # サブ指標
+        "r2",
+        # カウント系
+        "n_retrain",
+        "n_invest_steps",
+    ]
+    existing_cols = list(df.columns)
+    ordered_cols = [c for c in preferred_order if c in existing_cols]
+    # 上記以外の列があれば末尾に付ける
+    remaining = [c for c in existing_cols if c not in ordered_cols]
+    df = df[ordered_cols + remaining]
     return df
 
 
@@ -327,8 +385,19 @@ def plot_phi_paths(phi_df: pd.DataFrame, path: Path) -> None:
         return
     if "phi_used" not in phi_df.columns:
         return
+
+    # DFL 系（flex 系）のみを対象に可視化する
+    if "model" in phi_df.columns:
+        mask_flex = phi_df["model"].astype(str).str.contains("flex", case=False)
+        phi_df = phi_df.loc[mask_flex].copy()
+        if phi_df.empty:
+            return
+
     fig, ax = plt.subplots(figsize=(8, 4))
     use_date_axis = "rebalance_date" in phi_df.columns
+    anchor_levels: dict[str, float] = {}
+    # OAS 由来のアンカー φ_t の推移も描画するため、モデルごとの系列を保持
+    anchor_series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for model, sub in phi_df.groupby("model"):
         sub_sorted = sub.sort_values("cycle") if "cycle" in sub.columns else sub.copy()
         if use_date_axis:
@@ -338,6 +407,51 @@ def plot_phi_paths(phi_df: pd.DataFrame, path: Path) -> None:
                 continue
             x = sub_sorted["cycle"]
         ax.plot(x, sub_sorted["phi_used"], label=model)
+        # モデルごとのアンカー値（phi_anchor 列があればその平均、なければ 0.0）
+        if "phi_anchor" in sub_sorted.columns:
+            vals = pd.to_numeric(sub_sorted["phi_anchor"], errors="coerce")
+            vals_arr_full = vals.to_numpy(dtype=float)
+            mask = np.isfinite(vals_arr_full)
+            vals_arr = vals_arr_full[mask]
+            if vals_arr.size > 0:
+                anchor_levels[str(model)] = float(vals_arr.mean())
+                # アンカーの推移そのものも描画できるように保存
+                if use_date_axis:
+                    x_raw = pd.to_datetime(sub_sorted["rebalance_date"]).to_numpy()
+                else:
+                    x_raw = np.asarray(x)
+                x_anchor = x_raw[mask]
+                anchor_series[str(model)] = (x_anchor, vals_arr)
+
+    # OAS+EWMA ベースラインの φ アンカーを点線で表示
+    # ・phi_anchor 列がある場合は、その平均値を使用
+    # ・無い場合は φ=0.0（追加 shrinkage 無し＝OAS のみ）を基準とする
+    if anchor_levels:
+        # flex 系モデルのアンカーの代表値として平均を用いる
+        phi_anchor_val = float(np.mean(list(anchor_levels.values())))
+        label = f"OAS baseline (phi≈{phi_anchor_val:.2f})"
+    else:
+        phi_anchor_val = 0.0
+        label = "OAS baseline (phi=0.0)"
+
+    ax.axhline(
+        y=phi_anchor_val,
+        color="black",
+        linestyle="--",
+        linewidth=1.0,
+        label=label,
+    )
+
+    # 各モデルについて、OAS 由来のアンカー φ_t の推移も点線で描画する
+    for model, (x_anchor, vals_arr) in anchor_series.items():
+        ax.plot(
+            x_anchor,
+            vals_arr,
+            color="grey",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"OAS phi_anchor ({model})",
+        )
 
     if use_date_axis:
         for name, start, end in PERIOD_WINDOWS:
@@ -456,12 +570,113 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
             unique_handles.append(h)
             unique_labels.append(l)
             seen.add(l)
-    plt.legend(unique_handles, unique_labels, loc="best")
+    # 凡例は左上に固定
+    plt.legend(unique_handles, unique_labels, loc="upper left")
     plt.tight_layout()
     fig_path = path
     if path.name == "wealth_events.png":
         fig_path = path.with_name("2-wealth_events.png")
     plt.savefig(fig_path)
+    plt.close()
+
+
+def plot_wealth_window_normalized(
+    wealth_dict: Dict[str, pd.DataFrame],
+    period_name: str,
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    path: Path,
+    events_by_model: Dict[str, pd.DataFrame] | None = None,
+) -> None:
+    """Plot wealth trajectories per model, normalized to 1 at the period start.
+
+    For each model, we take wealth over [start, end], rebase the first value to 1.0,
+    and plot the normalized path. This is useful to compare performance within a
+    specific crisis window.
+    """
+    if plt is None or not wealth_dict:
+        return
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    plt.figure(figsize=(8, 4))
+    any_plotted = False
+    norm_series_by_model: Dict[str, pd.DataFrame] = {}
+    line_colors: Dict[str, str] = {}
+    for model, df in wealth_dict.items():
+        if df.empty:
+            continue
+        tmp = df.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"])
+        tmp = tmp.sort_values("date")
+        mask = (tmp["date"] >= start_ts) & (tmp["date"] <= end_ts)
+        tmp = tmp.loc[mask]
+        if tmp.empty:
+            continue
+        base = float(tmp["wealth"].iloc[0])
+        if not np.isfinite(base) or base == 0.0:
+            continue
+        series = tmp.copy()
+        series["wealth_norm"] = series["wealth"].astype(float) / base
+        color = MODEL_COLOR_MAP.get(model, None)
+        display_label = display_model_name(model)
+        kwargs = {"label": display_label}
+        if color is not None:
+            kwargs["color"] = color
+        if model in {"flex_dual", "flex_kkt"}:
+            kwargs["linestyle"] = "-"
+            kwargs["alpha"] = 0.4
+        (line_handle,) = plt.plot(series["date"], series["wealth_norm"], **kwargs)
+        norm_series_by_model[model] = series[["date", "wealth_norm"]].copy()
+        line_colors[model] = line_handle.get_color()
+        any_plotted = True
+    if not any_plotted:
+        plt.close()
+        return
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=0.8, alpha=0.7)
+    plt.xlabel("date")
+    plt.ylabel("normalized wealth (start=1)")
+    plt.title(f"Wealth normalized in window: {period_name}")
+    plt.legend(loc="upper left")
+
+    if events_by_model:
+        for model, events in events_by_model.items():
+            if model not in norm_series_by_model:
+                continue
+            if events.empty:
+                continue
+            events = events.copy()
+            events["rebalance_date"] = pd.to_datetime(events["rebalance_date"])
+            mask = (events["rebalance_date"] >= start_ts) & (events["rebalance_date"] <= end_ts)
+            events = events.loc[mask]
+            if events.empty:
+                continue
+            series = norm_series_by_model[model].sort_values("date")
+            if series.empty:
+                continue
+            x_series = series["date"].map(pd.Timestamp.toordinal).to_numpy(dtype=float)
+            y_series = series["wealth_norm"].to_numpy(dtype=float)
+            color = line_colors.get(model, "red")
+            x_evts = []
+            y_evts = []
+            for evt_date in events["rebalance_date"]:
+                evt_ord = float(pd.Timestamp(evt_date).toordinal())
+                if evt_ord < x_series[0] or evt_ord > x_series[-1]:
+                    continue
+                y_evt = np.interp(evt_ord, x_series, y_series)
+                x_evts.append(evt_date)
+                y_evts.append(y_evt)
+            if x_evts:
+                plt.scatter(
+                    x_evts,
+                    y_evts,
+                    marker="x",
+                    s=25,
+                    color=color,
+                    alpha=0.9,
+                    linewidths=1.2,
+                )
+    plt.tight_layout()
+    plt.savefig(path)
     plt.close()
 
 
@@ -565,9 +780,11 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
     ax.set_title(f"Freq(weight ≥ {WEIGHT_THRESHOLD:.2f}) per asset")
     ax.set_ylabel("frequency")
 
+    # x 軸ラベルは display_model_name で人間向けに整形
+    display_labels = [display_model_name(m) for m in models]
     for ax in axes:
         ax.set_xticks(x + width * (len(tickers) - 1) / 2)
-        ax.set_xticklabels(models, rotation=45, ha="right")
+        ax.set_xticklabels(display_labels, rotation=45, ha="right")
 
     handles, labels = axes[1].get_legend_handles_labels()
     if handles:
@@ -617,42 +834,97 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
 
 
 def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
+    """Visualize flex solver behavior over time (per rebalance).
+
+    Expects per-cycle rebalance logs with at least:
+        - model
+        - rebalance_date (ISO string) or cycle
+        - elapsed_sec
+        - solver_status
+    """
     if plt is None or df.empty:
         return
     flex_df = df.copy()
-    for col in flex_df.columns:
-        if col.startswith("solver_status_"):
-            flex_df[col] = pd.to_numeric(flex_df[col], errors="coerce")
-    models = flex_df["model"].tolist()
-    x = np.arange(len(models))
-    status_cols = [c for c in flex_df.columns if c.startswith("solver_status_")]
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    if status_cols:
-        width = 0.8 / len(status_cols)
-        for i, col in enumerate(status_cols):
-            axes[0].bar(
-                x + i * width,
-                flex_df[col].astype(float),
-                width=width,
-                label=col.replace("solver_status_", ""),
-            )
-        axes[0].set_xticks(x + width * (len(status_cols) - 1) / 2)
+    if "model" not in flex_df.columns:
+        return
+    # 時系列ソート
+    if "rebalance_date" in flex_df.columns:
+        flex_df["rebalance_date"] = pd.to_datetime(flex_df["rebalance_date"])
+        flex_df = flex_df.sort_values(["model", "rebalance_date"])
+        x_col = "rebalance_date"
+        x_label = "date"
     else:
-        axes[0].bar(x, [0] * len(models), width=0.6, label="none")
-        axes[0].set_xticks(x)
-    axes[0].set_xticklabels(models, rotation=45, ha="right")
-    axes[0].set_ylabel("count")
-    axes[0].set_title("Solver status counts")
-    axes[0].legend()
+        if "cycle" not in flex_df.columns:
+            return
+        flex_df = flex_df.sort_values(["model", "cycle"])
+        x_col = "cycle"
+        x_label = "cycle"
 
-    width2 = 0.35
-    axes[1].bar(x - width2 / 2, flex_df["elapsed_mean"].astype(float), width=width2, label="elapsed_mean")
-    axes[1].bar(x + width2 / 2, flex_df["elapsed_max"].astype(float), width=width2, label="elapsed_max")
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(models, rotation=45, ha="right")
-    axes[1].set_ylabel("seconds")
-    axes[1].set_title("Solver elapsed time")
-    axes[1].legend()
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=False)
+
+    # --- 左: solver status の時系列（optimal 以外のみマーカー表示, モデルごとに Y を分ける） ---
+    ax_status = axes[0]
+    # ok とみなすステータス（optimal / ok を含むもの）
+    def _is_ok(status: object) -> bool:
+        s = str(status).lower()
+        return ("optimal" in s) or ("ok" in s)
+
+    # 異常系ステータスだけ抽出
+    flex_df["solver_status_str"] = flex_df["solver_status"].astype(str)
+    non_ok = flex_df[~flex_df["solver_status_str"].map(_is_ok)]
+    if not non_ok.empty:
+        # モデルごとに Y 軸を離して配置（flex_dual / flex_kkt の違いを見る）
+        uniq_models = sorted(non_ok["model"].astype(str).unique())
+        y_map = {m: i for i, m in enumerate(uniq_models)}
+        marker_cycle = ["x", "^", "v", "s", "D", "P", "*", "o"]
+        marker_map = {}
+        color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+        color_map = {}
+
+        for i, status in enumerate(sorted(non_ok["solver_status_str"].unique())):
+            marker_map[status] = marker_cycle[i % len(marker_cycle)]
+            color_map[status] = color_cycle[i % len(color_cycle)]
+
+        for status, sub in non_ok.groupby("solver_status_str"):
+            x_vals = sub[x_col]
+            y_vals = [y_map[str(m)] for m in sub["model"]]
+            ax_status.scatter(
+                x_vals,
+                y_vals,
+                marker=marker_map.get(status, "x"),
+                color=color_map.get(status, "C0"),
+                label=status,
+            )
+        ax_status.set_yticks(list(y_map.values()))
+        ax_status.set_yticklabels(list(y_map.keys()))
+        ax_status.legend(loc="best", fontsize=8)
+    ax_status.set_xlabel(x_label)
+    ax_status.set_ylabel("model (non-optimal statuses)")
+    ax_status.set_title("Flex solver status over time")
+
+    # --- 右: elapsed time の時系列 + 平均 ---
+    ax_time = axes[1]
+    if "elapsed_sec" in flex_df.columns:
+        for model, sub in flex_df.groupby("model"):
+            sub_sorted = sub.sort_values(x_col)
+            x_vals = sub_sorted[x_col]
+            # 計算時間は対数スケールで表示するため、ゼロは小さな正値にクリップ
+            y_vals = sub_sorted["elapsed_sec"].astype(float).clip(lower=1e-6)
+            ax_time.plot(x_vals, y_vals, marker="o", linestyle="-", label=model)
+            # モデルごとの平均を点線で表示
+            mean_elapsed = float(y_vals.mean())
+            ax_time.axhline(
+                y=mean_elapsed,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.7,
+            )
+    ax_time.set_xlabel(x_label)
+    ax_time.set_ylabel("elapsed time (sec, log scale)")
+    ax_time.set_yscale("log")
+    ax_time.set_title("Flex solver elapsed time per rebalance")
+    ax_time.legend(loc="best", fontsize=8)
+
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -694,6 +966,7 @@ def compute_benchmark_series(
     mean_return = mean_step * steps_per_year
     std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
+    cvar_95 = compute_cvar(returns, alpha=0.05)
     sortino_step = compute_sortino_ratio(returns)
     sortino = (
         float(sortino_step) * math.sqrt(steps_per_year)
@@ -701,16 +974,20 @@ def compute_benchmark_series(
         else np.nan
     )
     label = f"benchmark_{ticker}"
+    terminal_wealth = float(wealth_list[-1])
+    total_return = terminal_wealth - 1.0
     stats = {
         "model": label,
-        "n_cycles": int(len(returns)),
-        "n_steps": int(len(returns)),
-        "mean_return": mean_return,
-        "std_return": std_return,
+        "n_retrain": int(len(returns)),
+        "n_invest_steps": int(len(returns)),
+        "ann_return": mean_return,
+        "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "cvar_95": cvar_95,
         "max_drawdown": max_drawdown(wealth_list),
-        "final_wealth": float(wealth_list[-1]),
+        "terminal_wealth": terminal_wealth,
+        "total_return": total_return,
         "train_window": 0,
         "rebal_interval": 0,
     }
@@ -746,6 +1023,7 @@ def compute_equal_weight_benchmark(
     mean_return = mean_step * steps_per_year
     std_return = std_step * math.sqrt(steps_per_year) if std_step > 0.0 else 0.0
     sharpe = mean_return / std_return if std_return > 1e-12 else np.nan
+    cvar_95 = compute_cvar(returns, alpha=0.05)
     sortino_step = compute_sortino_ratio(returns)
     sortino = (
         float(sortino_step) * math.sqrt(steps_per_year)
@@ -753,17 +1031,21 @@ def compute_equal_weight_benchmark(
         else np.nan
     )
     label = "benchmark_equal_weight"
+    terminal_wealth = float(wealth_list[-1])
+    total_return = terminal_wealth - 1.0
     stats = {
         # 表示名としては 1/N を使う
         "model": "1/N",
-        "n_cycles": int(len(returns)),
-        "n_steps": int(len(returns)),
-        "mean_return": mean_return,
-        "std_return": std_return,
+        "n_retrain": int(len(returns)),
+        "n_invest_steps": int(len(returns)),
+        "ann_return": mean_return,
+        "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "cvar_95": cvar_95,
         "max_drawdown": max_drawdown(wealth_list),
-        "final_wealth": float(wealth_list[-1]),
+        "terminal_wealth": terminal_wealth,
+        "total_return": total_return,
         "train_window": 0,
         "rebal_interval": 0,
     }
@@ -791,7 +1073,7 @@ def compute_correlation_stats(corr_df: pd.DataFrame) -> Dict[str, float]:
         eigvals = eigvals[eigvals > 0]
         if eigvals.size > 0:
             entropy = -np.sum((eigvals / eigvals.sum()) * np.log(eigvals / eigvals.sum()))
-            stats["entropy"] = float(entropy)
+        stats["entropy"] = float(entropy)
     except np.linalg.LinAlgError:
         stats["entropy"] = float("nan")
 
@@ -799,6 +1081,49 @@ def compute_correlation_stats(corr_df: pd.DataFrame) -> Dict[str, float]:
 def _normal_cdf(x: float) -> float:
     """Standard normal CDF using erf."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def export_max_return_winner_counts(
+    returns_df: pd.DataFrame,
+    csv_path: Path,
+    fig_path: Path,
+) -> None:
+    """Count how often each asset achieves the maximum return per date.
+
+    For each row in ``returns_df`` (one date), we find the column with the
+    largest return, and count how often each asset is the winner. Rows where all
+    returns are NaN are ignored. The counts are exported as CSV and visualized
+    as a bar chart.
+    """
+    if returns_df.empty:
+        return
+    df = returns_df.copy()
+    df = df.replace([np.inf, -np.inf], np.nan)
+    # ドローダウンと同様、全 NaN 行は無視
+    df = df.dropna(how="all")
+    if df.empty:
+        return
+    # 日付ごとに最大リターンとなった列名を取得
+    winners = df.idxmax(axis=1)
+    counts = winners.value_counts()
+    # 元の並び（列順）を維持した順序で並べる
+    ordered_index = [c for c in df.columns if c in counts.index]
+    counts = counts.reindex(ordered_index, fill_value=0)
+    counts.to_csv(csv_path, header=["max_ret_wins"])
+
+    if plt is None:
+        return
+    plt.figure(figsize=(8, 4))
+    x = np.arange(len(counts.index))
+    labels = list(counts.index)
+    values = counts.to_numpy(dtype=float)
+    plt.bar(x, values, color="tab:blue", alpha=0.8)
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.ylabel("count of max-return days")
+    plt.title("How often each asset had the highest daily return")
+    plt.tight_layout()
+    plt.savefig(fig_path)
+    plt.close()
 
 
 def compute_pairwise_mean_return_tests(
@@ -1163,10 +1488,13 @@ def run_mse_and_bias_analysis(
     if plot_df.empty or plt is None:
         return
 
-    # MSE vs Sharpe scatter
+    # バイアス関連図の保存先ディレクトリ
+    bias_fig_dir = analysis_fig_dir / "bias_analysis"
+    bias_fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # R^2 vs Sharpe scatter (summary の R^2 を使用)
     plt.figure()
-    max_mse = float(plot_df["mse"].max(skipna=True)) if "mse" in plot_df.columns else float("nan")
-    default_x = 0.0 if not np.isfinite(max_mse) else max_mse * 1.05
+    # R^2 が存在しない場合はプロットできないのでスキップ
     for model, row in plot_df.iterrows():
         # ベンチマーク系は散布図から除外（SPY, 1/N）
         mstr = str(model)
@@ -1175,20 +1503,19 @@ def run_mse_and_bias_analysis(
             or mstr in {"1/N", "[SPY]", "benchmark_SPY", "Buy&Hold SPY"}
         ):
             continue
-        x = row.get("mse", np.nan)
+        x = row.get("r2", np.nan)
         if not np.isfinite(x):
-            # MSE が定義されないベンチマーク（1/N など）は右端にプロット
-            x = default_x
+            continue
         y = row.get("sharpe", np.nan)
         if not np.isfinite(y):
             continue
         plt.scatter(x, y)
         plt.text(x, y, model, fontsize=8)
-    plt.xlabel("Prediction MSE (per step)")
+    plt.xlabel("Out-of-sample $R^2$ (per asset)")
     plt.ylabel("Sharpe ratio (annualized)")
-    plt.title("Prediction accuracy vs decision quality")
+    plt.title("Predictive fit vs decision quality")
     plt.tight_layout()
-    plt.savefig(analysis_fig_dir / "mse_vs_sharpe_scatter.png")
+    plt.savefig(bias_fig_dir / "mse_vs_sharpe_scatter.png")
     plt.close()
 
     # Bias-related analyses
@@ -1208,31 +1535,51 @@ def run_mse_and_bias_analysis(
     if plt is not None:
         try:
             plt.figure(figsize=(8, 5))
-            # Up/Down をモデル横断で 2 つの箱ひげに集約。
-            down_bias = df[df["updown"] == "Down"]["bias"].to_numpy()
-            up_bias = df[df["updown"] == "Up"]["bias"].to_numpy()
+            # 各モデルごとに Down（赤）/Up（緑）の箱ひげを並べる
+            models_order = sorted(df["model"].unique())
+            positions: List[float] = []
             data: List[np.ndarray] = []
-            labels: List[str] = []
-            colors = []
-            if down_bias.size:
-                data.append(down_bias)
-                labels.append("Down")
-                colors.append("red")
-            if up_bias.size:
-                data.append(up_bias)
-                labels.append("Up")
-                colors.append("green")
+            colors: List[str] = []
+            width = 0.15
+            x_base = np.arange(len(models_order))
+            for i, m in enumerate(models_order):
+                sub_m = df[df["model"] == m]
+                down_bias = sub_m[sub_m["updown"] == "Down"]["bias"].to_numpy()
+                up_bias = sub_m[sub_m["updown"] == "Up"]["bias"].to_numpy()
+                if down_bias.size:
+                    positions.append(x_base[i] - width)
+                    data.append(down_bias)
+                    colors.append("red")
+                if up_bias.size:
+                    positions.append(x_base[i] + width)
+                    data.append(up_bias)
+                    colors.append("green")
             if data:
-                box = plt.boxplot(data, labels=labels, patch_artist=True)
+                box = plt.boxplot(
+                    data,
+                    positions=positions,
+                    widths=width * 1.6,
+                    patch_artist=True,
+                )
                 for patch, c in zip(box["boxes"], colors):
                     patch.set_facecolor(c)
                     patch.set_alpha(0.6)
+            # x 軸はモデル名のみ表示
+            display_labels = [display_model_name(m) for m in models_order]
+            plt.xticks(x_base, display_labels, rotation=45, ha="right")
+            # 色の意味は凡例で示す
+            from matplotlib.patches import Patch  # type: ignore
+            legend_handles = [
+                Patch(facecolor="red", alpha=0.6, label="Down"),
+                Patch(facecolor="green", alpha=0.6, label="Up"),
+            ]
+            plt.legend(handles=legend_handles, loc="upper right")
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
             plt.ylabel("Bias = pred_ret - real_ret")
             plt.title("Prediction bias by Up/Down group")
             plt.yscale("symlog", linthresh=1e-2)
             plt.tight_layout()
-            plt.savefig(analysis_fig_dir / "updown_bias_boxplot.png")
+            plt.savefig(bias_fig_dir / "updown_bias_boxplot.png")
         except Exception as exc:  # pragma: no cover - 図生成失敗時も後続解析は続行
             print(f"[analysis] updown bias boxplot failed: {exc}")
         finally:
@@ -1253,31 +1600,49 @@ def run_mse_and_bias_analysis(
     if plt is not None:
         try:
             plt.figure(figsize=(8, 5))
-            # IN/OUT もモデル横断で 2 つの箱ひげに集約。
-            out_bias = df[df["inout"] == "OUT"]["bias"].to_numpy()
-            in_bias = df[df["inout"] == "IN"]["bias"].to_numpy()
+            # 各モデルごとに OUT（赤）/IN（緑）の箱ひげを並べる
+            models_order = sorted(df["model"].unique())
+            positions: List[float] = []
             data: List[np.ndarray] = []
-            labels: List[str] = []
-            colors = []
-            if out_bias.size:
-                data.append(out_bias)
-                labels.append("OUT")
-                colors.append("red")
-            if in_bias.size:
-                data.append(in_bias)
-                labels.append("IN")
-                colors.append("green")
+            colors: List[str] = []
+            width = 0.15
+            x_base = np.arange(len(models_order))
+            for i, m in enumerate(models_order):
+                sub_m = df[df["model"] == m]
+                out_bias = sub_m[sub_m["inout"] == "OUT"]["bias"].to_numpy()
+                in_bias = sub_m[sub_m["inout"] == "IN"]["bias"].to_numpy()
+                if out_bias.size:
+                    positions.append(x_base[i] - width)
+                    data.append(out_bias)
+                    colors.append("red")
+                if in_bias.size:
+                    positions.append(x_base[i] + width)
+                    data.append(in_bias)
+                    colors.append("green")
             if data:
-                box = plt.boxplot(data, labels=labels, patch_artist=True)
+                box = plt.boxplot(
+                    data,
+                    positions=positions,
+                    widths=width * 1.6,
+                    patch_artist=True,
+                )
                 for patch, c in zip(box["boxes"], colors):
                     patch.set_facecolor(c)
                     patch.set_alpha(0.6)
+            display_labels = [display_model_name(m) for m in models_order]
+            plt.xticks(x_base, display_labels, rotation=45, ha="right")
+            from matplotlib.patches import Patch  # type: ignore
+            legend_handles = [
+                Patch(facecolor="red", alpha=0.6, label="OUT"),
+                Patch(facecolor="green", alpha=0.6, label="IN"),
+            ]
+            plt.legend(handles=legend_handles, loc="upper right")
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
             plt.ylabel("Bias = pred_ret - real_ret")
             plt.title("Prediction bias for IN/OUT assets")
             plt.yscale("symlog", linthresh=1e-2)
             plt.tight_layout()
-            plt.savefig(analysis_fig_dir / "inout_bias_boxplot.png")
+            plt.savefig(bias_fig_dir / "inout_bias_boxplot.png")
         except Exception as exc:  # pragma: no cover
             print(f"[analysis] inout bias boxplot failed: {exc}")
         finally:
@@ -1289,13 +1654,13 @@ def run_mse_and_bias_analysis(
         # まだ display_model_name を通していない実験では "flex" ラベルを拾う
         flex_models = [m for m in df["model"].unique() if "flex" in str(m)]
     if plt is not None and flex_models:
-        # 共通のビンを決める（全体の 1〜99% 区間）
-        bias_q01 = float(df["bias"].quantile(0.01))
-        bias_q99 = float(df["bias"].quantile(0.99))
-        if not np.isfinite(bias_q01) or not np.isfinite(bias_q99) or bias_q01 == bias_q99:
-            bias_q01, bias_q99 = -0.1, 0.1
+        # 共通のビンを決める（全体の最小値〜最大値）
+        bias_min = float(df["bias"].min())
+        bias_max = float(df["bias"].max())
+        if not np.isfinite(bias_min) or not np.isfinite(bias_max) or bias_min == bias_max:
+            bias_min, bias_max = -0.1, 0.1
         # 分布形状をなめらかに見るため、ビン数はやや多めに設定
-        bins = np.linspace(bias_q01, bias_q99, 80)
+        bins = np.linspace(bias_min, bias_max, 80)
 
         # Up/Down ヒストグラム
         n = len(flex_models)
@@ -1328,7 +1693,7 @@ def run_mse_and_bias_analysis(
                 )
             ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
             ax.set_title(model)
-            ax.set_xlim(bias_q01, bias_q99)
+            ax.set_xlim(bias_min, bias_max)
             ax.set_yscale("log")
         axes[0].set_ylabel("Density (log scale)")
         # 凡例は最初の軸にまとめて表示
@@ -1336,7 +1701,7 @@ def run_mse_and_bias_analysis(
         if handles:
             axes[0].legend(handles, labels, loc="upper right")
         fig.tight_layout()
-        fig.savefig(analysis_fig_dir / "updown_bias_hist_flex.png")
+        fig.savefig(bias_fig_dir / "updown_bias_hist_flex.png")
         plt.close(fig)
 
         # IN/OUT ヒストグラム
@@ -1369,14 +1734,14 @@ def run_mse_and_bias_analysis(
                 )
             ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
             ax.set_title(model)
-            ax.set_xlim(bias_q01, bias_q99)
+            ax.set_xlim(bias_min, bias_max)
             ax.set_yscale("log")
         axes[0].set_ylabel("Density (log scale)")
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             axes[0].legend(handles, labels, loc="upper right")
         fig.tight_layout()
-        fig.savefig(analysis_fig_dir / "inout_bias_hist_flex.png")
+        fig.savefig(bias_fig_dir / "inout_bias_hist_flex.png")
         plt.close(fig)
 
     # Top/Bottom bias timeseries
