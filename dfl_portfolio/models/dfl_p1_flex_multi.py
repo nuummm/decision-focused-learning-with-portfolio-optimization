@@ -26,7 +26,7 @@ import pyomo.environ as pyo
 
 from dfl_portfolio.models.dfl_p1_flex import _prepare_pairs, _solver_metadata, SolverMeta
 from dfl_portfolio.models.ols_multi import train_ols_multi, predict_yhat_multi
-from dfl_portfolio.optimization.solvers import make_pyomo_solver
+from dfl_portfolio.optimization.solvers import make_pyomo_solver, cleanup_knitro_logs
 
 
 def fit_dfl_p1_flex_multi(
@@ -244,6 +244,7 @@ def fit_dfl_p1_flex_multi(
 
     opt = make_pyomo_solver(m, solver=solver, tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
+    cleanup_knitro_logs()
     meta = _solver_metadata(opt, res, solver)
 
     theta_hat = np.zeros((d, K), dtype=float)
@@ -265,4 +266,3 @@ def fit_dfl_p1_flex_multi(
 
 
 __all__ = ["fit_dfl_p1_flex_multi", "SolverMeta"]
-

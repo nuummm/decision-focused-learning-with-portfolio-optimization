@@ -112,6 +112,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--delta", type=parse_delta_0_1, default=0.5)
+    parser.add_argument(
+        "--delta-up",
+        type=str,
+        default=None,
+        help=(
+            "Risk aversion used in the objective (default falls back to --delta). "
+            "Accepts a single value in [0,1]."
+        ),
+    )
+    parser.add_argument(
+        "--delta-down",
+        type=str,
+        default=None,
+        help=(
+            "Risk aversion dedicated to DFL constraint terms. Accepts either a single "
+            "value or a comma-separated grid (each in [0,1]). Defaults to delta-up."
+        ),
+    )
     parser.add_argument("--models", type=str, default="ols,ipo,flex")
     parser.add_argument("--flex-solver", type=str, default="knitro")
     parser.add_argument(
@@ -123,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(e.g., 'dual', 'dual,kkt', or 'dual,kkt,dual&kkt' for dual/kkt+ensemble)."
         ),
     )
-    parser.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0)
+    parser.add_argument("--flex-lambda-theta-anchor", type=float, default=10.0)
     parser.add_argument("--flex-lambda-theta-iso", type=float, default=0.0)
     parser.add_argument("--flex-theta-anchor-mode", type=str, default="ipo")
     parser.add_argument("--flex-theta-init-mode", type=str, default="none")
@@ -147,7 +165,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--tee", action="store_true")
-    parser.add_argument("--debug-roll", action="store_true")
+    parser.add_argument(
+        "--debug-roll",
+        dest="debug_roll",
+        action="store_true",
+        default=True,
+        help="Enable rolling-debug progress output (enabled by default).",
+    )
+    parser.add_argument(
+        "--no-debug-roll",
+        dest="debug_roll",
+        action="store_false",
+        help="Disable rolling-debug progress output.",
+    )
     parser.add_argument(
         "--benchmark-ticker",
         type=str,
@@ -156,8 +186,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--benchmark-equal-weight",
+        dest="benchmark_equal_weight",
         action="store_true",
-        help="Include a 1/N equal-weighted portfolio benchmark built from all tickers.",
+        default=True,
+        help="Include a 1/N equal-weighted portfolio benchmark built from all tickers (enabled by default).",
+    )
+    parser.add_argument(
+        "--no-benchmark-equal-weight",
+        dest="benchmark_equal_weight",
+        action="store_false",
+        help="Disable the equal-weighted benchmark.",
     )
 
     parser.add_argument("--outdir", type=Path, default=None)

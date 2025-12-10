@@ -53,6 +53,7 @@ from dfl_portfolio.real_data.reporting import (
     plot_weight_comparison,
     plot_weight_histograms,
     plot_weight_paths,
+    plot_delta_paths,
     update_experiment_ledger,
     run_extended_analysis,
     summarize_dfl_performance_significance,
@@ -84,13 +85,15 @@ def train_model_window(
     model_key: str,
     trainer,
     bundle,
-    delta: float,
+    delta_up: float,
+    delta_down: float,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     train_start: int,
     train_end: int,
     tee: bool,
 ):
+    delta_for_training = delta_down if model_key == "flex" else delta_up
     trainer_kwargs: Dict[str, object] = dict(
         X=bundle.dataset.X,
         Y=bundle.dataset.Y,
@@ -98,13 +101,13 @@ def train_model_window(
         idx=bundle.cov_indices.tolist(),
         start_index=train_start,
         end_index=train_end,
-        delta=delta,
+        delta=delta_for_training,
         tee=tee,
     )
     theta_init_override: Optional[np.ndarray] = None
     if model_key == "flex" and flex_options:
         theta_init_override, resolved_flex = prepare_flex_training_args(
-            bundle, train_start, train_end, delta, tee, flex_options
+            bundle, train_start, train_end, delta_for_training, tee, flex_options
         )
         trainer_kwargs.update(resolved_flex)
     if theta_init_override is not None:
@@ -122,11 +125,36 @@ def train_model_window(
     return theta_hat, info, elapsed
 
 
+def _parse_delta_list(value: object, fallback: float, *, allow_multiple: bool) -> List[float]:
+    if value is None:
+        return [fallback]
+    if isinstance(value, (int, float)):
+        values = [float(value)]
+    else:
+        text = str(value).strip()
+        if not text:
+            return [fallback]
+        tokens = [tok.strip() for tok in text.split(",") if tok.strip()]
+        if not tokens:
+            raise ValueError("delta value list must contain at least one numeric entry.")
+        try:
+            values = [float(tok) for tok in tokens]
+        except ValueError as exc:
+            raise ValueError(f"Invalid delta specification '{value}'. Expected comma-separated floats.") from exc
+    for v in values:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"delta values must be within [0,1]; got {v}")
+    if not allow_multiple and len(values) > 1:
+        raise ValueError("Multiple values are not allowed for this delta option.")
+    return values
+
+
 def run_rolling_experiment(
     model_key: str,
     model_label: str,
     bundle,
-    delta: float,
+    delta_up: float,
+    delta_down_candidates: Sequence[float],
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     train_window: int,
@@ -155,20 +183,60 @@ def run_rolling_experiment(
     step_rows: List[Dict[str, object]] = []
     rebalance_rows: List[Dict[str, object]] = []
     asset_rows: List[Dict[str, object]] = []
+    delta_history: List[Dict[str, object]] = []
 
     total_cycles = len(schedule)
     for cycle_id, item in enumerate(schedule):
-        theta_hat, info, elapsed = train_model_window(
-            model_key,
-            trainer,
-            bundle,
-            delta,
-            solver_spec,
-            flex_options,
-            item.train_start,
-            item.train_end,
-            tee,
+        candidate_list = (
+            list(delta_down_candidates) if model_key == "flex" else [delta_down_candidates[0]]
         )
+        selected_delta_down = candidate_list[0]
+        train_objective = float("nan")
+        grid_stats: List[Dict[str, float]] = []
+        if model_key == "flex" and len(candidate_list) > 1:
+            best: Optional[Tuple[np.ndarray, Dict[str, object], float, float]] = None
+            elapsed_total = 0.0
+            for cand in candidate_list:
+                theta_hat_c, info_c, elapsed_c = train_model_window(
+                    model_key,
+                    trainer,
+                    bundle,
+                    delta_up,
+                    cand,
+                    solver_spec,
+                    flex_options,
+                    item.train_start,
+                    item.train_end,
+                    tee,
+                )
+                elapsed_total += elapsed_c
+                obj_raw = info_c.get("objective_value") if isinstance(info_c, dict) else None
+                obj_val = float(obj_raw) if obj_raw is not None else float("inf")
+                grid_stats.append({"delta_down": float(cand), "objective": float(obj_val)})
+                if best is None or obj_val < best[2]:
+                    best = (theta_hat_c, info_c, obj_val, cand)
+            if best is None:
+                raise RuntimeError("Delta grid search failed to produce a valid solution.")
+            theta_hat, info, train_objective, selected_delta_down = best
+            elapsed = elapsed_total
+        else:
+            selected_delta = candidate_list[0]
+            theta_hat, info, elapsed = train_model_window(
+                model_key,
+                trainer,
+                bundle,
+                delta_up,
+                selected_delta,
+                solver_spec,
+                flex_options,
+                item.train_start,
+                item.train_end,
+                tee,
+            )
+            obj_raw = info.get("objective_value") if isinstance(info, dict) else None
+            train_objective = float(obj_raw) if obj_raw is not None else float("nan")
+            grid_stats.append({"delta_down": float(selected_delta), "objective": train_objective})
+            selected_delta_down = selected_delta
         Yhat_all = predict_yhat(bundle.dataset.X, theta_hat)
 
         if debug_roll:
@@ -193,8 +261,23 @@ def run_rolling_experiment(
                 "solver_status": (info or {}).get("status", ""),
                 "solver_term": (info or {}).get("termination_condition", ""),
                 "elapsed_sec": elapsed,
+                "delta_down_selected": float(selected_delta_down),
+                "train_objective": float(train_objective),
             }
         )
+
+        if model_key == "flex":
+            delta_history.append(
+                {
+                    "model": display_model_name(model_label),
+                    "cycle": cycle_id,
+                    "rebalance_idx": item.rebalance_idx,
+                    "rebalance_date": bundle.dataset.timestamps[item.rebalance_idx].isoformat(),
+                    "delta_used": float(selected_delta_down),
+                    "objective_value": float(train_objective),
+                    "delta_candidates": json.dumps(grid_stats, ensure_ascii=False),
+                }
+            )
 
         if not wealth_dates and item.eval_indices:
             wealth_dates.append(bundle.dataset.timestamps[item.eval_indices[0]])
@@ -209,7 +292,7 @@ def run_rolling_experiment(
             z = solve_mvo_gurobi(
                 y_hat=yhat,
                 V_hat=cov,
-                delta=delta,
+                delta=delta_up,
                 psd_eps=1e-9,
                 output=False,
             )
@@ -221,7 +304,7 @@ def run_rolling_experiment(
             wealth_values.append(wealth)
             wealth_labels.append("after_step")
 
-            cost = mvo_cost(z, bundle.dataset.Y[eval_idx], cov, delta)
+            cost = mvo_cost(z, bundle.dataset.Y[eval_idx], cov, delta_up)
             step_rows.append(
                 {
                     "cycle": cycle_id,
@@ -408,6 +491,7 @@ def run_rolling_experiment(
         "weights_df": weights_df,
         "rebalance_df": rebalance_df,
         "rebalance_summary": reb_summary,
+        "delta_history": delta_history,
     }
 
 
@@ -430,8 +514,14 @@ def main() -> None:
     model_outputs_dir.mkdir(parents=True, exist_ok=True)
 
     # Safety check: delta in [0,1] (enforced by CLI type) and IPO+delta=0 is invalid
-    if args.delta < 0.0 or args.delta > 1.0:
-        raise ValueError(f"delta must be in [0, 1], got {args.delta}")
+    base_delta = float(args.delta)
+    if base_delta < 0.0 or base_delta > 1.0:
+        raise ValueError(f"delta must be in [0, 1], got {base_delta}")
+    cli_delta_up = getattr(args, "delta_up", None)
+    cli_delta_down = getattr(args, "delta_down", None)
+    delta_up_list = _parse_delta_list(cli_delta_up, base_delta, allow_multiple=False)
+    delta_up = float(delta_up_list[0])
+    delta_down_list = _parse_delta_list(cli_delta_down, delta_up, allow_multiple=True)
 
     flex_forms_raw = parse_commalist(args.flex_formulation)
     if not flex_forms_raw:
@@ -550,6 +640,7 @@ def main() -> None:
     rebalance_records: List[Dict[str, object]] = []
     # flex モデルのサイクルごとの rebalance ログ（solver 状態の時系列可視化用）
     flex_rebalance_logs: List[pd.DataFrame] = []
+    delta_records: List[Dict[str, object]] = []
 
     flex_base_options = dict(
         lambda_theta_anchor=args.flex_lambda_theta_anchor,
@@ -601,7 +692,8 @@ def main() -> None:
                 model_key=model_key,
                 model_label=label,
                 bundle=bundle,
-                delta=args.delta,
+                delta_up=delta_up,
+                delta_down_candidates=delta_down_list,
                 solver_spec=solver_spec,
                 flex_options=flex_options,
                 train_window=effective_train_window,
@@ -614,6 +706,10 @@ def main() -> None:
                 eval_start=eval_start_ts,
             )
             stats_results.append(run_result["stats"])
+            if model_key == "flex":
+                hist = run_result.get("delta_history", [])
+                if hist:
+                    delta_records.extend(hist)
             reb_df = run_result.get("rebalance_df", pd.DataFrame())
             if model_key == "flex" and isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
                 flex_rebalance_logs.append(reb_df.copy())
@@ -950,6 +1046,7 @@ def main() -> None:
                     plot_weight_comparison(
                         sub_weights,
                         weights_5y_dir / f"weights_comparison_5y_{window_label}.png",
+                        max_points=None,
                     )
                 start_win = start_win + pd.DateOffset(years=5)
         export_weight_variance_correlation(
@@ -980,6 +1077,10 @@ def main() -> None:
     if flex_rebalance_logs:
         flex_debug_df = pd.concat(flex_rebalance_logs, ignore_index=True)
         plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
+    if delta_records:
+        delta_df = pd.DataFrame(delta_records)
+        delta_df.to_csv(analysis_csv_dir / "delta_trajectory.csv", index=False)
+        plot_delta_paths(delta_df, analysis_fig_dir / "delta_paths.png")
     if not summary_df.empty:
         update_experiment_ledger(RESULTS_ROOT, outdir, args, summary_df, analysis_csv_dir, bundle_summary)
 
@@ -994,115 +1095,73 @@ if __name__ == "__main__":  # pragma: no cover
     main()
 
 """
+Baseline execution (defaults match the CLI parser):
 
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.real_data_run \
-  --tickers "SPY,GLD,EEM,TLT" \
+  --tickers "SPY,GLD,EURUSD=X,TLT" \
   --start 2006-01-01 --end 2025-12-01 \
-  --frequency weekly \
-  --resample-rule W-FRI \
   --momentum-window 26 \
-  --return-horizon 1 \
   --cov-window 13 \
   --cov-method oas \
-  --cov-ewma-alpha 0.97 \
   --train-window 26 \
   --rebal-interval 4 \
-  --delta 0.5 \
+  --delta-up 0.5 \
+  --delta-down 0.5 \
   --models ols,ipo,flex \
   --flex-solver knitro \
   --flex-formulation 'dual,kkt,dual&kkt' \
-  --flex-ensemble-weight-dual 0.5 \
   --flex-lambda-theta-anchor 10.0 \
   --flex-theta-anchor-mode ipo \
-  --flex-theta-init-mode none \
   --benchmark-ticker SPY \
   --benchmark-equal-weight \
   --debug-roll
 
-cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
-
-python -m dfl_portfolio.experiments.real_data_run \
-  --tickers "SPY,TLT,GLD,EURUSD=X" \
-  --start 2006-01-01 --end 2025-12-01 \
-  --frequency weekly \
-  --resample-rule W-FRI \
-  --momentum-window 26 \
-  --return-horizon 1 \
-  --cov-window 13 \
-  --cov-method oas \
-  --cov-ewma-alpha 0.97 \
-  --train-window 26 \
-  --rebal-interval 4 \
-  --delta 0.5 \
-  --models ols,ipo,flex \
-  --flex-solver knitro \
-  --flex-formulation 'dual,kkt,dual&kkt' \
-  --flex-ensemble-weight-dual 0.5 \
-  --flex-lambda-theta-anchor 10.0 \
-  --flex-theta-anchor-mode ipo \
-  --flex-theta-init-mode none \
-  --benchmark-ticker SPY \
-  --benchmark-equal-weight \
-  --debug-roll
-  
+CLI options (defaults follow the parser definitions)
+---------------------------------------------------
 データ取得・前処理
+- `--tickers` (str, default `SPY,GLD,EEM,TLT`): 任意のティッカーをカンマ区切りで指定。
+- `--start` / `--end` (str, default `2006-01-01` / `2025-12-01`): 取得期間。
+- `--interval` (str, default `1d`): Yahoo Finance から取得する原系列の足（`1d`, `1wk` など）。
+- `--price-field` (str, default `Close`): 使用する価格列。
+- `--return-kind` (str, `simple|log`, default `log`): 目的変数のリターン種別。
+- `--frequency` (str, `daily|weekly|monthly`, default `weekly`): リバランス頻度。
+- `--resample-rule` (str, default `W-FRI`): pandas resample ルール。
+- `--momentum-window` (int, default `26`): モメンタム特徴の計算窓。
+- `--return-horizon` (int, default `1`): 何期間先のリターンを予測するか。
+- `--no-auto-adjust`: 調整後リターン補正を無効化。
+- `--force-refresh`: 価格キャッシュを無視して再取得。
 
---tickers (str, default SPY,TLT,DBC,BIL)
---start (str, default 2010-01-01)
---end (str, default 2024-12-31)
---interval (str, default 1d)
-Yahoo Finance から価格を取るときの元データの足。1d なら日足、1wk なら週足。
---price-field (str, default Close)
---return-kind (str, simple|log, default log)
---frequency (str, daily|weekly, default weekly)
---resample-rule (str, default W-FRI)
---momentum-window (int, default 52)
---return-horizon (int, default 1)
-何期間先のリターンを予測するか。1 なら 1 期間先のリターンが目的変数 Y。
---no-auto-adjust (flag, default False)
---force-refresh (flag, default False)
 共分散推定
+- `--cov-window` (int, default `13`): 共分散計算のローリング窓。
+- `--cov-method` (str, `diag|oas|robust_lw|mini_factor`, default `oas`).
+- `--cov-shrinkage` (float, default `0.94`), `--cov-eps` (`1e-6`), `--cov-robust-huber-k` (`1.5`),
+  `--cov-factor-rank` (`1`), `--cov-factor-shrinkage` (`0.5`): method 固有の調整。
+- `--cov-ewma-alpha` (float, default `0.97`): OAS+EWMA での減衰率。
 
---cov-window (int, default 60)
---cov-method (str, diag|oas|robust_lw|mini_factor, default diag)
---cov-shrinkage (float, default 0.94)
---cov-eps (float, default 1e-6)
---cov-robust-huber-k (float, default 1.5)
---cov-factor-rank (int, default 1)
---cov-factor-shrinkage (float, default 0.5)
---cov-ewma-alpha (float, default 0.94)
 ローリング設定
+- `--train-window` (int, default `26`)
+- `--rebal-interval` (int, default `4`)
+- `--model-train-window` (str, default `""`): 例 `ols:60,flex:40`。
 
---train-window (int, default 25)
---rebal-interval (int, default 1)
---model-train-window (str, default "")
-例: ols:60,flex (line 25) のようにモデルごとの学習窓を上書き。
 モデル・Flex 設定
+- `--delta` (float ∈ [0,1], default `0.5`): 後方互換の基準 δ。`--delta-up`/`--delta-down` が未指定のときに利用。
+- `--delta-up` (float ∈ [0,1], default `None` → `--delta`): 目的関数の (1-δ) リターン + δ リスク の重み。
+- `--delta-down` (float ∈ [0,1], default `None` → `--delta-up`): DFL 制約部で用いる δ。
+- `--models` (str, default `ols,ipo,flex`): 実行するモデルリスト。
+- `--flex-solver` (str, default `knitro`).
+- `--flex-formulation` (str, default `dual,kkt,dual&kkt`): dual / kkt / dual&kkt ensemble。
+- `--flex-ensemble-weight-dual` (float ∈ [0,1], default `0.5`).
+- `--flex-lambda-theta-anchor` (float, default `10.0`) / `--flex-lambda-theta-iso` (float, default `0.0`).
+- `--flex-theta-anchor-mode` (str, default `ipo`), `--flex-theta-init-mode` (str, default `none`).
+- `--flex-lambda-phi-anchor` (float, default `0.0`): V-learning 用 phi 係数のアンカー。
 
---delta (float, default 0.5, 範囲 [0,1])
-目的関数の (1-δ)リターン + δリスク の重み。
---models (str, default ols,ipo,flex)
---flex-solver (str, default gurobi)
---flex-formulation (str, default dual)
-dual … DFL-P dual 版
-kkt … DFL-P KKT 版
-dual,kkt … dual と kkt の両方を評価
-dual,kkt,dual&kkt … dual/kkt に加え、両者のアンサンブルも評価
---flex-ensemble-weight-dual (float, default 0.5, 範囲 [0,1])
-アンサンブルの重み w_dual。
-w_ens = w_dual * w_dual_model + (1 - w_dual) * w_kkt_model。
---flex-lambda-theta-anchor (float, default 0.0)
---flex-lambda-theta-iso (float, default 0.0)
---flex-theta-anchor-mode (str, default ols)
---flex-theta-init-mode (str, default ols)
 実行制御・出力
-
---tee (flag) … ソルバログ表示
---debug-roll (flag) … ローリング進捗ログ表示
---benchmark-ticker (str, default SPY)
---benchmark-equal-weight (flag) … 等配分ベンチマークを計算・表示
---outdir (Path, default None → results/exp_real_data/<timestamp> 配下)
---no-debug (flag) … ローダ・パイプラインのデバッグ出力を抑制
+- `--tee`: ソルバログを表示。
+- `--debug-roll` / `--no-debug-roll`: ローリング進捗ログの表示（デフォルト有効）。
+- `--benchmark-ticker` (str, default `SPY`).
+- `--benchmark-equal-weight` / `--no-benchmark-equal-weight`: 等配分ベンチマーク（デフォルト有効）。
+- `--outdir` (Path, default `None` → `results/exp_real_data/<timestamp>` に自動作成)。
+- `--no-debug`: データローダのデバッグログを抑止。
 """

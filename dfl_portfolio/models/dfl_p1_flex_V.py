@@ -6,7 +6,7 @@ from typing import Optional, Sequence, Tuple, List
 import numpy as np
 import pyomo.environ as pyo
 
-from dfl_portfolio.optimization.solvers import make_pyomo_solver
+from dfl_portfolio.optimization.solvers import make_pyomo_solver, cleanup_knitro_logs
 from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
 from dfl_portfolio.models.ols import train_ols, predict_yhat
 from dfl_portfolio.models.ols_gurobi import solve_series_mvo_gurobi
@@ -336,7 +336,12 @@ def fit_dfl_p1_flex_V(
     # Knitro 固定で解く
     opt = make_pyomo_solver(m, solver="knitro", tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
+    cleanup_knitro_logs()
     meta = _solver_metadata(opt, res, "knitro")
+    try:
+        meta["objective_value"] = float(pyo.value(m.obj))
+    except Exception:
+        meta["objective_value"] = None
     meta["phi_hat"] = float(pyo.value(m.phi))
     meta["phi_anchor"] = float(phi_anchor_val)
 

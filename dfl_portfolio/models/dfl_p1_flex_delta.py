@@ -20,7 +20,7 @@ from typing import Optional, Sequence, Tuple, List
 import numpy as np
 import pyomo.environ as pyo
 
-from dfl_portfolio.optimization.solvers import make_pyomo_solver
+from dfl_portfolio.optimization.solvers import make_pyomo_solver, cleanup_knitro_logs
 from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
 from dfl_portfolio.models.ols import train_ols, predict_yhat
 from dfl_portfolio.models.ols_gurobi import solve_series_mvo_gurobi
@@ -105,9 +105,8 @@ def fit_dfl_p1_flex_delta(
     lambda_theta_iso: float = 0.0,
     delta_min: float = 0.01,
     delta_max: float = 0.99,
-    lambda_delta_center: float = 0.0,
-    lambda_delta_smooth: float = 0.0,
-    delta_prev: Optional[float] = None,
+    lambda_delta_up: float = 0.0,
+    delta_up: Optional[float] = None,
 ):
     """
     DFL-P1 flex (dual/KKT) with learnable delta (experimental).
@@ -126,6 +125,10 @@ def fit_dfl_p1_flex_delta(
     if not (0.0 <= delta_min < delta_max <= 1.0):
         raise ValueError("delta_min/max must satisfy 0 <= delta_min < delta_max <= 1")
 
+    delta_down_init = float(delta)
+    delta_up_const = float(delta_up) if delta_up is not None else float(delta_down_init)
+    delta_up_const = float(np.clip(delta_up_const, 0.0, 1.0))
+
     X = np.asarray(X, float)
     Y = np.asarray(Y, float)
     d = X.shape[1]
@@ -140,11 +143,7 @@ def fit_dfl_p1_flex_delta(
     lam_theta_l2 = float(lambda_theta_anchor)
     lam_theta_l1 = float(lambda_theta_anchor_l1)
     lam_theta_iso = float(lambda_theta_iso)
-    lambda_delta_center = float(lambda_delta_center)
-    lambda_delta_smooth = float(lambda_delta_smooth)
-    # 事前の中心値は 0.5 に固定
-    delta0_const = 0.5
-    delta_prev_val = float(delta_prev) if delta_prev is not None else delta0_const
+    lambda_delta_up = float(lambda_delta_up)
     theta_anchor_vec = None
     if lam_theta_l2 > 0.0 or lam_theta_l1 > 0.0:
         if theta_anchor is None:
@@ -207,7 +206,8 @@ def fit_dfl_p1_flex_delta(
     def V_ini(m, t, j, k): return float(V_list[int(t)][int(j), int(k)])
 
     # learnable delta in [delta_min, delta_max]
-    delta_init = float(np.clip(delta, delta_min, delta_max))
+    delta_init = float(np.clip(delta_down_init, delta_min, delta_max))
+    delta_obj_const = float(delta_up_const)
     m.delta = pyo.Var(bounds=(delta_min, delta_max), initialize=delta_init)
     m.x = pyo.Param(m.T, m.J, initialize=x_ini)
     m.y = pyo.Param(m.T, m.J, initialize=y_ini)
@@ -299,7 +299,7 @@ def fit_dfl_p1_flex_delta(
         for t in m.T:
             lin = sum(m.y[t, j] * m.w[t, j] for j in m.J)
             quad = sum(m.w[t, j] * sum(m.V[t, j, k] * m.w[t, k] for k in m.J) for j in m.J)
-            total += -(1.0 - m.delta) * lin + 0.5 * m.delta * quad
+            total += -(1.0 - delta_obj_const) * lin + 0.5 * delta_obj_const * quad
         total = total / float(T_used)
 
         if lam_theta_l2 > 0.0 and theta_anchor_vec is not None:
@@ -311,10 +311,8 @@ def fit_dfl_p1_flex_delta(
             total += 0.5 * lam_theta_iso * sum(m.theta[j] ** 2 for j in m.J)
 
         # delta に対する正則化項
-        if lambda_delta_center > 0.0:
-            total += 0.5 * lambda_delta_center * (m.delta - delta0_const) ** 2
-        if lambda_delta_smooth > 0.0:
-            total += 0.5 * lambda_delta_smooth * (m.delta - delta_prev_val) ** 2
+        if lambda_delta_up > 0.0:
+            total += 0.5 * lambda_delta_up * (m.delta - delta_up_const) ** 2
 
         return total
 
@@ -332,6 +330,7 @@ def fit_dfl_p1_flex_delta(
 
     opt = make_pyomo_solver(m, solver=solver, tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
+    cleanup_knitro_logs()
     meta = _solver_metadata(opt, res, solver)
 
     theta_hat = np.array([pyo.value(m.theta[j]) for j in m.J], dtype=float)

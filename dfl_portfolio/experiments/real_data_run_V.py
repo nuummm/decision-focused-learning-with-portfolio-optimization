@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import math
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,7 @@ from dfl_portfolio.real_data.reporting import (
     export_average_weights,
     export_weight_threshold_frequency,
     export_weight_variance_correlation,
+    export_max_return_winner_counts,
     max_drawdown,
     plot_asset_correlation,
     plot_flex_solver_debug,
@@ -53,6 +55,7 @@ from dfl_portfolio.real_data.reporting import (
     plot_weight_paths,
     plot_phi_paths,
     plot_beta_paths,
+    plot_delta_paths,
     update_experiment_ledger,
     run_extended_analysis,
     summarize_dfl_performance_significance,
@@ -81,11 +84,23 @@ logging.getLogger("pyomo").setLevel(logging.ERROR)
 logging.getLogger("pyomo.solvers").setLevel(logging.ERROR)
 
 
+def mirror_to_analysis_root(src: Path, analysis_dir: Path) -> None:
+    """Copy ``src`` to the parent ``analysis_dir`` for quick access."""
+
+    if not src.exists():
+        return
+    dest = analysis_dir / src.name
+    if dest == src:
+        return
+    shutil.copy2(src, dest)
+
+
 def train_model_window(
     model_key: str,
     trainer,
     bundle,
-    delta: float,
+    delta_up: float,
+    delta_down: float,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     train_start: int,
@@ -94,6 +109,7 @@ def train_model_window(
     V_sample_list: Sequence[np.ndarray],
     V_diag_list: Sequence[np.ndarray],
 ):
+    delta_for_training = delta_down if model_key == "flex" else delta_up
     idx_list = bundle.cov_indices.tolist()
     base_kwargs: Dict[str, object] = dict(
         X=bundle.dataset.X,
@@ -101,13 +117,13 @@ def train_model_window(
         idx=idx_list,
         start_index=train_start,
         end_index=train_end,
-        delta=delta,
+        delta=delta_for_training,
         tee=tee,
     )
     theta_init_override: Optional[np.ndarray] = None
     if model_key == "flex" and flex_options:
         theta_init_override, resolved_flex = prepare_flex_training_args(
-            bundle, train_start, train_end, delta, tee, flex_options
+            bundle, train_start, train_end, delta_for_training, tee, flex_options
         )
         base_kwargs.update(resolved_flex)
         # OAS×EWMA の shrinkage 係数 δ_t から、train window 上の平均を φ のアンカーにする。
@@ -154,11 +170,36 @@ def train_model_window(
     return theta_hat, info, elapsed
 
 
+def _parse_delta_list(value: object, fallback: float, *, allow_multiple: bool) -> List[float]:
+    if value is None:
+        return [fallback]
+    if isinstance(value, (int, float)):
+        values = [float(value)]
+    else:
+        text = str(value).strip()
+        if not text:
+            return [fallback]
+        tokens = [tok.strip() for tok in text.split(",") if tok.strip()]
+        if not tokens:
+            raise ValueError("delta value list must contain at least one numeric entry.")
+        try:
+            values = [float(tok) for tok in tokens]
+        except ValueError as exc:
+            raise ValueError(f"Invalid delta specification '{value}'. Expected comma-separated floats.") from exc
+    for v in values:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"delta values must be within [0,1]; got {v}")
+    if not allow_multiple and len(values) > 1:
+        raise ValueError("Multiple values are not allowed for this delta option.")
+    return values
+
+
 def run_rolling_experiment(
     model_key: str,
     model_label: str,
     bundle,
-    delta: float,
+    delta_up: float,
+    delta_down_candidates: Sequence[float],
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     train_window: int,
@@ -189,22 +230,65 @@ def run_rolling_experiment(
     step_rows: List[Dict[str, object]] = []
     rebalance_rows: List[Dict[str, object]] = []
     asset_rows: List[Dict[str, object]] = []
+    delta_history: List[Dict[str, object]] = []
 
     total_cycles = len(schedule)
     for cycle_id, item in enumerate(schedule):
-        theta_hat, info, elapsed = train_model_window(
-            model_key,
-            trainer,
-            bundle,
-            delta,
-            solver_spec,
-            flex_options,
-            item.train_start,
-            item.train_end,
-            tee,
-            V_sample_list,
-            V_diag_list,
+        candidate_list = (
+            list(delta_down_candidates) if model_key == "flex" else [delta_down_candidates[0]]
         )
+        selected_delta_down = candidate_list[0]
+        train_objective = float("nan")
+        grid_stats: List[Dict[str, float]] = []
+        if model_key == "flex" and len(candidate_list) > 1:
+            best: Optional[Tuple[np.ndarray, Dict[str, object], float, float]] = None
+            elapsed_total = 0.0
+            for cand in candidate_list:
+                theta_hat_c, info_c, elapsed_c = train_model_window(
+                    model_key,
+                    trainer,
+                    bundle,
+                    delta_up,
+                    cand,
+                    solver_spec,
+                    flex_options,
+                    item.train_start,
+                    item.train_end,
+                    tee,
+                    V_sample_list,
+                    V_diag_list,
+                )
+                elapsed_total += elapsed_c
+                obj_raw = info_c.get("objective_value") if isinstance(info_c, dict) else None
+                obj_val = float(obj_raw) if obj_raw is not None else float("inf")
+                grid_stats.append({"delta_down": float(cand), "objective": float(obj_val)})
+                if best is None or obj_val < best[2]:
+                    best = (theta_hat_c, info_c, obj_val, cand)
+            if best is None:
+                raise RuntimeError("Delta grid search failed to produce a valid solution.")
+            theta_hat, info, train_objective, selected_delta_down = best
+            elapsed = elapsed_total
+        else:
+            selected_delta = candidate_list[0]
+            theta_hat, info, elapsed = train_model_window(
+                model_key,
+                trainer,
+                bundle,
+                delta_up,
+                selected_delta,
+                solver_spec,
+                flex_options,
+                item.train_start,
+                item.train_end,
+                tee,
+                V_sample_list,
+                V_diag_list,
+            )
+            obj_raw = info.get("objective_value") if isinstance(info, dict) else None
+            train_objective = float(obj_raw) if obj_raw is not None else float("nan")
+            grid_stats.append({"delta_down": float(selected_delta), "objective": train_objective})
+            selected_delta_down = selected_delta
+        Yhat_all = predict_yhat(bundle.dataset.X, theta_hat)
         Yhat_all = predict_yhat(bundle.dataset.X, theta_hat)
 
         if debug_roll:
@@ -233,8 +317,23 @@ def run_rolling_experiment(
                 "elapsed_sec": elapsed,
                 "phi_used": float(phi_hat) if phi_hat is not None else np.nan,
                 "phi_anchor": float(phi_anchor) if phi_anchor is not None else np.nan,
+                "delta_down_selected": float(selected_delta_down),
+                "train_objective": float(train_objective),
             }
         )
+
+        if model_key == "flex":
+            delta_history.append(
+                {
+                    "model": display_model_name(model_label),
+                    "cycle": cycle_id,
+                    "rebalance_idx": item.rebalance_idx,
+                    "rebalance_date": bundle.dataset.timestamps[item.rebalance_idx].isoformat(),
+                    "delta_used": float(selected_delta_down),
+                    "objective_value": float(train_objective),
+                    "delta_candidates": json.dumps(grid_stats, ensure_ascii=False),
+                }
+            )
 
         if not wealth_dates and item.eval_indices:
             wealth_dates.append(bundle.dataset.timestamps[item.eval_indices[0]])
@@ -256,7 +355,7 @@ def run_rolling_experiment(
             z = solve_mvo_gurobi(
                 y_hat=yhat,
                 V_hat=V_used,
-                delta=delta,
+                delta=delta_up,
                 psd_eps=1e-9,
                 output=False,
             )
@@ -268,7 +367,7 @@ def run_rolling_experiment(
             wealth_values.append(wealth)
             wealth_labels.append("after_step")
 
-            cost = mvo_cost(z, bundle.dataset.Y[eval_idx], V_used, delta)
+            cost = mvo_cost(z, bundle.dataset.Y[eval_idx], V_used, delta_up)
             step_rows.append(
                 {
                     "cycle": cycle_id,
@@ -416,6 +515,7 @@ def run_rolling_experiment(
         "rebalance_df": rebalance_df,
         "cov_stats": {},
         "period_metrics": period_metrics,
+        "delta_history": delta_history,
     }
 
 
@@ -430,6 +530,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("real_data_run_V は --flex-solver knitro のみ対応です。")
 
     tickers = parse_tickers(args.tickers)
+    base_delta = float(args.delta)
+    if not (0.0 <= base_delta <= 1.0):
+        raise ValueError(f"delta must be within [0,1]; got {base_delta}")
+    cli_delta_up = getattr(args, "delta_up", None)
+    cli_delta_down = getattr(args, "delta_down", None)
+    delta_up_list = _parse_delta_list(cli_delta_up, base_delta, allow_multiple=False)
+    delta_up = float(delta_up_list[0])
+    delta_down_list = _parse_delta_list(cli_delta_down, delta_up, allow_multiple=True)
     loader_cfg = MarketLoaderConfig(
         tickers=tickers,
         start=args.start,
@@ -456,6 +564,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     pipeline_cfg = PipelineConfig(loader=loader_cfg, debug=not args.no_debug)
 
     outdir = make_output_dir(RESULTS_ROOT, args.outdir)
+    analysis_dir = outdir / "analysis"
+    analysis_csv_dir = analysis_dir / "csv"
+    analysis_fig_dir = analysis_dir / "figures"
+    asset_pred_dir = analysis_csv_dir / "asset_predictions"
+    model_outputs_dir = outdir / "models"
     debug_dir = DEBUG_ROOT / outdir.name
     debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -476,12 +589,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     model_train_windows = parse_model_train_window_spec(args.model_train_window)
 
     outdir.mkdir(parents=True, exist_ok=True)
-    analysis_fig_dir = outdir / "analysis" / "figures"
-    analysis_csv_dir = outdir / "analysis" / "csv"
-    asset_pred_dir = analysis_csv_dir / "asset_predictions"
-    model_outputs_dir = outdir / "models"
-    analysis_fig_dir.mkdir(parents=True, exist_ok=True)
     analysis_csv_dir.mkdir(parents=True, exist_ok=True)
+    analysis_fig_dir.mkdir(parents=True, exist_ok=True)
     asset_pred_dir.mkdir(parents=True, exist_ok=True)
     model_outputs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -542,6 +651,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             analysis_fig_dir / "asset_return_correlation.png",
             corr_stats,
         )
+        export_max_return_winner_counts(
+            returns_matrix,
+            analysis_csv_dir / "asset_max_return_wins.csv",
+            analysis_fig_dir / "asset_max_return_wins.png",
+        )
 
     stats_results: List[Dict[str, object]] = []
     period_rows: List[Dict[str, object]] = []
@@ -551,6 +665,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     beta_records: List[Dict[str, object]] = []
     # flex 用のサイクルごとの rebalance ログ（solver 状態の時系列可視化用）
     flex_rebalance_logs: List[pd.DataFrame] = []
+    delta_records: List[Dict[str, object]] = []
 
     wealth_dict: Dict[str, pd.DataFrame] = {}
     weight_dict: Dict[str, pd.DataFrame] = {}
@@ -606,7 +721,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 model_key=model_key,
                 model_label=label,
                 bundle=bundle,
-                delta=args.delta,
+                delta_up=delta_up,
+                delta_down_candidates=delta_down_list,
                 solver_spec=solver_spec,
                 flex_options=flex_options,
                 train_window=effective_train_window,
@@ -621,6 +737,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 eval_start=eval_start_ts,
             )
             stats_results.append(run_result["stats"])
+            if model_key == "flex":
+                hist = run_result.get("delta_history", [])
+                if hist:
+                    delta_records.extend(hist)
             reb_df = run_result["rebalance_df"]
             if model_key == "flex" and not reb_df.empty:
                 flex_rebalance_logs.append(reb_df.copy())
@@ -736,15 +856,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             stats_results.append(eq_info["stats"])
             wealth_dict[eq_info["label"]] = eq_info["wealth_df"]
 
+    summary_csv_path = analysis_csv_dir / "1-summary.csv"
     summary_df = pd.DataFrame(stats_results)
     if not summary_df.empty:
         if "model" in summary_df.columns:
             summary_df["model"] = summary_df["model"].map(display_model_name)
         summary_df["max_drawdown"] = summary_df["max_drawdown"].astype(float)
         summary_df = format_summary_for_output(summary_df)
-        summary_df.to_csv(analysis_csv_dir / "1-summary.csv", index=False)
+        summary_df.to_csv(summary_csv_path, index=False)
     else:
-        (analysis_csv_dir / "1-summary.csv").write_text("")
+        summary_csv_path.write_text("")
+    mirror_to_analysis_root(summary_csv_path, analysis_dir)
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)
@@ -789,20 +911,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             wealth_merge = wealth_merge.sort_values("date")
             wealth_merge = wealth_merge.groupby("date", as_index=False).last()
             wealth_merge.to_csv(analysis_csv_dir / "wealth_comparison.csv", index=False)
-            plot_multi_wealth({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_comparison.png")
-            # 1) 全モデル版（従来どおり）
+            plot_multi_wealth(
+                {m: df for m, df in wealth_dict.items()},
+                analysis_fig_dir / "wealth_comparison.png",
+            )
+            wealth_events_base_path = analysis_dir / "wealth_events.png"
+            wealth_events_primary_path = analysis_dir / "2-wealth_events.png"
             plot_wealth_with_events(
                 {m: df for m, df in wealth_dict.items()},
-                analysis_fig_dir / "wealth_events.png",
+                wealth_events_base_path,
             )
-            # 2) DFL 系モデルのみ（flex 系だけ抽出）
+            if wealth_events_primary_path.exists():
+                shutil.copy2(
+                    wealth_events_primary_path,
+                    analysis_fig_dir / wealth_events_primary_path.name,
+                )
             flex_only = {m: df for m, df in wealth_dict.items() if "flex" in str(m)}
             if flex_only:
                 plot_wealth_with_events(
                     flex_only,
                     analysis_fig_dir / "wealth_events_dfl_only.png",
                 )
-            # 3) DFL-dual vs その他（flex_dual を基準に比較）
             flex_dual_key = None
             for key in wealth_dict.keys():
                 key_str = str(key)
@@ -823,7 +952,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         dual_vs_others,
                         analysis_fig_dir / "wealth_events_flex_dual_vs_baselines.png",
                     )
-            # 4) 各危機ウィンドウごとに、期間開始時点を 1 とした累積推移を描画
             event_fig_dir = analysis_fig_dir / "event_windows"
             event_fig_dir.mkdir(parents=True, exist_ok=True)
             for name, start, end in PERIOD_WINDOWS:
@@ -846,19 +974,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         event_fig_dir / f"wealth_window_{name}.png",
                         events_by_model=solver_events_by_model,
                     )
-            # 5) 実験全期間を 2 年ごとに区切り、各ウィンドウの開始時点を 1 に正規化した推移を出力
-            two_year_dir = analysis_fig_dir / "wealth_windows_2y"
-            two_year_dir_all = two_year_dir / "all_models"
-            two_year_dir_dfl = two_year_dir / "dfl_only"
-            two_year_dir_all.mkdir(parents=True, exist_ok=True)
-            two_year_dir_dfl.mkdir(parents=True, exist_ok=True)
+            five_year_dir = analysis_fig_dir / "wealth_windows_5y"
+            five_year_dir_all = five_year_dir / "all_models"
+            five_year_dir_dfl = five_year_dir / "dfl_only"
+            five_year_dir_all.mkdir(parents=True, exist_ok=True)
+            five_year_dir_dfl.mkdir(parents=True, exist_ok=True)
             dates_all = pd.to_datetime(wealth_merge["date"])
             if not dates_all.empty:
                 start_all = dates_all.min()
                 end_all = dates_all.max()
                 start_win = start_all
                 while start_win < end_all:
-                    end_win = start_win + pd.DateOffset(years=2)
+                    end_win = start_win + pd.DateOffset(years=5)
                     if end_win > end_all:
                         end_win = end_all
                     window_label = f"{start_win.year}_{end_win.year}"
@@ -878,40 +1005,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                             window_label,
                             start_win,
                             end_win,
-                            two_year_dir_all / f"wealth_window_2y_{window_label}.png",
+                            five_year_dir_all / f"wealth_window_5y_{window_label}.png",
                             events_by_model=solver_events_by_model,
                         )
-                        flex_only = {m: df for m, df in sub_dict.items() if "flex" in str(m)}
-                        if flex_only:
+                        flex_only_win = {m: df for m, df in sub_dict.items() if "flex" in str(m)}
+                        if flex_only_win:
                             plot_wealth_window_normalized(
-                                flex_only,
+                                flex_only_win,
                                 window_label,
                                 start_win,
                                 end_win,
-                                two_year_dir_dfl / f"wealth_window_2y_{window_label}.png",
+                                five_year_dir_dfl / f"wealth_window_5y_{window_label}.png",
                                 events_by_model=solver_events_by_model,
                             )
-                    start_win = start_win + pd.DateOffset(years=2)
-            # 4) 各危機ウィンドウごとに、期間開始時点を 1 とした累積推移を描画
-            for name, start, end in PERIOD_WINDOWS:
-                sub_dict: Dict[str, pd.DataFrame] = {}
-                for m, df in wealth_dict.items():
-                    if df.empty:
-                        continue
-                    tmp = df.copy()
-                    tmp["date"] = pd.to_datetime(tmp["date"])
-                    mask = (tmp["date"] >= pd.Timestamp(start)) & (tmp["date"] <= pd.Timestamp(end))
-                    tmp = tmp.loc[mask]
-                    if not tmp.empty:
-                        sub_dict[m] = tmp[["date", "wealth"]].copy()
-                if sub_dict:
-                    plot_wealth_window_normalized(
-                        sub_dict,
-                        name,
-                        start,
-                        end,
-                        analysis_fig_dir / f"wealth_window_{name}.png",
-                    )
+                    start_win = start_win + pd.DateOffset(years=5)
             wealth_returns = wealth_merge.copy()
             wealth_returns["date"] = pd.to_datetime(wealth_returns["date"])
             wealth_returns = wealth_returns.set_index("date").pct_change(fill_method=None).dropna(how="all")
@@ -936,6 +1043,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if weight_dict:
         plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")
         for name, start, end in [
+            ("lehman_2008", "2007-07-01", "2009-06-30"),
             ("covid_2020", "2020-02-01", "2020-12-31"),
             ("inflation_2022", "2022-01-01", "2023-12-31"),
         ]:
@@ -951,11 +1059,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     sub_weights[m] = tmp
             if sub_weights:
                 plot_weight_comparison(
-                    sub_weights, event_fig_dir / f"weights_comparison_{name}.png"
+                    sub_weights, analysis_fig_dir / f"weights_comparison_{name}.png"
                 )
-        # 実験全期間を 2 年ごとに区切り、各ウィンドウの weights_comparison を出力
-        weights_2y_dir = analysis_fig_dir / "weights_windows_2y"
-        weights_2y_dir.mkdir(parents=True, exist_ok=True)
+        weights_5y_dir = analysis_fig_dir / "weights_windows_5y"
+        weights_5y_dir.mkdir(parents=True, exist_ok=True)
         all_dates: List[pd.Timestamp] = []
         for df in weight_dict.values():
             if df.empty or "date" not in df.columns:
@@ -969,7 +1076,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             end_all = max(all_dates)
             start_win = start_all
             while start_win < end_all:
-                end_win = start_win + pd.DateOffset(years=2)
+                end_win = start_win + pd.DateOffset(years=5)
                 if end_win > end_all:
                     end_win = end_all
                 window_label = f"{start_win.year}_{end_win.year}"
@@ -986,9 +1093,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 if sub_weights:
                     plot_weight_comparison(
                         sub_weights,
-                        weights_2y_dir / f"weights_comparison_2y_{window_label}.png",
+                        weights_5y_dir / f"weights_comparison_5y_{window_label}.png",
+                        max_points=None,
                     )
-                start_win = start_win + pd.DateOffset(years=2)
+                start_win = start_win + pd.DateOffset(years=5)
         export_weight_variance_correlation(
             weight_dict,
             analysis_csv_dir / "weight_variance_correlation.csv",
@@ -1024,6 +1132,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         beta_df = pd.DataFrame(beta_records)
         beta_df.to_csv(analysis_csv_dir / "beta_trajectory.csv", index=False)
         plot_beta_paths(beta_df, analysis_fig_dir / "beta_paths.png")
+    if delta_records:
+        delta_df = pd.DataFrame(delta_records)
+        delta_df.to_csv(analysis_csv_dir / "delta_trajectory.csv", index=False)
+        plot_delta_paths(delta_df, analysis_fig_dir / "delta_paths.png")
     if not summary_df.empty:
         update_experiment_ledger(RESULTS_ROOT, outdir, args, summary_df, analysis_csv_dir, bundle_summary)
 
@@ -1043,26 +1155,21 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 python -m dfl_portfolio.experiments.real_data_run_V \
   --tickers "SPY,GLD,EEM,TLT" \
   --start 2006-10-31 --end 2025-10-31 \
-  --interval 1d \
-  --price-field Close \
-  --return-kind log \
   --frequency weekly \
   --resample-rule W-FRI \
   --momentum-window 26 \
   --return-horizon 1 \
   --cov-window 13 \
   --cov-method oas \
-  --cov-ewma-alpha 0.97 \
-  --cov-shrinkage 0.94 \
-  --cov-eps 1e-6 \
   --train-window 26 \
   --rebal-interval 4 \
   --delta 0.5 \
+  --delta-up 0.5 \
+  --delta-down 0.5 \
   --models ols,ipo,flex \
   --flex-solver knitro \
   --flex-formulation 'dual' \
   --flex-lambda-theta-anchor 10.0 \
-  --flex-lambda-theta-iso 0.0 \
   --flex-theta-anchor-mode ipo \
   --flex-theta-init-mode none \
   --flex-lambda-phi-anchor 0.0 \

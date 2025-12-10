@@ -1,6 +1,7 @@
 knitro.log
 knitro_logs/
 dfl_portfolio/real_data/cache/
+**/__pycache__/
 *.pyc
 **/*.pyc
 *.log

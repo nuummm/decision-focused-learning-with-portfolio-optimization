@@ -27,7 +27,8 @@ TrainerFn = Callable[
 # --- デフォルトのソルバー仕様（必要に応じて run.py から上書き） ---
 KNITRO_DEFAULTS = {
     "outlev": 3,
-    "outmode": 1,
+    # outmode=0 suppresses knitro.log/summary files from being created
+    "outmode": 0,
     "nlp_algorithm": 3,     # Interior/Direct
     "hessopt": 4,           # BFGS
     "linsolver": 3,         # MA57 (sparse symmetric)

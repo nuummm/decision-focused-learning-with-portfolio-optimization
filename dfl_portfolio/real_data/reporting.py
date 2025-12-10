@@ -130,7 +130,12 @@ def plot_weight_paths(weights_df: pd.DataFrame, model: str, path: Path) -> None:
     plt.close()
 
 
-def plot_weight_comparison(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+def plot_weight_comparison(
+    weight_dict: Dict[str, pd.DataFrame],
+    path: Path,
+    *,
+    max_points: int | None = WEIGHT_PLOT_MAX_POINTS,
+) -> None:
     if plt is None or not weight_dict:
         return
     models = list(weight_dict.keys())
@@ -140,8 +145,8 @@ def plot_weight_comparison(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
         axes = [axes]
     for ax, model in zip(axes, models):
         df = weight_dict[model]
-        if len(df) > WEIGHT_PLOT_MAX_POINTS:
-            df = df.tail(WEIGHT_PLOT_MAX_POINTS)
+        if max_points is not None and len(df) > max_points:
+            df = df.tail(max_points)
         dates = pd.to_datetime(df["date"])
         value_cols = [c for c in df.columns if c not in {"date", "portfolio_return_sq"}]
         values = df[value_cols].astype(float)

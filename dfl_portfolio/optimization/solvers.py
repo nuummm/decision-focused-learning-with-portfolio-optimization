@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import pyomo.environ as pyo
 
 def _make_gurobi(model, tee: bool, options: dict | None):
@@ -122,3 +123,15 @@ def make_pyomo_solver(model, solver: str, tee: bool = False, options: dict | Non
         return _make_knitro(model, tee, options)
     else:
         raise ValueError(f"Unknown solver: {solver}")
+
+
+def cleanup_knitro_logs():
+    """Remove Knitro log artifacts that knitroampl writes even when disabled."""
+    for name in ("knitro.log", "knitro_summary.log", "knitro_solution.txt"):
+        try:
+            path = Path(name)
+            if path.exists():
+                path.unlink()
+        except OSError:
+            # Never let log cleanup break experiment execution
+            pass

@@ -29,7 +29,7 @@ from typing import Optional, Sequence, Tuple, List
 import numpy as np
 import pyomo.environ as pyo
 
-from dfl_portfolio.optimization.solvers import make_pyomo_solver
+from dfl_portfolio.optimization.solvers import make_pyomo_solver, cleanup_knitro_logs
 from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
 from dfl_portfolio.models.ols import train_ols, predict_yhat
 from dfl_portfolio.models.ols_gurobi import solve_series_mvo_gurobi
@@ -350,7 +350,12 @@ def fit_dfl_p1_flex(
 
     opt = make_pyomo_solver(m, solver=solver, tee=tee, options=solver_options)
     res = opt.solve(m, tee=tee)
+    cleanup_knitro_logs()
     meta = _solver_metadata(opt, res, solver)
+    try:
+        meta["objective_value"] = float(pyo.value(m.obj))
+    except Exception:
+        meta["objective_value"] = None
 
     theta_hat = np.array([pyo.value(m.theta[j]) for j in m.J], dtype=float)
     W = np.array([[pyo.value(m.w[t, j]) for j in m.J] for t in m.T], dtype=float)

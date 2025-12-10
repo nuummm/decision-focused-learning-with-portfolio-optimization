@@ -28,6 +28,7 @@ from dfl_portfolio.real_data.cli import (
 from dfl_portfolio.real_data.reporting import (
     WEIGHT_THRESHOLD,
     WEIGHT_PLOT_MAX_POINTS,
+    PERIOD_WINDOWS,
     compute_benchmark_series,
     compute_equal_weight_benchmark,
     compute_correlation_stats,
@@ -40,6 +41,7 @@ from dfl_portfolio.real_data.reporting import (
     export_average_weights,
     export_weight_threshold_frequency,
     export_weight_variance_correlation,
+    export_max_return_winner_counts,
     max_drawdown,
     plot_asset_correlation,
     plot_flex_solver_debug,
@@ -48,6 +50,7 @@ from dfl_portfolio.real_data.reporting import (
     plot_wealth_correlation_heatmap,
     plot_wealth_curve,
     plot_wealth_with_events,
+    plot_wealth_window_normalized,
     plot_weight_comparison,
     plot_weight_histograms,
     plot_weight_paths,
@@ -95,18 +98,18 @@ def train_model_window(
     model_key: str,
     trainer,
     bundle,
-    delta: float,
-    delta_prev: float,
+    delta_up: float,
+    delta_down: float,
     delta_min: float,
     delta_max: float,
-    lambda_delta_center: float,
-    lambda_delta_smooth: float,
+    lambda_delta_up: float,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     train_start: int,
     train_end: int,
     tee: bool,
 ):
+    delta_for_training = delta_down if model_key == "flex" else delta_up
     trainer_kwargs: Dict[str, object] = dict(
         X=bundle.dataset.X,
         Y=bundle.dataset.Y,
@@ -114,13 +117,13 @@ def train_model_window(
         idx=bundle.cov_indices.tolist(),
         start_index=train_start,
         end_index=train_end,
-        delta=delta,
+        delta=delta_for_training,
         tee=tee,
     )
     theta_init_override: Optional[np.ndarray] = None
     if model_key == "flex" and flex_options:
         theta_init_override, resolved_flex = prepare_flex_training_args(
-            bundle, train_start, train_end, delta, tee, flex_options
+            bundle, train_start, train_end, delta_for_training, tee, flex_options
         )
         trainer_kwargs.update(resolved_flex)
     if theta_init_override is not None:
@@ -137,9 +140,8 @@ def train_model_window(
             solver_options=solver_opts,
             delta_min=delta_min,
             delta_max=delta_max,
-            lambda_delta_center=lambda_delta_center,
-            lambda_delta_smooth=lambda_delta_smooth,
-            delta_prev=delta_prev,
+            lambda_delta_up=lambda_delta_up,
+            delta_up=delta_up,
         )
     else:
         trainer_ret = trainer(**trainer_kwargs)
@@ -157,11 +159,11 @@ def run_rolling_experiment(
     model_key: str,
     model_label: str,
     bundle,
-    delta: float,
+    delta_up: float,
+    delta_down: float,
     delta_min: float,
     delta_max: float,
-    lambda_delta_center: float,
-    lambda_delta_smooth: float,
+    lambda_delta_up: float,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     train_window: int,
@@ -195,9 +197,6 @@ def run_rolling_experiment(
     X = bundle.dataset.X
     Y = bundle.dataset.Y
 
-    # delta の時間的ななめらかさのため、前サイクルの値を保持
-    delta_prev = float(delta)
-
     for cycle_id, item in enumerate(schedule, start=1):
         if debug_roll:
             progress = cycle_id / max(len(schedule), 1)
@@ -215,12 +214,11 @@ def run_rolling_experiment(
             model_key=model_key,
             trainer=trainer,
             bundle=bundle,
-            delta=delta,
-            delta_prev=delta_prev,
+            delta_up=delta_up,
+            delta_down=delta_down,
             delta_min=delta_min,
             delta_max=delta_max,
-            lambda_delta_center=lambda_delta_center,
-            lambda_delta_smooth=lambda_delta_smooth,
+            lambda_delta_up=lambda_delta_up,
             solver_spec=solver_spec,
             flex_options=flex_options,
             train_start=item.train_start,
@@ -229,9 +227,8 @@ def run_rolling_experiment(
         )
         theta_init = theta_hat
         # flex_delta では学習された delta_hat を meta から取得し、評価にも使う
-        cycle_delta = float(info.get("delta_hat", delta))
-        # 次サイクル用の delta_prev を更新（時間方向のなめらかさペナルティで使用）
-        delta_prev = cycle_delta
+        default_delta = delta_down if model_key == "flex" else delta_up
+        cycle_delta = float(info.get("delta_hat", default_delta))
         rebalance_rows.append(
             {
                 "cycle": cycle_id,
@@ -459,16 +456,10 @@ def main() -> None:
         help="Upper bound of learnable delta (inclusive), must be <=1 and > delta-min.",
     )
     parser.add_argument(
-        "--delta-reg-center",
+        "--delta-reg-up",
         type=float,
-        default=0.1,
-        help="Regularization weight for (delta - 0.5)^2.",
-    )
-    parser.add_argument(
-        "--delta-reg-smooth",
-        type=float,
-        default=0.1,
-        help="Regularization weight for (delta_t - delta_{t-1})^2.",
+        default=0.0,
+        help="Regularization weight for (delta_down - delta_up)^2.",
     )
     args = parser.parse_args()
     model_train_windows = parse_model_train_window_spec(getattr(args, "model_train_window", ""))
@@ -493,10 +484,15 @@ def main() -> None:
             f"delta-min/max must satisfy 0 <= delta-min < delta-max <= 1 "
             f"(got delta-min={args.delta_min}, delta-max={args.delta_max})"
         )
-    if not (args.delta_min <= args.delta <= args.delta_max):
+    base_delta = float(args.delta)
+    cli_delta_up = getattr(args, "delta_up", None)
+    cli_delta_down = getattr(args, "delta_down", None)
+    delta_up = float(cli_delta_up) if cli_delta_up is not None else base_delta
+    delta_down = float(cli_delta_down) if cli_delta_down is not None else delta_up
+    if not (args.delta_min <= delta_down <= args.delta_max):
         raise ValueError(
-            f"delta (initial) must be within [delta-min, delta-max]; "
-            f"got delta={args.delta}, range=[{args.delta_min},{args.delta_max}]"
+            f"delta_down (initial) must be within [delta-min, delta-max]; "
+            f"got delta_down={delta_down}, range=[{args.delta_min},{args.delta_max}]"
         )
 
     loader_cfg = MarketLoaderConfig.for_cli(
@@ -585,6 +581,11 @@ def main() -> None:
             analysis_fig_dir / "asset_return_correlation.png",
             corr_stats,
         )
+        export_max_return_winner_counts(
+            returns_matrix,
+            analysis_csv_dir / "asset_max_return_wins.csv",
+            analysis_fig_dir / "asset_max_return_wins.png",
+        )
 
     stats_results: List[Dict[str, object]] = []
     period_rows: List[Dict[str, object]] = []
@@ -661,11 +662,11 @@ def main() -> None:
                 model_key=model_key,
                 model_label=label,
                 bundle=bundle,
-                delta=args.delta,
+                delta_up=delta_up,
+                delta_down=delta_down,
                 delta_min=args.delta_min,
                 delta_max=args.delta_max,
-                lambda_delta_center=args.delta_reg_center,
-                lambda_delta_smooth=args.delta_reg_smooth,
+                lambda_delta_up=args.delta_reg_up,
                 solver_spec=solver_spec,
                 flex_options=flex_options,
                 train_window=effective_train_window,
@@ -801,6 +802,31 @@ def main() -> None:
             period_df["model"] = period_df["model"].map(display_model_name)
         period_df.to_csv(analysis_csv_dir / "period_metrics.csv", index=False)
 
+    solver_events_by_model: Dict[str, pd.DataFrame] = {}
+    if flex_rebalance_logs:
+        tmp_events: Dict[str, List[pd.DataFrame]] = {}
+        for log in flex_rebalance_logs:
+            df = log.copy()
+            if df.empty or "rebalance_date" not in df.columns:
+                continue
+            df["rebalance_date"] = pd.to_datetime(df["rebalance_date"])
+            statuses = df.get("solver_status", "").astype(str)
+            mask = ~statuses.str.contains("optimal", case=False, na=False)
+            mask &= ~statuses.str.contains("ok", case=False, na=False)
+            df = df.loc[mask]
+            if df.empty:
+                continue
+            need_cols = {"model", "rebalance_date", "solver_status"}
+            missing = need_cols - set(df.columns)
+            if missing:
+                continue
+            for model, sub in df[list(need_cols)].groupby("model"):
+                tmp_events.setdefault(model, []).append(sub)
+        solver_events_by_model = {
+            model: pd.concat(chunks, ignore_index=True).sort_values("rebalance_date")
+            for model, chunks in tmp_events.items()
+        }
+
     if wealth_dict:
         wealth_merge = None
         for model, wdf in wealth_dict.items():
@@ -818,10 +844,110 @@ def main() -> None:
                 {m: df for m, df in wealth_dict.items()},
                 analysis_fig_dir / "wealth_comparison.png",
             )
-            wealth_events_base_path = analysis_fig_dir / "wealth_events.png"
-            wealth_events_output_path = wealth_events_base_path.with_name("2-wealth_events.png")
-            plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, wealth_events_base_path)
-            mirror_to_analysis_root(wealth_events_output_path, analysis_dir)
+            wealth_events_base_path = analysis_dir / "wealth_events.png"
+            wealth_events_primary_path = analysis_dir / "2-wealth_events.png"
+            plot_wealth_with_events(
+                {m: df for m, df in wealth_dict.items()},
+                wealth_events_base_path,
+            )
+            if wealth_events_primary_path.exists():
+                shutil.copy2(
+                    wealth_events_primary_path,
+                    analysis_fig_dir / wealth_events_primary_path.name,
+                )
+            flex_only = {m: df for m, df in wealth_dict.items() if "flex" in str(m)}
+            if flex_only:
+                plot_wealth_with_events(
+                    flex_only,
+                    analysis_fig_dir / "wealth_events_dfl_only.png",
+                )
+            flex_dual_key = None
+            for key in wealth_dict.keys():
+                key_str = str(key)
+                if "flex" in key_str and ("dual" in key_str or key_str == "flex"):
+                    flex_dual_key = key
+                    break
+            if flex_dual_key is not None:
+                dual_vs_others: Dict[str, pd.DataFrame] = {}
+                dual_vs_others[flex_dual_key] = wealth_dict[flex_dual_key]
+                for key, df in wealth_dict.items():
+                    if key == flex_dual_key:
+                        continue
+                    if "flex" in str(key):
+                        continue
+                    dual_vs_others[key] = df
+                if len(dual_vs_others) > 1:
+                    plot_wealth_with_events(
+                        dual_vs_others,
+                        analysis_fig_dir / "wealth_events_flex_dual_vs_baselines.png",
+                    )
+            event_fig_dir = analysis_fig_dir / "event_windows"
+            event_fig_dir.mkdir(parents=True, exist_ok=True)
+            for name, start, end in PERIOD_WINDOWS:
+                sub_dict: Dict[str, pd.DataFrame] = {}
+                for m, df in wealth_dict.items():
+                    if df.empty:
+                        continue
+                    tmp = df.copy()
+                    tmp["date"] = pd.to_datetime(tmp["date"])
+                    mask = (tmp["date"] >= pd.Timestamp(start)) & (tmp["date"] <= pd.Timestamp(end))
+                    tmp = tmp.loc[mask]
+                    if not tmp.empty:
+                        sub_dict[m] = tmp[["date", "wealth"]].copy()
+                if sub_dict:
+                    plot_wealth_window_normalized(
+                        sub_dict,
+                        name,
+                        start,
+                        end,
+                        event_fig_dir / f"wealth_window_{name}.png",
+                        events_by_model=solver_events_by_model,
+                    )
+            five_year_dir = analysis_fig_dir / "wealth_windows_5y"
+            five_year_dir_all = five_year_dir / "all_models"
+            five_year_dir_dfl = five_year_dir / "dfl_only"
+            five_year_dir_all.mkdir(parents=True, exist_ok=True)
+            five_year_dir_dfl.mkdir(parents=True, exist_ok=True)
+            dates_all = pd.to_datetime(wealth_merge["date"])
+            if not dates_all.empty:
+                start_all = dates_all.min()
+                end_all = dates_all.max()
+                start_win = start_all
+                while start_win < end_all:
+                    end_win = start_win + pd.DateOffset(years=5)
+                    if end_win > end_all:
+                        end_win = end_all
+                    window_label = f"{start_win.year}_{end_win.year}"
+                    sub_dict: Dict[str, pd.DataFrame] = {}
+                    for m, df in wealth_dict.items():
+                        if df.empty:
+                            continue
+                        tmp = df.copy()
+                        tmp["date"] = pd.to_datetime(tmp["date"])
+                        mask = (tmp["date"] >= start_win) & (tmp["date"] < end_win)
+                        tmp = tmp.loc[mask]
+                        if not tmp.empty:
+                            sub_dict[m] = tmp[["date", "wealth"]].copy()
+                    if sub_dict:
+                        plot_wealth_window_normalized(
+                            sub_dict,
+                            window_label,
+                            start_win,
+                            end_win,
+                            five_year_dir_all / f"wealth_window_5y_{window_label}.png",
+                            events_by_model=solver_events_by_model,
+                        )
+                        flex_only_win = {m: df for m, df in sub_dict.items() if "flex" in str(m)}
+                        if flex_only_win:
+                            plot_wealth_window_normalized(
+                                flex_only_win,
+                                window_label,
+                                start_win,
+                                end_win,
+                                five_year_dir_dfl / f"wealth_window_5y_{window_label}.png",
+                                events_by_model=solver_events_by_model,
+                            )
+                    start_win = start_win + pd.DateOffset(years=5)
             wealth_returns = wealth_merge.copy()
             wealth_returns["date"] = pd.to_datetime(wealth_returns["date"])
             wealth_returns = (
@@ -848,6 +974,7 @@ def main() -> None:
     if weight_dict:
         plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")
         for name, start, end in [
+            ("lehman_2008", "2007-07-01", "2009-06-30"),
             ("covid_2020", "2020-02-01", "2020-12-31"),
             ("inflation_2022", "2022-01-01", "2023-12-31"),
         ]:
@@ -865,6 +992,42 @@ def main() -> None:
                 plot_weight_comparison(
                     sub_weights, analysis_fig_dir / f"weights_comparison_{name}.png"
                 )
+        weights_5y_dir = analysis_fig_dir / "weights_windows_5y"
+        weights_5y_dir.mkdir(parents=True, exist_ok=True)
+        all_dates: List[pd.Timestamp] = []
+        for df in weight_dict.values():
+            if df.empty or "date" not in df.columns:
+                continue
+            d = pd.to_datetime(df["date"])
+            if not d.empty:
+                all_dates.append(d.min())
+                all_dates.append(d.max())
+        if all_dates:
+            start_all = min(all_dates)
+            end_all = max(all_dates)
+            start_win = start_all
+            while start_win < end_all:
+                end_win = start_win + pd.DateOffset(years=5)
+                if end_win > end_all:
+                    end_win = end_all
+                window_label = f"{start_win.year}_{end_win.year}"
+                sub_weights: Dict[str, pd.DataFrame] = {}
+                for m, df in weight_dict.items():
+                    if df.empty or "date" not in df.columns:
+                        continue
+                    tmp = df.copy()
+                    tmp["date"] = pd.to_datetime(tmp["date"])
+                    mask = (tmp["date"] >= start_win) & (tmp["date"] < end_win)
+                    tmp = tmp.loc[mask]
+                    if not tmp.empty:
+                        sub_weights[m] = tmp
+                if sub_weights:
+                    plot_weight_comparison(
+                        sub_weights,
+                        weights_5y_dir / f"weights_comparison_5y_{window_label}.png",
+                        max_points=None,
+                    )
+                start_win = start_win + pd.DateOffset(years=5)
         export_weight_variance_correlation(
             weight_dict,
             analysis_csv_dir / "weight_variance_correlation.csv",
@@ -913,32 +1076,23 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.real_data_run_delta \
   --tickers "SPY,GLD,EEM,TLT" \
-  --start 2006-10-31 --end 2025-10-31 \
-  --interval 1d \
-  --price-field Close \
-  --return-kind log \
   --frequency weekly \
   --resample-rule W-FRI \
-  --momentum-window 30 \
-  --return-horizon 1 \
-  --cov-window 10 \
-  --cov-method diag \
-  --cov-shrinkage 0.94 \
-  --cov-eps 1e-6 \
-  --train-window 25 \
+  --momentum-window 26 \
+  --cov-window 13 \
+  --cov-method oas \
+  --train-window 26 \
   --rebal-interval 4 \
-  --delta-min 0.01 \
-  --delta-max 0.99 \
-  --delta-reg-center 1 \
-  --delta-reg-smooth 1 \
-  --delta 0.5 \
+  --delta-min 0.3 \
+  --delta-max 0.7 \
+  --delta-reg-up 0.1 \
+  --delta-up 0.5 \
+  --delta-down 0.5 \
   --models ols,ipo,flex \
   --flex-solver knitro \
   --flex-formulation 'dual' \
-  --flex-lambda-theta-anchor 0.0 \
-  --flex-lambda-theta-iso 0.0 \
-  --flex-theta-anchor-mode ols \
-  --flex-theta-init-mode none \
+  --flex-lambda-theta-anchor 10.0 \
+  --flex-theta-anchor-mode ipo \
   --benchmark-ticker SPY \
   --benchmark-equal-weight \
   --debug-roll
