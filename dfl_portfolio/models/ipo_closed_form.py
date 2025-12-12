@@ -101,20 +101,32 @@ def fit_ipo_closed_form(
         meta = {"solver": "ipo_closed_form", "status": "skipped", "message": "no pairs in range"}
         return theta_hat, Z, MU, LAM, [], meta
 
+    # IPO 目的関数は mvo_cost(z,y,V; delta) = -(1-δ) zᵀ y + (δ/2) zᵀ V z を前提とする。
+    # 一方、下位 MVO の解析解 _build_affine_decision は
+    #   min_z  (δ_eff/2) zᵀ V z - y_hatᵀ z
+    # に対する解を返す設計になっているため、ここで δ_eff = δ / (1-δ) に変換する。
+    alpha = 1.0 - float(delta)
+    if delta <= 0.0 or alpha <= 0.0:
+        raise ValueError(f"delta must be in (0,1) for IPO closed-form; got {delta}")
+    delta_eff = float(delta) / alpha
+
     # ---- A θ = b を構成（凸二次最小化の正規方程式）----
     A = np.zeros((d, d), dtype=float)
     b = np.zeros(d, dtype=float)
 
     # 新しい目的関数: -(1-δ) r^T z + (δ/2) z^T V z
     # で導出した係数のための係数 α = 1 - δ
-    alpha = 1.0 - float(delta)
+    # alpha = 1 - δ は mvo_cost におけるリターン項の重み。
+    # 上位の二次目的 L(θ) の係数は、この alpha と δ の組み合わせから導出される。
 
     for (i, V_i) in pairs:
         # V を安定化
         V_i = _make_psd(V_i, psd_eps)
 
         # 下位MVO: z*(y_hat) = (1/δ) H y_hat + c
-        H, c = _build_affine_decision(V_i, delta, mode)
+        # ただし、mvo_cost に対しては δ_eff = δ / (1-δ) を使った Markowitz 目的と等価なので、
+        # 解析解レイヤには δ_eff を渡す。
+        H, c = _build_affine_decision(V_i, delta_eff, mode)
 
         # 便利な中間量
         # S = Hᵀ V H（対称, PSD）
@@ -130,8 +142,6 @@ def fit_ipo_closed_form(
         # 新しい目的関数に基づく係数:
         #   A_i = (α^2 / δ) D_i S D_i
         #   b_i = (α^2 / δ) D_i Hᵀ y_i - α D_i t
-        if delta == 0.0:
-            raise ValueError("delta must be non-zero for IPO closed-form (got 0)")
         coef_quad = (alpha ** 2) / float(delta)
         A += coef_quad * (D_i @ S @ D_i)
         b += coef_quad * (D_i @ (H.T @ y_i)) - alpha * (D_i @ t)

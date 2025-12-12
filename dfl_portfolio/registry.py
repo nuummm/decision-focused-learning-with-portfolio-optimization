@@ -5,6 +5,7 @@ from typing import Callable, Dict, Any, Optional, Tuple, List
 from dfl_portfolio.models.dfl_p1_flex import fit_dfl_p1_flex as _fit_flex, SolverMeta as _FlexMeta
 from dfl_portfolio.models.ols_baseline import fit_ols_baseline
 from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
+from dfl_portfolio.models.ipo_grad import fit_ipo_grad
 
 # 型エイリアス（分かりやすさ用）
 NDArray = Any
@@ -170,6 +171,45 @@ def _wrap_ipo(spec: SolverSpec) -> TrainerFn:
     return _runner
 
 
+def _wrap_ipo_grad(spec: SolverSpec) -> TrainerFn:
+    # IPO-GRAD: differentiable QP layer; solver_spec is unused but interface kept
+    def _runner(
+        X: NDArray, Y: NDArray, Vhats: List[NDArray], idx: List[int],
+        start_index: Optional[int] = None, end_index: Optional[int] = None,
+        delta: float = 1.0, theta_init: Optional[NDArray] = None,
+        tee: bool = False,
+        solver: str = "ipo_grad",
+        solver_options: Optional[Dict[str, Any]] = None,
+        **kw,
+    ):
+        epochs = int(kw.pop("ipo_grad_epochs", 500))
+        lr = float(kw.pop("ipo_grad_lr", 1e-3))
+        batch_size = int(kw.pop("ipo_grad_batch_size", 0))
+        qp_max_iter = int(kw.pop("ipo_grad_qp_max_iter", 5000))
+        qp_tol = float(kw.pop("ipo_grad_qp_tol", 1e-6))
+        debug_kkt = bool(kw.pop("ipo_grad_debug_kkt", False))
+        ret = fit_ipo_grad(
+            X,
+            Y,
+            Vhats,
+            idx,
+            start_index=start_index,
+            end_index=end_index,
+            delta=delta,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            qp_max_iter=qp_max_iter,
+            qp_tol=qp_tol,
+            theta_init=theta_init,
+            tee=tee,
+            debug_kkt=debug_kkt,
+        )
+        return ret
+
+    return _runner
+
+
 # レジストリ本体
 def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
     key = model_key.lower()
@@ -197,7 +237,9 @@ def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
         return _runner
     if key in ("ipo", "ipo_closed_form", "ipo-analytic"):
         return _wrap_ipo(solver_spec)
-    raise KeyError(f"Unknown model_key: {model_key}. Use one of: flex, ols, ipo")
+    if key in ("ipo_grad", "ipo-nn", "ipo_nn"):
+        return _wrap_ipo_grad(solver_spec)
+    raise KeyError(f"Unknown model_key: {model_key}. Use one of: flex, ols, ipo, ipo_grad")
 
 def available_models() -> Dict[str, Callable]:
     # ヘルプ/表示用：実体は使われない
@@ -205,4 +247,5 @@ def available_models() -> Dict[str, Callable]:
         "flex": _fit_flex,
         "ols": fit_ols_baseline,
         "ipo": fit_ipo_closed_form,
+        "ipo_grad": fit_ipo_grad,
     }

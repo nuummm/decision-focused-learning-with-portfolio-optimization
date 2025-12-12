@@ -206,6 +206,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional overrides like 'SPY:5,GLD:8' (basis points) applied per ticker.",
     )
     parser.add_argument(
+        "--ipo-grad-epochs",
+        type=int,
+        default=1000,
+        help="Number of training epochs for IPO-GRAD (IPO neural network).",
+    )
+    parser.add_argument(
+        "--ipo-grad-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for IPO-GRAD (Adam).",
+    )
+    parser.add_argument(
+        "--ipo-grad-batch-size",
+        type=int,
+        default=0,
+        help="Batch size for IPO-GRAD (0 means full batch).",
+    )
+    parser.add_argument(
+        "--ipo-grad-qp-max-iter",
+        type=int,
+        default=5000,
+        help="Maximum number of iterations in the QP solver inside IPO-GRAD.",
+    )
+    parser.add_argument(
+        "--ipo-grad-qp-tol",
+        type=float,
+        default=1e-6,
+        help="Convergence tolerance for the QP solver inside IPO-GRAD.",
+    )
+    parser.add_argument(
+        "--ipo-grad-debug-kkt",
+        action="store_true",
+        help=(
+            "Enable additional IPO-GRAD diagnostics (prints approximate "
+            "constraint violations per epoch)."
+        ),
+    )
+    parser.add_argument(
         "--benchmarks",
         type=str,
         default="",

@@ -34,6 +34,9 @@ WEIGHT_PLOT_MAX_POINTS = 60
 
 # 表示用のモデル名マッピング
 _MODEL_DISPLAY_MAP = {
+    "ols": "OLS",
+    "ipo": "IPO-analytic",
+    "ipo_grad": "IPO-GRAD",
     "flex": "DFL-QCQP",
     "flex_dual": "DFL-QCQP-dual",
     "flex_kkt": "DFL-QCQP-kkt",
@@ -45,6 +48,7 @@ _MODEL_DISPLAY_MAP = {
 MODEL_COLOR_MAP: Dict[str, str] = {
     "ols": "tab:blue",
     "ipo": "tab:orange",
+    "ipo_grad": "tab:brown",
     "flex": "tab:green",
     "flex_dual": "tab:green",
     "flex_kkt": "tab:red",
@@ -1074,6 +1078,118 @@ def compute_benchmark_series(
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return None
+
+
+def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
+    """Plot solver warning counts and mean elapsed time for key models.
+
+    Focuses on flex_dual, flex_kkt, and ipo_grad. For flex models, a warning
+    is counted when solver_status is not 'optimal'/'ok'. For ipo_grad, a warning
+    is counted when the recorded maximum constraint violation exceeds a small
+    tolerance.
+    """
+    if plt is None:
+        return
+    if rebalance_df.empty or "model" not in rebalance_df.columns:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df = rebalance_df.copy()
+
+    def _base_model(name: object) -> Optional[str]:
+        s = str(name)
+        if "flex_dual" in s:
+            return "flex_dual"
+        if "flex_kkt" in s:
+            return "flex_kkt"
+        if s == "ipo_grad":
+            return "ipo_grad"
+        return None
+
+    df["model_base"] = df["model"].map(_base_model)
+    df = df[df["model_base"].notna()].copy()
+    if df.empty:
+        return
+
+    # Define warnings
+    def _is_ok(status: object) -> bool:
+        s = str(status).lower()
+        return ("optimal" in s) or ("ok" in s)
+
+    df["is_warning"] = False
+    mask_flex = df["model_base"].isin(["flex_dual", "flex_kkt"])
+    df.loc[mask_flex, "is_warning"] = ~df.loc[mask_flex, "solver_status"].map(_is_ok)
+
+    mask_ipo = df["model_base"] == "ipo_grad"
+    if mask_ipo.any():
+        eq = df.loc[mask_ipo, "train_eq_viol_max"].astype(float).abs()
+        ineq = df.loc[mask_ipo, "train_ineq_viol_max"].astype(float).abs()
+        # Treat violations above small tolerances as warnings.
+        eq_tol = 1e-4
+        ineq_tol = 1e-8
+        df.loc[mask_ipo, "is_warning"] = (eq > eq_tol) | (ineq > ineq_tol)
+
+    # Aggregate statistics
+    warn_counts = df.groupby("model_base")["is_warning"].sum()
+    total_counts = df.groupby("model_base")["is_warning"].count()
+    elapsed_mean = df.groupby("model_base")["elapsed_sec"].mean()
+
+    models = ["flex_dual", "flex_kkt", "ipo_grad"]
+    display_names = {
+        "flex_dual": "DFL-QCQP-dual",
+        "flex_kkt": "DFL-QCQP-kkt",
+        "ipo_grad": "IPO-GRAD",
+    }
+
+    # Warning counts bar chart
+    values = [float(warn_counts.get(m, 0.0)) for m in models]
+    totals = [int(total_counts.get(m, 0)) for m in models]
+    if any(totals):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        x = np.arange(len(models))
+        colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
+        bars = ax.bar(x, values, color=colors, alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
+        ax.set_ylabel("warning count")
+        ax.set_title("Solver warning counts (flex / IPO-GRAD)")
+        for xi, bar, val, tot in zip(x, bars, values, totals):
+            ax.text(
+                xi,
+                bar.get_height() + 0.05,
+                f"{int(val)}/{tot}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        fig.tight_layout()
+        fig.savefig(out_dir / "solver_warning_counts.png")
+        plt.close(fig)
+
+    # Mean elapsed time bar chart
+    elapsed_vals = [float(elapsed_mean.get(m, np.nan)) for m in models]
+    if any(np.isfinite(elapsed_vals)):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        x = np.arange(len(models))
+        colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
+        bars = ax.bar(x, elapsed_vals, color=colors, alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
+        ax.set_ylabel("mean elapsed time per cycle (sec)")
+        ax.set_title("Solver mean elapsed time (flex / IPO-GRAD)")
+        for xi, bar, val in zip(x, bars, elapsed_vals):
+            if np.isfinite(val):
+                ax.text(
+                    xi,
+                    bar.get_height() + 0.01,
+                    f"{val:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+        fig.tight_layout()
+        fig.savefig(out_dir / "solver_elapsed_mean.png")
+        plt.close(fig)
     returns_df = bundle.dataset.returns
     if ticker not in returns_df.columns:
         print(f"[benchmark] ticker '{ticker}' not found in returns; skipping benchmark.")

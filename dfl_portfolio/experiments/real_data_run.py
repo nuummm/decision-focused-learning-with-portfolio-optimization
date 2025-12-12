@@ -47,6 +47,7 @@ from dfl_portfolio.real_data.reporting import (
     max_drawdown,
     plot_asset_correlation,
     plot_flex_solver_debug,
+    plot_solver_summary_bars,
     plot_multi_wealth,
     plot_time_series,
     plot_wealth_correlation_heatmap,
@@ -160,6 +161,7 @@ def train_model_window(
     train_start: int,
     train_end: int,
     tee: bool,
+    ipo_grad_debug_kkt: bool = False,
 ):
     delta_for_training = delta_down if model_key == "flex" else delta_up
     trainer_kwargs: Dict[str, object] = dict(
@@ -178,8 +180,30 @@ def train_model_window(
             bundle, train_start, train_end, delta_for_training, tee, flex_options
         )
         trainer_kwargs.update(resolved_flex)
+    if model_key == "ipo_grad":
+        # Warm-start IPO-GRAD from the analytical IPO closed-form solution
+        try:
+            theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
+                bundle.dataset.X,
+                bundle.dataset.Y,
+                bundle.covariances,
+                bundle.cov_indices.tolist(),
+                start_index=train_start,
+                end_index=train_end,
+                delta=delta_for_training,
+                mode="budget",
+                psd_eps=1e-12,
+                ridge_theta=1e-10,
+                tee=tee,
+            )
+            theta_init_override = np.asarray(theta_ipo, dtype=float)
+        except Exception as exc:  # pragma: no cover - best-effort warm start
+            if tee:
+                print(f"[IPO-GRAD] IPO closed-form warm-start failed: {exc}")
     if theta_init_override is not None:
         trainer_kwargs["theta_init"] = theta_init_override
+    if model_key == "ipo_grad":
+        trainer_kwargs["ipo_grad_debug_kkt"] = bool(ipo_grad_debug_kkt)
 
     start_time = time.perf_counter()
     trainer_ret = trainer(**trainer_kwargs)
@@ -235,6 +259,7 @@ def run_rolling_experiment(
     tee: bool,
     asset_pred_dir: Path | None = None,
     eval_start: Optional[pd.Timestamp] = None,
+    ipo_grad_debug_kkt: bool = False,
 ) -> Dict[str, object]:
     trainer = get_trainer(model_key, solver_spec)
     schedule = build_rebalance_schedule(bundle, train_window, rebal_interval, eval_start=eval_start)
@@ -301,6 +326,7 @@ def run_rolling_experiment(
                     item.train_start,
                     item.train_end,
                     tee,
+                    ipo_grad_debug_kkt=ipo_grad_debug_kkt,
                 )
                 elapsed_total += elapsed_c
                 obj_raw = info_c.get("objective_value") if isinstance(info_c, dict) else None
@@ -325,6 +351,7 @@ def run_rolling_experiment(
                 item.train_start,
                 item.train_end,
                 tee,
+                ipo_grad_debug_kkt=ipo_grad_debug_kkt,
             )
             obj_raw = info.get("objective_value") if isinstance(info, dict) else None
             train_objective = float(obj_raw) if obj_raw is not None else float("nan")
@@ -354,6 +381,8 @@ def run_rolling_experiment(
                 "solver_status": (info or {}).get("status", ""),
                 "solver_term": (info or {}).get("termination_condition", ""),
                 "elapsed_sec": elapsed,
+                "train_eq_viol_max": (info or {}).get("eq_viol_max", float("nan")),
+                "train_ineq_viol_max": (info or {}).get("ineq_viol_max", float("nan")),
                 "delta_down_selected": float(selected_delta_down),
                 "train_objective": float(train_objective),
             }
@@ -840,7 +869,7 @@ def main() -> None:
     eval_start_ts = pd.Timestamp(args.start)
 
     for model_key in model_list:
-        if model_key not in {"ols", "ipo", "flex"}:
+        if model_key not in {"ols", "ipo", "ipo_grad", "flex"}:
             print(f"[real-data] skipping unsupported model '{model_key}'")
             continue
         formulations = flex_formulations if model_key == "flex" else [None]
@@ -888,6 +917,7 @@ def main() -> None:
                 tee=args.tee,
                 asset_pred_dir=asset_pred_dir,
                 eval_start=eval_start_ts,
+                ipo_grad_debug_kkt=getattr(args, "ipo_grad_debug_kkt", False),
             )
             stats_results.append(run_result["stats"])
             if model_key == "flex":
@@ -1264,10 +1294,15 @@ def main() -> None:
     if rebalance_records:
         rebalance_df = pd.DataFrame(rebalance_records)
         rebalance_df.to_csv(analysis_csv_dir / "rebalance_summary.csv", index=False)
+        solver_debug_dir = analysis_fig_dir / "solver_debug"
+        solver_debug_dir.mkdir(parents=True, exist_ok=True)
+        plot_solver_summary_bars(rebalance_df, solver_debug_dir)
     # flex solver debug: サイクルごとの elapsed / status を時系列で表示
     if flex_rebalance_logs:
         flex_debug_df = pd.concat(flex_rebalance_logs, ignore_index=True)
-        plot_flex_solver_debug(flex_debug_df, analysis_fig_dir / "flex_solver_debug.png")
+        solver_debug_dir = analysis_fig_dir / "solver_debug"
+        solver_debug_dir.mkdir(parents=True, exist_ok=True)
+        plot_flex_solver_debug(flex_debug_df, solver_debug_dir / "flex_solver_debug.png")
     if delta_records:
         delta_df = pd.DataFrame(delta_records)
         delta_df.to_csv(analysis_csv_dir / "delta_trajectory.csv", index=False)
@@ -1301,7 +1336,7 @@ if __name__ == "__main__":  # pragma: no cover
 
 """
 Baseline execution (defaults match the CLI parser):
-
+----------------------------------------------------------
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.real_data_run \
@@ -1314,14 +1349,14 @@ python -m dfl_portfolio.experiments.real_data_run \
   --rebal-interval 4 \
   --delta-up 0.5 \
   --delta-down 0.5 \
-  --models ols,ipo,flex \
+  --models "ols,ipo,ipo_grad,flex" \
   --flex-solver knitro \
   --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-lambda-theta-anchor 10.0 \
   --flex-theta-anchor-mode ipo \
-  --benchmarks "spy,equal_weight,tsmom_spy" \
+  --benchmarks "spy,1/n,tsmom_spy" \
   --trading-cost-bps 1 \
-  --trading-cost-per-asset "SPY:5,GLD:10,EURUSD=X:2,TLT:5" \
+  --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
   --debug-roll
 
 
@@ -1354,13 +1389,21 @@ CLI options (defaults follow the parser definitions)
 - `--delta` (float ∈ [0,1], default `0.5`): 既定の δ。
 - `--delta-up` (float ∈ [0,1], default `None` → `--delta`): 目的関数で使う δ。
 - `--delta-down` (float ∈ [0,1], default `None` → `--delta-up`): DFL 制約で使う δ。
-- `--models` (str, default `ols,ipo,flex`): 走らせるモデル一覧。
+- `--models` (str, default `ols,ipo,flex`): 走らせるモデル一覧（例 `ols,ipo,ipo_grad,flex`）。
 - `--flex-solver` (str, default `knitro`).
 - `--flex-formulation` (str, default `dual,kkt,dual&kkt`): Flex の定式化。
 - `--flex-ensemble-weight-dual` (float ∈ [0,1], default `0.5`): dual/kkt ensemble の重み。
 - `--flex-lambda-theta-anchor` / `--flex-lambda-theta-iso` (float, default `10.0` / `0.0`): θ 罰則。
 - `--flex-theta-anchor-mode` (str, default `ipo`), `--flex-theta-init-mode` (str, default `none`): θ アンカー / 初期化モード。
 - `--flex-lambda-phi-anchor` (float, default `0.0`): V-learning の φ アンカー罰則。
+
+IPO-GRAD（IPO-NN）設定
+- `--ipo-grad-epochs` (int, default `500`): IPO-GRAD の学習エポック数。
+- `--ipo-grad-lr` (float, default `1e-3`): IPO-GRAD の学習率（Adam）。
+- `--ipo-grad-batch-size` (int, default `0`): IPO-GRAD のバッチサイズ（0 の場合はフルバッチ）。
+- `--ipo-grad-qp-max-iter` (int, default `5000`): IPO-GRAD 内部の QP ソルバの最大反復回数。
+- `--ipo-grad-qp-tol` (float, default `1e-6`): IPO-GRAD 内部の QP ソルバの収束許容誤差。
+- `--ipo-grad-debug-kkt`: IPO-GRAD の各リバランスで KKT 条件のデバッグチェックを有効化。
 
 取引コスト
 - `--trading-cost-bps` (float, default `0.0`): 正の値を指定すると、内蔵のティッカー別コスト表（bps）を有効化。
@@ -1369,9 +1412,7 @@ CLI options (defaults follow the parser definitions)
 実行制御・出力
 - `--tee`: ソルバログを表示。
 - `--debug-roll` / `--no-debug-roll`: ローリング進捗ログの表示切替（デフォルト有効）。
-- `--benchmark-ticker` (str, default `SPY`).
-- `--benchmark-equal-weight` / `--no-benchmark-equal-weight`: 等配分ベンチマークの有無（デフォルト有効）。
-- `--benchmarks` (str, default `""`): 新しいベンチマーク指定（例 `spy,equal_weight,min_var`）。空文字のときは従来フラグにフォールバック。
+- `--benchmarks` (str, default `""`): 新しいベンチマーク指定（例 `spy,1/n,tsmom_spy`）。空文字のときは従来フラグにフォールバック。
 - `--outdir` (Path, default `None` → `results/exp_real_data/<timestamp>` に自動作成)。
 - `--no-debug`: データローダのデバッグログを抑止。
 """
