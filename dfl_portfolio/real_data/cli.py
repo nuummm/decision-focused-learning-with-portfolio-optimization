@@ -205,6 +205,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional overrides like 'SPY:5,GLD:8' (basis points) applied per ticker.",
     )
+    parser.add_argument(
+        "--benchmarks",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated benchmark list (spy,equal_weight,1/n,tsmom_spy). "
+            "Empty string falls back to legacy flags."
+        ),
+    )
     parser.add_argument("--tee", action="store_true")
     parser.add_argument(
         "--debug-roll",

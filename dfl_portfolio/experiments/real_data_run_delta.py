@@ -29,8 +29,6 @@ from dfl_portfolio.real_data.reporting import (
     WEIGHT_THRESHOLD,
     WEIGHT_PLOT_MAX_POINTS,
     PERIOD_WINDOWS,
-    compute_benchmark_series,
-    compute_equal_weight_benchmark,
     compute_correlation_stats,
     compute_period_metrics,
     compute_pairwise_mean_return_tests,
@@ -74,6 +72,7 @@ from dfl_portfolio.experiments.real_data_common import (
     prepare_flex_training_args,
     resolve_trading_cost_rates,
 )
+from dfl_portfolio.experiments.real_data_benchmarks import run_benchmark_suite
 
 HERE = Path(__file__).resolve()
 PROJECT_ROOT = HERE.parents[3]
@@ -557,6 +556,14 @@ def main() -> None:
     )
     args = parser.parse_args()
     model_train_windows = parse_model_train_window_spec(getattr(args, "model_train_window", ""))
+    benchmark_specs = parse_commalist(getattr(args, "benchmarks", ""))
+    if not benchmark_specs:
+        fallback: List[str] = []
+        if (args.benchmark_ticker or "").strip():
+            fallback.append("spy")
+        if getattr(args, "benchmark_equal_weight", False):
+            fallback.append("equal_weight")
+        benchmark_specs = fallback
 
     tickers = parse_tickers(args.tickers)
     outdir = make_output_dir(RESULTS_ROOT, args.outdir)
@@ -849,41 +856,18 @@ def main() -> None:
             log_prefix="[ensemble]",
         )
 
-    benchmark_spec = (args.benchmark_ticker or "").strip()
-    if benchmark_spec and wealth_dict:
-        min_date: Optional[pd.Timestamp] = None
-        for df in wealth_dict.values():
-            if df.empty:
-                continue
-            dates = pd.to_datetime(df["date"])
-            if dates.empty:
-                continue
-            current_min = dates.min()
-            if pd.isna(current_min):
-                continue
-            if min_date is None or current_min < min_date:
-                min_date = current_min
-        benchmark_info = compute_benchmark_series(bundle, benchmark_spec, start_date=min_date)
-        if benchmark_info:
-            stats_results.append(benchmark_info["stats"])
-            wealth_dict[benchmark_info["label"]] = benchmark_info["wealth_df"]
-    if getattr(args, "benchmark_equal_weight", False) and wealth_dict:
-        min_date_eq: Optional[pd.Timestamp] = None
-        for df in wealth_dict.values():
-            if df.empty:
-                continue
-            dates = pd.to_datetime(df["date"])
-            if dates.empty:
-                continue
-            current_min = dates.min()
-            if pd.isna(current_min):
-                continue
-            if min_date_eq is None or current_min < min_date_eq:
-                min_date_eq = current_min
-        eq_info = compute_equal_weight_benchmark(bundle, start_date=min_date_eq)
-        if eq_info:
-            stats_results.append(eq_info["stats"])
-            wealth_dict[eq_info["label"]] = eq_info["wealth_df"]
+    bench_stats, bench_wealth = run_benchmark_suite(
+        bundle,
+        benchmarks=benchmark_specs,
+        args=args,
+        trading_costs_enabled=trading_costs_enabled,
+        asset_cost_overrides=asset_cost_overrides_dec,
+        eval_start=eval_start_ts,
+    )
+    if bench_stats:
+        stats_results.extend(bench_stats)
+    for label, df in bench_wealth.items():
+        wealth_dict[label] = df
 
     summary_csv_path = analysis_csv_dir / "1-summary.csv"
     summary_cost_csv_path = analysis_csv_dir / "1-summary_cost.csv"

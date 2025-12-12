@@ -347,6 +347,22 @@ def build_flex_dual_kkt_ensemble(
     else:
         weights_df = pd.DataFrame()
 
+    avg_turnover = float("nan")
+    if not weights_df.empty:
+        weights_sorted = weights_df.sort_values("date")
+        prev_vec: Optional[np.ndarray] = None
+        turnover_vals: List[float] = []
+        for _, row in weights_sorted.iterrows():
+            vec = np.array([row.get(t, np.nan) for t in tickers], dtype=float)
+            if not np.all(np.isfinite(vec)):
+                prev_vec = None
+                continue
+            if prev_vec is not None:
+                turnover_vals.append(0.5 * float(np.sum(np.abs(vec - prev_vec))))
+            prev_vec = vec
+        if turnover_vals:
+            avg_turnover = float(np.mean(turnover_vals))
+
     returns = ens_df["portfolio_return"].to_numpy()
     mean_step = float(np.mean(returns)) if returns.size else 0.0
     std_step = float(np.std(returns, ddof=1)) if returns.size > 1 else 0.0
@@ -381,12 +397,22 @@ def build_flex_dual_kkt_ensemble(
         "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "ann_return_net": mean_return,
+        "ann_volatility_net": std_return,
+        "sharpe_net": sharpe,
+        "sortino_net": sortino,
         "cvar_95": cvar_95,
         "max_drawdown": max_drawdown(wealth_series_values),
         "terminal_wealth": terminal_wealth,
+        "terminal_wealth_net": terminal_wealth,
         "total_return": total_return,
+        "total_return_net": total_return,
         "train_window": args.train_window,
         "rebal_interval": args.rebal_interval,
+        "avg_turnover": avg_turnover,
+        "avg_trading_cost": 0.0,
+        "trading_cost_bps": 0.0,
+        "avg_condition_number": float("nan"),
     }
     stats_results.append(stats_report)
 

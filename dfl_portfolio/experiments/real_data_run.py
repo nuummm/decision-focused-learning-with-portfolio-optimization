@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+try:  # matplotlib is only needed for custom window plots
+    import matplotlib.pyplot as plt  # type: ignore
+except Exception:  # pragma: no cover - best effort
+    plt = None
+
 import numpy as np
 import pandas as pd
 
@@ -29,8 +34,6 @@ from dfl_portfolio.real_data.reporting import (
     WEIGHT_THRESHOLD,
     WEIGHT_PLOT_MAX_POINTS,
     PERIOD_WINDOWS,
-    compute_benchmark_series,
-    compute_equal_weight_benchmark,
     compute_correlation_stats,
     compute_period_metrics,
     compute_pairwise_mean_return_tests,
@@ -72,6 +75,7 @@ from dfl_portfolio.experiments.real_data_common import (
     prepare_flex_training_args,
     resolve_trading_cost_rates,
 )
+from dfl_portfolio.experiments.real_data_benchmarks import run_benchmark_suite
 
 HERE = Path(__file__).resolve()
 PROJECT_ROOT = HERE.parents[3]
@@ -82,6 +86,67 @@ DEBUG_ROOT = RESULTS_BASE / "debug_outputs"
 # Suppress Pyomo-related warnings (only show errors)
 logging.getLogger("pyomo").setLevel(logging.ERROR)
 logging.getLogger("pyomo.solvers").setLevel(logging.ERROR)
+
+
+def plot_weight_window_with_connections(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+    """Render stacked weights and effective connection counts per model."""
+
+    if plt is None or not weight_dict:
+        return
+    entries: List[Tuple[str, pd.DataFrame]] = []
+    for model_key, df in weight_dict.items():
+        if df.empty or "date" not in df.columns:
+            continue
+        tmp = df.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"])
+        tmp = tmp.sort_values("date")
+        entries.append((str(model_key), tmp))
+    if not entries:
+        return
+
+    n_models = len(entries)
+    fig_height = max(2.5 * n_models + 2, 4)
+    fig, axes = plt.subplots(n_models + 1, 1, figsize=(12, fig_height), sharex=True)
+    axes = np.atleast_1d(axes)
+    axes_list = list(axes)
+    conn_ax = axes_list[-1]
+    model_axes = axes_list[:-1]
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+
+    for idx, ((model_key, df_model), ax) in enumerate(zip(entries, model_axes)):
+        asset_cols = [c for c in df_model.columns if c not in {"date", "portfolio_return_sq"}]
+        if not asset_cols:
+            continue
+        values = df_model[asset_cols].astype(float)
+        dates = pd.to_datetime(df_model["date"])
+        bottom = np.zeros(len(values))
+        for col_idx, col in enumerate(asset_cols):
+            label = col if idx == 0 else None
+            ax.bar(dates, values[col], bottom=bottom, width=5, label=label)
+            bottom += values[col].to_numpy()
+        ax.set_ylabel(display_model_name(model_key))
+        ax.set_ylim(0.0, 1.0)
+        if idx == 0 and asset_cols:
+            ax.legend(loc="upper right", fontsize=8)
+
+        weights = values
+        h_val = (weights.pow(2).sum(axis=1)).replace(0.0, np.nan)
+        neff = 1.0 / h_val
+        color = color_cycle[idx % len(color_cycle)] if color_cycle else None
+        conn_ax.plot(
+            dates,
+            neff,
+            label=display_model_name(model_key),
+            color=color,
+        )
+
+    conn_ax.set_ylabel("N_eff")
+    conn_ax.set_xlabel("date")
+    conn_ax.set_title("Effective connection count (N_eff)")
+    conn_ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
 
 
 def train_model_window(
@@ -187,7 +252,18 @@ def run_rolling_experiment(
         enable_default_costs=trading_cost_enabled,
     )
     costs_active = bool(np.any(asset_cost_rates > 0.0))
-    mean_defined_cost_bps = float(np.mean(asset_cost_rates) * 10000.0) if costs_active else 0.0
+    cost_label_entries: List[str] = []
+    if costs_active:
+        for ticker, rate in zip(tickers, asset_cost_rates):
+            bps_val = float(rate * 10000.0)
+            if not np.isfinite(bps_val):
+                continue
+            if abs(bps_val - round(bps_val)) < 1e-9:
+                entry = f"{ticker}:{int(round(bps_val))}"
+            else:
+                entry = f"{ticker}:{bps_val:.2f}"
+            cost_label_entries.append(entry)
+    trading_cost_label = ",".join(cost_label_entries)
 
     wealth = 1.0
     wealth_net = 1.0
@@ -546,7 +622,7 @@ def run_rolling_experiment(
         "rebal_interval": rebal_interval,
         "avg_turnover": avg_turnover,
         "avg_trading_cost": avg_trading_cost,
-        "trading_cost_bps": mean_defined_cost_bps,
+        "trading_cost_bps": trading_cost_label,
         "avg_condition_number": avg_condition,
     }
 
@@ -592,6 +668,14 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     model_train_windows = parse_model_train_window_spec(getattr(args, "model_train_window", ""))
+    benchmark_specs = parse_commalist(getattr(args, "benchmarks", ""))
+    if not benchmark_specs:
+        legacy_list: List[str] = []
+        if (args.benchmark_ticker or "").strip():
+            legacy_list.append("spy")
+        if getattr(args, "benchmark_equal_weight", False):
+            legacy_list.append("equal_weight")
+        benchmark_specs = legacy_list
 
     tickers = parse_tickers(args.tickers)
     outdir = make_output_dir(RESULTS_ROOT, args.outdir)
@@ -858,42 +942,18 @@ def main() -> None:
             log_prefix="[ensemble]",
         )
 
-    benchmark_spec = (args.benchmark_ticker or "").strip()
-    if benchmark_spec and wealth_dict:
-        min_date: Optional[pd.Timestamp] = None
-        for df in wealth_dict.values():
-            if df.empty:
-                continue
-            dates = pd.to_datetime(df["date"])
-            if dates.empty:
-                continue
-            current_min = dates.min()
-            if pd.isna(current_min):
-                continue
-            if min_date is None or current_min < min_date:
-                min_date = current_min
-        benchmark_info = compute_benchmark_series(bundle, benchmark_spec, start_date=min_date)
-        if benchmark_info:
-            stats_results.append(benchmark_info["stats"])
-            wealth_dict[benchmark_info["label"]] = benchmark_info["wealth_df"]
-    # 等配分ベンチマーク
-    if getattr(args, "benchmark_equal_weight", False) and wealth_dict:
-        min_date_eq: Optional[pd.Timestamp] = None
-        for df in wealth_dict.values():
-            if df.empty:
-                continue
-            dates = pd.to_datetime(df["date"])
-            if dates.empty:
-                continue
-            current_min = dates.min()
-            if pd.isna(current_min):
-                continue
-            if min_date_eq is None or current_min < min_date_eq:
-                min_date_eq = current_min
-        eq_info = compute_equal_weight_benchmark(bundle, start_date=min_date_eq)
-        if eq_info:
-            stats_results.append(eq_info["stats"])
-            wealth_dict[eq_info["label"]] = eq_info["wealth_df"]
+    bench_stats, bench_wealth = run_benchmark_suite(
+        bundle,
+        benchmarks=benchmark_specs,
+        args=args,
+        trading_costs_enabled=trading_costs_enabled,
+        asset_cost_overrides=asset_cost_overrides_dec,
+        eval_start=eval_start_ts,
+    )
+    if bench_stats:
+        stats_results.extend(bench_stats)
+    for label, df in bench_wealth.items():
+        wealth_dict[label] = df
 
     summary_output_path = analysis_dir / "1-summary.csv"
     summary_csv_path = analysis_csv_dir / "1-summary.csv"
@@ -902,11 +962,26 @@ def main() -> None:
     summary_raw_df = pd.DataFrame(stats_results)
     if not summary_raw_df.empty:
         summary_raw_df["max_drawdown"] = summary_raw_df["max_drawdown"].astype(float)
-        summary_df = format_summary_for_output(summary_raw_df)
+        gross_df = summary_raw_df.drop(
+            columns=[c for c in summary_raw_df.columns if c.endswith("_net")],
+            errors="ignore",
+        ).drop(columns=["trading_cost_bps"], errors="ignore")
+        summary_df = format_summary_for_output(gross_df)
         summary_df.to_csv(summary_output_path, index=False)
-        summary_cost_df = format_summary_for_output(
-            build_cost_adjusted_summary(summary_raw_df)
-        )
+
+        net_keep_cols = ["model"] + [c for c in summary_raw_df.columns if c.endswith("_net")]
+        net_keep_cols += [
+            "avg_turnover",
+            "avg_trading_cost",
+            "trading_cost_bps",
+            "r2",
+            "n_retrain",
+            "n_invest_steps",
+            "max_drawdown",
+            "cvar_95",
+        ]
+        summary_cost_base = summary_raw_df[[c for c in net_keep_cols if c in summary_raw_df.columns]].copy()
+        summary_cost_df = format_summary_for_output(summary_cost_base)
         summary_cost_df.to_csv(summary_cost_path, index=False)
     else:
         summary_output_path.write_text("")
@@ -1119,9 +1194,12 @@ def main() -> None:
                 plot_weight_comparison(
                     sub_weights, event_fig_dir / f"weights_comparison_{name}.png"
                 )
-        # 実験全期間を 5 年ごとに区切り、各ウィンドウの weights_comparison を出力
-        weights_5y_dir = analysis_fig_dir / "weights_windows_5y"
-        weights_5y_dir.mkdir(parents=True, exist_ok=True)
+        # 実験全期間を 2 年ごとに区切り、各ウィンドウの weights_comparison を出力
+        weights_2y_dir = analysis_fig_dir / "weights_windows_2y"
+        weights_all_dir = weights_2y_dir / "all_models"
+        weights_dfl_dir = weights_2y_dir / "dfl_only"
+        weights_all_dir.mkdir(parents=True, exist_ok=True)
+        weights_dfl_dir.mkdir(parents=True, exist_ok=True)
         # 全モデルの weight 日付の min/max を取得
         all_dates: List[pd.Timestamp] = []
         for df in weight_dict.values():
@@ -1136,7 +1214,7 @@ def main() -> None:
             end_all = max(all_dates)
             start_win = start_all
             while start_win < end_all:
-                end_win = start_win + pd.DateOffset(years=5)
+                end_win = start_win + pd.DateOffset(years=2)
                 if end_win > end_all:
                     end_win = end_all
                 window_label = f"{start_win.year}_{end_win.year}"
@@ -1151,12 +1229,17 @@ def main() -> None:
                     if not tmp.empty:
                         sub_weights[m] = tmp
                 if sub_weights:
-                    plot_weight_comparison(
+                    plot_weight_window_with_connections(
                         sub_weights,
-                        weights_5y_dir / f"weights_comparison_5y_{window_label}.png",
-                        max_points=None,
+                        weights_all_dir / f"weights_window_2y_{window_label}.png",
                     )
-                start_win = start_win + pd.DateOffset(years=5)
+                    flex_only = {k: v for k, v in sub_weights.items() if "flex" in str(k)}
+                    if flex_only:
+                        plot_weight_window_with_connections(
+                            flex_only,
+                            weights_dfl_dir / f"weights_window_2y_{window_label}.png",
+                        )
+                start_win = start_win + pd.DateOffset(years=2)
         export_weight_variance_correlation(
             weight_dict,
             analysis_csv_dir / "weight_variance_correlation.csv",
@@ -1188,7 +1271,21 @@ def main() -> None:
     if delta_records:
         delta_df = pd.DataFrame(delta_records)
         delta_df.to_csv(analysis_csv_dir / "delta_trajectory.csv", index=False)
-        plot_delta_paths(delta_df, analysis_fig_dir / "delta_paths.png")
+        delta_plot_df = delta_df.copy()
+        if "model" in delta_plot_df.columns and "delta_used" in delta_plot_df.columns:
+            means = (
+                delta_plot_df.groupby("model")["delta_used"]
+                .mean()
+                .to_dict()
+            )
+            delta_plot_df["model"] = delta_plot_df["model"].map(
+                lambda m: (
+                    f"{m} (avg={means.get(m, float('nan')):.3f})"
+                    if m in means and np.isfinite(means.get(m, np.nan))
+                    else str(m)
+                )
+            )
+        plot_delta_paths(delta_plot_df, analysis_fig_dir / "delta_paths.png")
     if not summary_df.empty:
         update_experiment_ledger(RESULTS_ROOT, outdir, args, summary_df, analysis_csv_dir, bundle_summary)
 
@@ -1208,7 +1305,7 @@ Baseline execution (defaults match the CLI parser):
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.real_data_run \
-  --tickers "SPY,GLD,EURUSD=X,TLT" \
+  --tickers "SPY,GLD,EEM,TLT" \
   --start 2006-01-01 --end 2025-12-01 \
   --momentum-window 26 \
   --cov-window 13 \
@@ -1222,8 +1319,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-lambda-theta-anchor 10.0 \
   --flex-theta-anchor-mode ipo \
-  --benchmark-ticker SPY \
-  --benchmark-equal-weight \
+  --benchmarks "spy,equal_weight,tsmom_spy" \
   --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EURUSD=X:2,TLT:5" \
   --debug-roll
@@ -1275,6 +1371,7 @@ CLI options (defaults follow the parser definitions)
 - `--debug-roll` / `--no-debug-roll`: ローリング進捗ログの表示切替（デフォルト有効）。
 - `--benchmark-ticker` (str, default `SPY`).
 - `--benchmark-equal-weight` / `--no-benchmark-equal-weight`: 等配分ベンチマークの有無（デフォルト有効）。
+- `--benchmarks` (str, default `""`): 新しいベンチマーク指定（例 `spy,equal_weight,min_var`）。空文字のときは従来フラグにフォールバック。
 - `--outdir` (Path, default `None` → `results/exp_real_data/<timestamp>` に自動作成)。
 - `--no-debug`: データローダのデバッグログを抑止。
 """

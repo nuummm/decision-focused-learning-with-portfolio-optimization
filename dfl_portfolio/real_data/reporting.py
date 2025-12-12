@@ -294,8 +294,8 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     if summary_df.empty:
         return summary_df
     df = summary_df.copy()
-    # summary では train_window / rebal_interval は列から除外する
-    for col in ["train_window", "rebal_interval"]:
+    # summary では train_window / rebal_interval / avg_condition_number は列から除外する
+    for col in ["train_window", "rebal_interval", "avg_condition_number"]:
         if col in df.columns:
             df = df.drop(columns=[col])
     # % として表示する列（年率リターン・年率ボラティリティ・累積リターン）
@@ -307,7 +307,6 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         "ann_volatility_net",
         "total_return_net",
         "avg_turnover",
-        "avg_trading_cost",
     ]
     for col in percent_cols:
         if col in df.columns:
@@ -321,6 +320,11 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         df["cvar_95"] = (df["cvar_95"].astype(float) * 100.0).round(2)
     if "max_drawdown" in df.columns:
         df["max_drawdown"] = (-df["max_drawdown"].astype(float) * 100.0).round(2)
+    if "avg_trading_cost" in df.columns:
+        series = pd.to_numeric(df["avg_trading_cost"], errors="coerce")
+        df["avg_trading_cost"] = series.apply(
+            lambda x: f"{x:.4f}" if pd.notna(x) else ""
+        )
     if "terminal_wealth" in df.columns:
         df["terminal_wealth"] = df["terminal_wealth"].astype(float).round(2)
     if "terminal_wealth_net" in df.columns:
@@ -377,8 +381,6 @@ def build_cost_adjusted_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
     for gross_col, net_col in replacements.items():
         if net_col in df.columns:
             df[gross_col] = df[net_col]
-    drop_cols = [net for net in replacements.values() if net in df.columns]
-    df = df.drop(columns=drop_cols, errors="ignore")
     return df
 
 
@@ -393,13 +395,20 @@ def plot_delta_paths(delta_df: pd.DataFrame, path: Path) -> None:
     use_date_axis = "rebalance_date" in delta_df.columns
     for model, sub in delta_df.groupby("model"):
         sub_sorted = sub.sort_values("cycle") if "cycle" in sub.columns else sub.copy()
+        delta_vals = pd.to_numeric(sub_sorted["delta_used"], errors="coerce")
+        delta_mean = float(delta_vals.mean()) if delta_vals.notna().any() else float("nan")
+        label = (
+            f"{model} (avg={delta_mean:.3f})"
+            if np.isfinite(delta_mean)
+            else str(model)
+        )
         if use_date_axis:
             x = pd.to_datetime(sub_sorted["rebalance_date"])
         else:
             if "cycle" not in sub_sorted.columns:
                 continue
             x = sub_sorted["cycle"]
-        ax.plot(x, sub_sorted["delta_used"], label=model)
+        ax.plot(x, sub_sorted["delta_used"], label=label)
 
     # 金融ショック期間を背景に表示（wealth_events と同じ PERIOD_WINDOWS を使用）
     if use_date_axis:
@@ -1006,6 +1015,7 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
 
     # --- 右: elapsed time のヒストグラム比較 ---
     ax_time = axes[1]
+    use_log_scale = False
     if "elapsed_sec" in flex_df.columns:
         grouped = []
         for model, sub in flex_df.groupby("model_display"):
@@ -1043,7 +1053,9 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
                     linewidth=1.0,
                     alpha=0.9,
                 )
-            ax_time.set_xscale("log")
+            use_log_scale = True
+    if use_log_scale:
+        ax_time.set_xscale("log")
     ax_time.set_xlabel("elapsed time (sec)")
     ax_time.set_ylabel("frequency")
     ax_time.set_title("Flex solver elapsed time histogram")
@@ -1108,12 +1120,22 @@ def compute_benchmark_series(
         "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "ann_return_net": mean_return,
+        "ann_volatility_net": std_return,
+        "sharpe_net": sharpe,
+        "sortino_net": sortino,
         "cvar_95": cvar_95,
         "max_drawdown": max_drawdown(wealth_list),
         "terminal_wealth": terminal_wealth,
+        "terminal_wealth_net": terminal_wealth,
         "total_return": total_return,
+        "total_return_net": total_return,
         "train_window": 0,
         "rebal_interval": 0,
+        "avg_turnover": 0.0,
+        "avg_trading_cost": 0.0,
+        "trading_cost_bps": 0.0,
+        "avg_condition_number": float("nan"),
     }
     return {"label": label, "wealth_df": wealth_df, "stats": stats}
 
@@ -1166,12 +1188,22 @@ def compute_equal_weight_benchmark(
         "ann_volatility": std_return,
         "sharpe": sharpe,
         "sortino": sortino,
+        "ann_return_net": mean_return,
+        "ann_volatility_net": std_return,
+        "sharpe_net": sharpe,
+        "sortino_net": sortino,
         "cvar_95": cvar_95,
         "max_drawdown": max_drawdown(wealth_list),
         "terminal_wealth": terminal_wealth,
+        "terminal_wealth_net": terminal_wealth,
         "total_return": total_return,
+        "total_return_net": total_return,
         "train_window": 0,
         "rebal_interval": 0,
+        "avg_turnover": 0.0,
+        "avg_trading_cost": 0.0,
+        "trading_cost_bps": 0.0,
+        "avg_condition_number": float("nan"),
     }
     return {"label": label, "wealth_df": wealth_df, "stats": stats}
 
