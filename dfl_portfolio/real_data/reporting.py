@@ -37,11 +37,13 @@ _MODEL_DISPLAY_MAP = {
     "ols": "OLS",
     "ipo": "IPO-analytic",
     "ipo_grad": "IPO-GRAD",
+    "spo_plus": "SPO+",
     "flex": "DFL-QCQP",
     "flex_dual": "DFL-QCQP-dual",
     "flex_kkt": "DFL-QCQP-kkt",
     "flex_dual_kkt_ens": "DFL-QCQP-ens",
     "benchmark_equal_weight": "1/N",
+    "benchmark_tsmom_spy": "TSMOM (SPY)",
 }
 
 # 一貫した色指定（内部名ベース）
@@ -49,23 +51,108 @@ MODEL_COLOR_MAP: Dict[str, str] = {
     "ols": "tab:blue",
     "ipo": "tab:orange",
     "ipo_grad": "tab:brown",
+    "spo_plus": "tab:cyan",
     "flex": "tab:green",
     "flex_dual": "tab:green",
     "flex_kkt": "tab:red",
     "flex_dual_kkt_ens": "black",
     "benchmark_SPY": "tab:purple",
+    "benchmark_tsmom_spy": "tab:olive",
     "benchmark_equal_weight": "grey",
 }
+
+# 線種やアルファをモデルごとに統一的に指定（DFL系は同系色、ensは目立ちすぎない点線）
+MODEL_LINESTYLE_MAP: Dict[str, str] = {
+    "ols": "-",
+    "ipo": "-",
+    "ipo_grad": "-.",
+    "flex": "-",
+    "flex_dual": "-",
+    "flex_kkt": "--",
+    "flex_dual_kkt_ens": ":",
+    "benchmark_SPY": "--",
+    "benchmark_tsmom_spy": "-.",
+    "benchmark_equal_weight": "-",
+}
+MODEL_LINEWIDTH_MAP: Dict[str, float] = {
+    "flex_dual_kkt_ens": 1.8,
+}
+MODEL_ALPHA_MAP: Dict[str, float] = {
+    # DFL 主系統をやや淡く重ねやすく、ens はさらに抑える
+    "flex_dual": 0.75,
+    "flex_kkt": 0.75,
+    "flex_dual_kkt_ens": 0.65,
+}
+
+# 資産系列の基本カラー（データ概観プロットで使用）
+ASSET_COLOR_SEQUENCE = [
+    "tab:blue",
+    "tab:orange",
+    "tab:green",
+    "tab:red",
+    "tab:purple",
+    "tab:brown",
+    "tab:pink",
+    "tab:gray",
+    "tab:olive",
+    "tab:cyan",
+]
+
+
+def _model_plot_kwargs(model: str, base_alpha: float = 1.0) -> Dict[str, object]:
+    """統一した色・線種を返すヘルパー。"""
+    kwargs: Dict[str, object] = {}
+    color = MODEL_COLOR_MAP.get(model)
+    if color:
+        kwargs["color"] = color
+    linestyle = MODEL_LINESTYLE_MAP.get(model)
+    if linestyle:
+        kwargs["linestyle"] = linestyle
+    linewidth = MODEL_LINEWIDTH_MAP.get(model)
+    if linewidth:
+        kwargs["linewidth"] = linewidth
+    alpha = MODEL_ALPHA_MAP.get(model, 1.0) * base_alpha
+    if alpha != 1.0:
+        kwargs["alpha"] = alpha
+    return kwargs
+
+
+def _add_range_markers(ax, start_ts: Optional[pd.Timestamp], end_ts: Optional[pd.Timestamp]) -> None:
+    """開始・終了を示す縦線と日付ラベルを控えめに追加する。"""
+    if start_ts is None or end_ts is None:
+        return
+    y_min, y_max = ax.get_ylim()
+    y_span = max(y_max - y_min, 1e-9)
+    y_pos = y_min + 0.02 * y_span
+    for ts in [start_ts, end_ts]:
+        if pd.isna(ts):
+            continue
+        ts_dt = pd.to_datetime(ts)
+        ax.axvline(ts_dt, color="0.35", linestyle=":", linewidth=0.9, alpha=0.8)
+        ax.text(
+            ts_dt,
+            y_pos,
+            ts_dt.date().isoformat(),
+            rotation=90,
+            va="bottom",
+            ha="center",
+            fontsize=8,
+            color="0.35",
+            alpha=0.9,
+            clip_on=False,
+        )
 
 
 def display_model_name(model: str) -> str:
     """集計・可視化用にモデル名を整形する."""
     name = str(model)
+    if name in _MODEL_DISPLAY_MAP:
+        return _MODEL_DISPLAY_MAP[name]
     # ベンチマークティッカー系: benchmark_SPY → Buy&Hold SPY
     if name.startswith("benchmark_") and name != "benchmark_equal_weight":
         ticker = name[len("benchmark_") :]
         return f"Buy&Hold {ticker}"
-    return _MODEL_DISPLAY_MAP.get(name, name)
+    return name
 
 
 def _compute_steps_per_year(dates: Sequence[pd.Timestamp], n_steps: int) -> float:
@@ -416,8 +503,8 @@ def plot_delta_paths(delta_df: pd.DataFrame, path: Path) -> None:
 
     # 金融ショック期間を背景に表示（wealth_events と同じ PERIOD_WINDOWS を使用）
     if use_date_axis:
-        for name, start, end in PERIOD_WINDOWS:
-            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15, label=name)
+        for _, start, end in PERIOD_WINDOWS:
+            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
 
     ax.set_xlabel("date" if use_date_axis else "cycle")
     ax.set_ylabel("delta")
@@ -513,8 +600,8 @@ def plot_phi_paths(phi_df: pd.DataFrame, path: Path) -> None:
         )
 
     if use_date_axis:
-        for name, start, end in PERIOD_WINDOWS:
-            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15, label=name)
+        for _, start, end in PERIOD_WINDOWS:
+            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
 
     ax.set_xlabel("date" if use_date_axis else "cycle")
     ax.set_ylabel("phi")
@@ -553,8 +640,8 @@ def plot_beta_paths(beta_df: pd.DataFrame, path: Path) -> None:
         ax.plot(x, sub_sorted["beta_used"], label=model)
 
     if use_date_axis:
-        for name, start, end in PERIOD_WINDOWS:
-            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15, label=name)
+        for _, start, end in PERIOD_WINDOWS:
+            ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
 
     ax.set_xlabel("date" if use_date_axis else "cycle")
     ax.set_ylabel("beta")
@@ -579,19 +666,18 @@ def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
         return
     plt.figure(figsize=(10, 4))
     for model, df in wealth_dict.items():
-        color = MODEL_COLOR_MAP.get(model, None)
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
-        if color is not None:
-            kwargs["color"] = color
-        # flex_dual / flex_kkt は半透明で重なりを見やすく
-        if model in {"flex_dual", "flex_kkt"}:
-            kwargs["linestyle"] = "-"
-            kwargs["alpha"] = 0.4
+        kwargs.update(_model_plot_kwargs(model))
         plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
     plt.xlabel("date")
     plt.ylabel("wealth")
     plt.title("Wealth comparison")
+    # 開始・終了を控えめにマーキング
+    all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
+    if not all_dates.empty:
+        ax = plt.gca()
+        _add_range_markers(ax, all_dates.min(), all_dates.max())
     plt.legend()
     plt.tight_layout()
     fig_path = path
@@ -606,20 +692,19 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
         return
     plt.figure(figsize=(10, 4))
     for model, df in wealth_dict.items():
-        color = MODEL_COLOR_MAP.get(model, None)
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
-        if color is not None:
-            kwargs["color"] = color
-        if model in {"flex_dual", "flex_kkt"}:
-            kwargs["linestyle"] = "-"
-            kwargs["alpha"] = 0.4
+        kwargs.update(_model_plot_kwargs(model))
         plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
-    for name, start, end in PERIOD_WINDOWS:
-        plt.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15, label=name)
+    for _, start, end in PERIOD_WINDOWS:
+        plt.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
     plt.xlabel("date")
     plt.ylabel("wealth")
     plt.title("Wealth comparison with crisis windows")
+    all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
+    if not all_dates.empty:
+        ax = plt.gca()
+        _add_range_markers(ax, all_dates.min(), all_dates.max())
     handles, labels = plt.gca().get_legend_handles_labels()
     seen = set()
     unique_handles = []
@@ -676,14 +761,9 @@ def plot_wealth_window_normalized(
             continue
         series = tmp.copy()
         series["wealth_norm"] = series["wealth"].astype(float) / base
-        color = MODEL_COLOR_MAP.get(model, None)
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
-        if color is not None:
-            kwargs["color"] = color
-        if model in {"flex_dual", "flex_kkt"}:
-            kwargs["linestyle"] = "-"
-            kwargs["alpha"] = 0.4
+        kwargs.update(_model_plot_kwargs(model))
         (line_handle,) = plt.plot(series["date"], series["wealth_norm"], **kwargs)
         norm_series_by_model[model] = series[["date", "wealth_norm"]].copy()
         line_colors[model] = line_handle.get_color()
@@ -695,6 +775,8 @@ def plot_wealth_window_normalized(
     plt.xlabel("date")
     plt.ylabel("normalized wealth (start=1)")
     plt.title(f"Wealth normalized in window: {period_name}")
+    ax = plt.gca()
+    _add_range_markers(ax, start_ts, end_ts)
     plt.legend(loc="upper left")
 
     if events_by_model:
@@ -743,8 +825,10 @@ def plot_time_series(df: pd.DataFrame, title: str, start_date: pd.Timestamp, pat
     if plt is None or df.empty:
         return
     plt.figure(figsize=(10, 4))
-    for col in df.columns:
-        plt.plot(df.index, df[col], label=col)
+    cols = list(df.columns)
+    for idx, col in enumerate(cols):
+        color = ASSET_COLOR_SEQUENCE[idx % len(ASSET_COLOR_SEQUENCE)]
+        plt.plot(df.index, df[col], label=col, color=color, linewidth=1.2)
     if not pd.isna(start_date):
         plt.axvline(start_date, color="red", linestyle="--", label="start_date")
     plt.title(title)
@@ -824,18 +908,43 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
     x = np.arange(len(models))
     width = 0.8 / max(len(tickers), 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+    hatch_patterns = ["", "//", "\\\\", "++", "xx", "..", "**"]
+    # モデルの色をバーのベース色にし、ティッカーはハッチで区別する
+    model_colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
 
     # 平均ウェイト
     ax = axes[0]
     for i, ticker in enumerate(tickers):
-        ax.bar(x + i * width, pivot_avg[ticker], width=width, label=ticker)
+        hatch = hatch_patterns[i % len(hatch_patterns)]
+        ax.bar(
+            x + i * width,
+            pivot_avg[ticker],
+            width=width,
+            label=ticker,
+            color=model_colors,
+            edgecolor="black",
+            linewidth=0.6,
+            hatch=hatch,
+            alpha=0.85,
+        )
     ax.set_title("Average weight per asset")
     ax.set_ylabel("average weight")
 
     # 95%以上採用頻度
     ax = axes[1]
     for i, ticker in enumerate(tickers):
-        ax.bar(x + i * width, pivot_freq[ticker], width=width, label=ticker)
+        hatch = hatch_patterns[i % len(hatch_patterns)]
+        ax.bar(
+            x + i * width,
+            pivot_freq[ticker],
+            width=width,
+            label=ticker,
+            color=model_colors,
+            edgecolor="black",
+            linewidth=0.6,
+            hatch=hatch,
+            alpha=0.85,
+        )
     ax.set_title(f"Freq(weight ≥ {WEIGHT_THRESHOLD:.2f}) per asset")
     ax.set_ylabel("frequency")
 
@@ -868,8 +977,8 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
     elif n_cols == 1:
         axes = np.array([[ax] for ax in axes])
 
-    # 共通のビン（0〜1 の範囲を等間隔に分割）
-    bins = np.linspace(0.0, 1.0, 21)
+    # 共通のビン（0〜1 をより細かく等間隔に分割）
+    bins = np.linspace(0.0, 1.0, 41)
 
     for r, model in enumerate(models):
         values, _ = reduce_weight_columns(weight_dict[model])
@@ -1078,118 +1187,6 @@ def compute_benchmark_series(
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return None
-
-
-def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
-    """Plot solver warning counts and mean elapsed time for key models.
-
-    Focuses on flex_dual, flex_kkt, and ipo_grad. For flex models, a warning
-    is counted when solver_status is not 'optimal'/'ok'. For ipo_grad, a warning
-    is counted when the recorded maximum constraint violation exceeds a small
-    tolerance.
-    """
-    if plt is None:
-        return
-    if rebalance_df.empty or "model" not in rebalance_df.columns:
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    df = rebalance_df.copy()
-
-    def _base_model(name: object) -> Optional[str]:
-        s = str(name)
-        if "flex_dual" in s:
-            return "flex_dual"
-        if "flex_kkt" in s:
-            return "flex_kkt"
-        if s == "ipo_grad":
-            return "ipo_grad"
-        return None
-
-    df["model_base"] = df["model"].map(_base_model)
-    df = df[df["model_base"].notna()].copy()
-    if df.empty:
-        return
-
-    # Define warnings
-    def _is_ok(status: object) -> bool:
-        s = str(status).lower()
-        return ("optimal" in s) or ("ok" in s)
-
-    df["is_warning"] = False
-    mask_flex = df["model_base"].isin(["flex_dual", "flex_kkt"])
-    df.loc[mask_flex, "is_warning"] = ~df.loc[mask_flex, "solver_status"].map(_is_ok)
-
-    mask_ipo = df["model_base"] == "ipo_grad"
-    if mask_ipo.any():
-        eq = df.loc[mask_ipo, "train_eq_viol_max"].astype(float).abs()
-        ineq = df.loc[mask_ipo, "train_ineq_viol_max"].astype(float).abs()
-        # Treat violations above small tolerances as warnings.
-        eq_tol = 1e-4
-        ineq_tol = 1e-8
-        df.loc[mask_ipo, "is_warning"] = (eq > eq_tol) | (ineq > ineq_tol)
-
-    # Aggregate statistics
-    warn_counts = df.groupby("model_base")["is_warning"].sum()
-    total_counts = df.groupby("model_base")["is_warning"].count()
-    elapsed_mean = df.groupby("model_base")["elapsed_sec"].mean()
-
-    models = ["flex_dual", "flex_kkt", "ipo_grad"]
-    display_names = {
-        "flex_dual": "DFL-QCQP-dual",
-        "flex_kkt": "DFL-QCQP-kkt",
-        "ipo_grad": "IPO-GRAD",
-    }
-
-    # Warning counts bar chart
-    values = [float(warn_counts.get(m, 0.0)) for m in models]
-    totals = [int(total_counts.get(m, 0)) for m in models]
-    if any(totals):
-        fig, ax = plt.subplots(figsize=(6, 4))
-        x = np.arange(len(models))
-        colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
-        bars = ax.bar(x, values, color=colors, alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
-        ax.set_ylabel("warning count")
-        ax.set_title("Solver warning counts (flex / IPO-GRAD)")
-        for xi, bar, val, tot in zip(x, bars, values, totals):
-            ax.text(
-                xi,
-                bar.get_height() + 0.05,
-                f"{int(val)}/{tot}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
-        fig.tight_layout()
-        fig.savefig(out_dir / "solver_warning_counts.png")
-        plt.close(fig)
-
-    # Mean elapsed time bar chart
-    elapsed_vals = [float(elapsed_mean.get(m, np.nan)) for m in models]
-    if any(np.isfinite(elapsed_vals)):
-        fig, ax = plt.subplots(figsize=(6, 4))
-        x = np.arange(len(models))
-        colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
-        bars = ax.bar(x, elapsed_vals, color=colors, alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
-        ax.set_ylabel("mean elapsed time per cycle (sec)")
-        ax.set_title("Solver mean elapsed time (flex / IPO-GRAD)")
-        for xi, bar, val in zip(x, bars, elapsed_vals):
-            if np.isfinite(val):
-                ax.text(
-                    xi,
-                    bar.get_height() + 0.01,
-                    f"{val:.3f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
-        fig.tight_layout()
-        fig.savefig(out_dir / "solver_elapsed_mean.png")
-        plt.close(fig)
     returns_df = bundle.dataset.returns
     if ticker not in returns_df.columns:
         print(f"[benchmark] ticker '{ticker}' not found in returns; skipping benchmark.")
@@ -1254,6 +1251,129 @@ def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
         "avg_condition_number": float("nan"),
     }
     return {"label": label, "wealth_df": wealth_df, "stats": stats}
+
+
+def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
+    """Plot solver warning counts and mean elapsed time for key models.
+
+    Focuses on flex_dual, flex_kkt, ipo_grad, and spo_plus. For flex models, a warning
+    is counted when solver_status is not 'optimal'/'ok'. For ipo_grad, a warning
+    is counted when the recorded maximum constraint violation exceeds a small
+    tolerance. For spo_plus, a warning is counted when the oracle reports any
+    failures/fallbacks.
+    """
+    if plt is None:
+        return
+    if rebalance_df.empty or "model" not in rebalance_df.columns:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df = rebalance_df.copy()
+
+    def _base_model(name: object) -> Optional[str]:
+        s = str(name)
+        if "flex_dual" in s:
+            return "flex_dual"
+        if "flex_kkt" in s:
+            return "flex_kkt"
+        if s == "ipo_grad":
+            return "ipo_grad"
+        if s == "spo_plus":
+            return "spo_plus"
+        return None
+
+    df["model_base"] = df["model"].map(_base_model)
+    df = df[df["model_base"].notna()].copy()
+    if df.empty:
+        return
+
+    # Define warnings
+    def _is_ok(status: object) -> bool:
+        s = str(status).lower()
+        return ("optimal" in s) or ("ok" in s)
+
+    df["is_warning"] = False
+    mask_flex = df["model_base"].isin(["flex_dual", "flex_kkt"])
+    df.loc[mask_flex, "is_warning"] = ~df.loc[mask_flex, "solver_status"].map(_is_ok)
+
+    mask_ipo = df["model_base"] == "ipo_grad"
+    if mask_ipo.any():
+        eq = df.loc[mask_ipo, "train_eq_viol_max"].astype(float).abs()
+        ineq = df.loc[mask_ipo, "train_ineq_viol_max"].astype(float).abs()
+        # Treat violations above small tolerances as warnings.
+        eq_tol = 1e-4
+        ineq_tol = 1e-8
+        df.loc[mask_ipo, "is_warning"] = (eq > eq_tol) | (ineq > ineq_tol)
+
+    mask_spo = df["model_base"] == "spo_plus"
+    if mask_spo.any():
+        fail_true = df.loc[mask_spo, "spo_oracle_fail_true"].astype(float).fillna(0.0)
+        fail_tilde = df.loc[mask_spo, "spo_oracle_fail_tilde"].astype(float).fillna(0.0)
+        fallback_tilde = df.loc[mask_spo, "spo_oracle_fallback_tilde"].astype(float).fillna(0.0)
+        df.loc[mask_spo, "is_warning"] = (fail_true > 0) | (fail_tilde > 0) | (fallback_tilde > 0)
+
+    # Aggregate statistics
+    warn_counts = df.groupby("model_base")["is_warning"].sum()
+    total_counts = df.groupby("model_base")["is_warning"].count()
+    elapsed_mean = df.groupby("model_base")["elapsed_sec"].mean()
+
+    models = ["flex_dual", "flex_kkt", "ipo_grad", "spo_plus"]
+    display_names = {
+        "flex_dual": "DFL-QCQP-dual",
+        "flex_kkt": "DFL-QCQP-kkt",
+        "ipo_grad": "IPO-GRAD",
+        "spo_plus": "SPO+",
+    }
+
+    # Warning counts bar chart
+    values = [float(warn_counts.get(m, 0.0)) for m in models]
+    totals = [int(total_counts.get(m, 0)) for m in models]
+    if any(totals):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        x = np.arange(len(models))
+        colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
+        bars = ax.bar(x, values, color=colors, alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
+        ax.set_ylabel("warning count")
+        ax.set_title("Solver warning counts (flex / IPO-GRAD / SPO+)")
+        for xi, bar, val, tot in zip(x, bars, values, totals):
+            ax.text(
+                xi,
+                bar.get_height() + 0.05,
+                f"{int(val)}/{tot}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        fig.tight_layout()
+        fig.savefig(out_dir / "solver_warning_counts.png")
+        plt.close(fig)
+
+    # Mean elapsed time bar chart
+    elapsed_vals = [float(elapsed_mean.get(m, np.nan)) for m in models]
+    if any(np.isfinite(elapsed_vals)):
+        fig, ax = plt.subplots(figsize=(6, 4))
+        x = np.arange(len(models))
+        colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
+        bars = ax.bar(x, elapsed_vals, color=colors, alpha=0.8)
+        ax.set_xticks(x)
+        ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
+        ax.set_ylabel("mean elapsed time per cycle (sec)")
+        ax.set_title("Solver mean elapsed time (flex / IPO-GRAD / SPO+)")
+        for xi, bar, val in zip(x, bars, elapsed_vals):
+            if np.isfinite(val):
+                ax.text(
+                    xi,
+                    bar.get_height() + 0.01,
+                    f"{val:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+        fig.tight_layout()
+        fig.savefig(out_dir / "solver_elapsed_mean.png")
+        plt.close(fig)
 
 
 def compute_equal_weight_benchmark(
@@ -1389,7 +1509,19 @@ def export_max_return_winner_counts(
     x = np.arange(len(counts.index))
     labels = list(counts.index)
     values = counts.to_numpy(dtype=float)
-    plt.bar(x, values, color="tab:blue", alpha=0.8)
+    colors = [ASSET_COLOR_SEQUENCE[i % len(ASSET_COLOR_SEQUENCE)] for i in range(len(labels))]
+    hatches = ["", "//", "\\\\", "++", "xx", "..", "**"]
+    hatch_list = [hatches[i % len(hatches)] for i in range(len(labels))]
+    for xi, val, color, hatch in zip(x, values, colors, hatch_list):
+        plt.bar(
+            xi,
+            val,
+            color=color,
+            alpha=0.85,
+            edgecolor="black",
+            linewidth=0.6,
+            hatch=hatch,
+        )
     plt.xticks(x, labels, rotation=45, ha="right")
     plt.ylabel("count of max-return days")
     plt.title("How often each asset had the highest daily return")

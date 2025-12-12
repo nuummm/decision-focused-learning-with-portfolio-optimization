@@ -6,6 +6,7 @@ from dfl_portfolio.models.dfl_p1_flex import fit_dfl_p1_flex as _fit_flex, Solve
 from dfl_portfolio.models.ols_baseline import fit_ols_baseline
 from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
 from dfl_portfolio.models.ipo_grad import fit_ipo_grad
+from dfl_portfolio.models.spo_plus import fit_spo_plus
 
 # 型エイリアス（分かりやすさ用）
 NDArray = Any
@@ -210,6 +211,47 @@ def _wrap_ipo_grad(spec: SolverSpec) -> TrainerFn:
     return _runner
 
 
+def _wrap_spo_plus(spec: SolverSpec) -> TrainerFn:
+    # SPO+: linear objective + (optional) risk-constrained simplex oracle (gurobi)
+    def _runner(
+        X: NDArray, Y: NDArray, Vhats: List[NDArray], idx: List[int],
+        start_index: Optional[int] = None, end_index: Optional[int] = None,
+        delta: float = 1.0, theta_init: Optional[NDArray] = None,
+        tee: bool = False,
+        solver: str = "spo_plus",
+        solver_options: Optional[Dict[str, Any]] = None,
+        **kw,
+    ):
+        epochs = int(kw.pop("spo_plus_epochs", 500))
+        lr = float(kw.pop("spo_plus_lr", 1e-3))
+        batch_size = int(kw.pop("spo_plus_batch_size", 0))
+        lambda_reg = float(kw.pop("spo_plus_lambda_reg", 0.0))
+        risk_constraint = bool(kw.pop("spo_plus_risk_constraint", True))
+        risk_mult = float(kw.pop("spo_plus_risk_mult", 2.0))
+        psd_eps = float(kw.pop("spo_plus_psd_eps", 1e-9))
+        # theta_init is intentionally ignored (SPO+ starts from zeros by design)
+        ret = fit_spo_plus(
+            X,
+            Y,
+            Vhats,
+            idx,
+            start_index=start_index,
+            end_index=end_index,
+            delta=delta,
+            epochs=epochs,
+            lr=lr,
+            batch_size=batch_size,
+            lambda_reg=lambda_reg,
+            risk_constraint=risk_constraint,
+            risk_mult=risk_mult,
+            psd_eps=psd_eps,
+            tee=tee,
+        )
+        return ret
+
+    return _runner
+
+
 # レジストリ本体
 def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
     key = model_key.lower()
@@ -239,7 +281,9 @@ def get_trainer(model_key: str, solver_spec: SolverSpec) -> TrainerFn:
         return _wrap_ipo(solver_spec)
     if key in ("ipo_grad", "ipo-nn", "ipo_nn"):
         return _wrap_ipo_grad(solver_spec)
-    raise KeyError(f"Unknown model_key: {model_key}. Use one of: flex, ols, ipo, ipo_grad")
+    if key in ("spo_plus", "spo+", "spoplus", "spo_plus_risk"):
+        return _wrap_spo_plus(solver_spec)
+    raise KeyError(f"Unknown model_key: {model_key}. Use one of: flex, ols, ipo, ipo_grad, spo_plus")
 
 def available_models() -> Dict[str, Callable]:
     # ヘルプ/表示用：実体は使われない
@@ -248,4 +292,5 @@ def available_models() -> Dict[str, Callable]:
         "ols": fit_ols_baseline,
         "ipo": fit_ipo_closed_form,
         "ipo_grad": fit_ipo_grad,
+        "spo_plus": fit_spo_plus,
     }

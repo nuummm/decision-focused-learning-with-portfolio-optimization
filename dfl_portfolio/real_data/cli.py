@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ipo-grad-epochs",
         type=int,
-        default=1000,
+        default=500,
         help="Number of training epochs for IPO-GRAD (IPO neural network).",
     )
     parser.add_argument(
@@ -242,6 +242,52 @@ def build_parser() -> argparse.ArgumentParser:
             "Enable additional IPO-GRAD diagnostics (prints approximate "
             "constraint violations per epoch)."
         ),
+    )
+    parser.add_argument(
+        "--spo-plus-epochs",
+        type=int,
+        default=500,
+        help="Number of training epochs for SPO+.",
+    )
+    parser.add_argument(
+        "--spo-plus-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for SPO+ (Adam).",
+    )
+    parser.add_argument(
+        "--spo-plus-batch-size",
+        type=int,
+        default=0,
+        help="Batch size for SPO+ (0 means full batch).",
+    )
+    parser.add_argument(
+        "--spo-plus-lambda-reg",
+        type=float,
+        default=0.0,
+        help="L2 regularization strength on theta for SPO+.",
+    )
+    parser.add_argument(
+        "--spo-plus-risk-mult",
+        type=float,
+        default=2.0,
+        help=(
+            "Risk budget multiplier for SPO+ oracle when using risk constraint: "
+            "kappa = mult * min_z z^T V_S z (on the simplex)."
+        ),
+    )
+    parser.add_argument(
+        "--spo-plus-risk-constraint",
+        dest="spo_plus_risk_constraint",
+        action="store_true",
+        default=True,
+        help="Enable SPO+ risk constraint z^T V_S z <= kappa (enabled by default).",
+    )
+    parser.add_argument(
+        "--spo-plus-no-risk-constraint",
+        dest="spo_plus_risk_constraint",
+        action="store_false",
+        help="Disable SPO+ risk constraint (simplex-only oracle).",
     )
     parser.add_argument(
         "--benchmarks",

@@ -158,6 +158,7 @@ def train_model_window(
     delta_down: float,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
+    spo_plus_options: Dict[str, Any] | None,
     train_start: int,
     train_end: int,
     tee: bool,
@@ -204,6 +205,8 @@ def train_model_window(
         trainer_kwargs["theta_init"] = theta_init_override
     if model_key == "ipo_grad":
         trainer_kwargs["ipo_grad_debug_kkt"] = bool(ipo_grad_debug_kkt)
+    if model_key == "spo_plus" and spo_plus_options:
+        trainer_kwargs.update(spo_plus_options)
 
     start_time = time.perf_counter()
     trainer_ret = trainer(**trainer_kwargs)
@@ -251,6 +254,7 @@ def run_rolling_experiment(
     asset_cost_overrides: Dict[str, float] | None,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
+    spo_plus_options: Dict[str, Any] | None,
     train_window: int,
     rebal_interval: int,
     debug_roll: bool,
@@ -323,6 +327,7 @@ def run_rolling_experiment(
                     cand,
                     solver_spec,
                     flex_options,
+                    spo_plus_options,
                     item.train_start,
                     item.train_end,
                     tee,
@@ -348,6 +353,7 @@ def run_rolling_experiment(
                 selected_delta,
                 solver_spec,
                 flex_options,
+                spo_plus_options,
                 item.train_start,
                 item.train_end,
                 tee,
@@ -383,6 +389,10 @@ def run_rolling_experiment(
                 "elapsed_sec": elapsed,
                 "train_eq_viol_max": (info or {}).get("eq_viol_max", float("nan")),
                 "train_ineq_viol_max": (info or {}).get("ineq_viol_max", float("nan")),
+                # SPO+ oracle diagnostics (present only for spo_plus)
+                "spo_oracle_fail_true": (info or {}).get("oracle_fail_true", float("nan")),
+                "spo_oracle_fail_tilde": (info or {}).get("oracle_fail_tilde", float("nan")),
+                "spo_oracle_fallback_tilde": (info or {}).get("oracle_fallback_tilde", float("nan")),
                 "delta_down_selected": float(selected_delta_down),
                 "train_objective": float(train_objective),
             }
@@ -849,6 +859,8 @@ def main() -> None:
     weight_dict: Dict[str, pd.DataFrame] = {}
     train_window_records: List[Dict[str, object]] = []
     rebalance_records: List[Dict[str, object]] = []
+    # 全モデルのリバランスログ（solver_status などサイクルごとの情報を統合）
+    rebalance_log_frames: List[pd.DataFrame] = []
     # flex モデルのサイクルごとの rebalance ログ（solver 状態の時系列可視化用）
     flex_rebalance_logs: List[pd.DataFrame] = []
     delta_records: List[Dict[str, object]] = []
@@ -868,8 +880,17 @@ def main() -> None:
 
     eval_start_ts = pd.Timestamp(args.start)
 
+    spo_plus_options: Dict[str, Any] = {
+        "spo_plus_epochs": getattr(args, "spo_plus_epochs", 500),
+        "spo_plus_lr": getattr(args, "spo_plus_lr", 1e-3),
+        "spo_plus_batch_size": getattr(args, "spo_plus_batch_size", 0),
+        "spo_plus_lambda_reg": getattr(args, "spo_plus_lambda_reg", 0.0),
+        "spo_plus_risk_constraint": getattr(args, "spo_plus_risk_constraint", True),
+        "spo_plus_risk_mult": getattr(args, "spo_plus_risk_mult", 2.0),
+    }
+
     for model_key in model_list:
-        if model_key not in {"ols", "ipo", "ipo_grad", "flex"}:
+        if model_key not in {"ols", "ipo", "ipo_grad", "spo_plus", "flex"}:
             print(f"[real-data] skipping unsupported model '{model_key}'")
             continue
         formulations = flex_formulations if model_key == "flex" else [None]
@@ -878,7 +899,12 @@ def main() -> None:
             if model_key == "flex" and (len(formulations) > 1 or (form and form != "dual")):
                 label = f"{model_key}_{form}"
             print(f"[real-data] rolling model={label}")
-            solver_name = args.flex_solver if model_key == "flex" else "analytic"
+            if model_key == "flex":
+                solver_name = args.flex_solver
+            elif model_key == "spo_plus":
+                solver_name = "gurobi"
+            else:
+                solver_name = "analytic"
             solver_spec = SolverSpec(name=solver_name, tee=args.tee)
             flex_options = None
             if model_key == "flex":
@@ -918,6 +944,7 @@ def main() -> None:
                 asset_pred_dir=asset_pred_dir,
                 eval_start=eval_start_ts,
                 ipo_grad_debug_kkt=getattr(args, "ipo_grad_debug_kkt", False),
+                spo_plus_options=spo_plus_options,
             )
             stats_results.append(run_result["stats"])
             if model_key == "flex":
@@ -927,6 +954,8 @@ def main() -> None:
             reb_df = run_result.get("rebalance_df", pd.DataFrame())
             if model_key == "flex" and isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
                 flex_rebalance_logs.append(reb_df.copy())
+            if isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
+                rebalance_log_frames.append(reb_df.copy())
             reb_summary = run_result.get("rebalance_summary", {})
             if reb_summary:
                 record = {
@@ -1078,11 +1107,15 @@ def main() -> None:
                     wealth_events_primary_path,
                     analysis_fig_dir / wealth_events_primary_path.name,
                 )
-            # 2) DFL 系モデルのみ（flex 系だけ抽出）
-            flex_only = {m: df for m, df in wealth_dict.items() if "flex" in str(m)}
-            if flex_only:
+            # 2) DFL + IPO + SPO+（主要な学習系モデルのみを抽出）
+            primary_models = {
+                m: df
+                for m, df in wealth_dict.items()
+                if any(key in str(m) for key in ["flex", "ipo", "spo_plus"])
+            }
+            if primary_models:
                 plot_wealth_with_events(
-                    flex_only,
+                    primary_models,
                     analysis_fig_dir / "wealth_events_dfl_only.png",
                 )
             # 3) DFL-dual vs その他（flex_dual を基準に比較）
@@ -1098,8 +1131,9 @@ def main() -> None:
                 for key, df in wealth_dict.items():
                     if key == flex_dual_key:
                         continue
-                    # 比較対象として flex 系以外のモデルのみ追加
-                    if "flex" in str(key):
+                    # 比較対象としてベンチマーク系のみを追加
+                    key_str = str(key)
+                    if not (key_str.startswith("benchmark_") or key_str == "benchmark_equal_weight"):
                         continue
                     dual_vs_others[key] = df
                 if len(dual_vs_others) > 1:
@@ -1291,12 +1325,15 @@ def main() -> None:
         pd.DataFrame(train_window_records).to_csv(
             analysis_csv_dir / "model_train_windows.csv", index=False
         )
+    solver_debug_dir = analysis_fig_dir / "solver_debug"
     if rebalance_records:
         rebalance_df = pd.DataFrame(rebalance_records)
         rebalance_df.to_csv(analysis_csv_dir / "rebalance_summary.csv", index=False)
-        solver_debug_dir = analysis_fig_dir / "solver_debug"
         solver_debug_dir.mkdir(parents=True, exist_ok=True)
-        plot_solver_summary_bars(rebalance_df, solver_debug_dir)
+    if rebalance_log_frames:
+        solver_debug_dir.mkdir(parents=True, exist_ok=True)
+        rebalance_log_df = pd.concat(rebalance_log_frames, ignore_index=True)
+        plot_solver_summary_bars(rebalance_log_df, solver_debug_dir)
     # flex solver debug: サイクルごとの elapsed / status を時系列で表示
     if flex_rebalance_logs:
         flex_debug_df = pd.concat(flex_rebalance_logs, ignore_index=True)
@@ -1349,13 +1386,13 @@ python -m dfl_portfolio.experiments.real_data_run \
   --rebal-interval 4 \
   --delta-up 0.5 \
   --delta-down 0.5 \
-  --models "ols,ipo,ipo_grad,flex" \
+  --models "ols,ipo,ipo_grad,spo_plus,flex" \
+  --spo-plus-risk-constraint \
   --flex-solver knitro \
   --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-lambda-theta-anchor 10.0 \
   --flex-theta-anchor-mode ipo \
   --benchmarks "spy,1/n,tsmom_spy" \
-  --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
   --debug-roll
 
@@ -1404,6 +1441,14 @@ IPO-GRAD（IPO-NN）設定
 - `--ipo-grad-qp-max-iter` (int, default `5000`): IPO-GRAD 内部の QP ソルバの最大反復回数。
 - `--ipo-grad-qp-tol` (float, default `1e-6`): IPO-GRAD 内部の QP ソルバの収束許容誤差。
 - `--ipo-grad-debug-kkt`: IPO-GRAD の各リバランスで KKT 条件のデバッグチェックを有効化。
+
+SPO+ 設定
+- `--spo-plus-epochs` (int, default `500`): SPO+ の学習エポック数。
+- `--spo-plus-lr` (float, default `1e-3`): SPO+ の学習率（Adam）。
+- `--spo-plus-batch-size` (int, default `0`): SPO+ のバッチサイズ（0 の場合はフルバッチ）。
+- `--spo-plus-lambda-reg` (float, default `0.0`): SPO+ の L2 正則化係数（θ）。
+- `--spo-plus-risk-mult` (float, default `2.0`): リスク制約の強さ（κ = mult × min-var risk）。
+- `--spo-plus-risk-constraint` / `--spo-plus-no-risk-constraint`: リスク制約の有効/無効（デフォルト有効）。
 
 取引コスト
 - `--trading-cost-bps` (float, default `0.0`): 正の値を指定すると、内蔵のティッカー別コスト表（bps）を有効化。
