@@ -229,7 +229,7 @@ def _wrap_spo_plus(spec: SolverSpec) -> TrainerFn:
         risk_constraint = bool(kw.pop("spo_plus_risk_constraint", True))
         risk_mult = float(kw.pop("spo_plus_risk_mult", 2.0))
         psd_eps = float(kw.pop("spo_plus_psd_eps", 1e-9))
-        # theta_init is intentionally ignored (SPO+ starts from zeros by design)
+        kw.pop("spo_plus_init_mode", None)  # consumed upstream; ignore if present
         ret = fit_spo_plus(
             X,
             Y,
@@ -246,6 +246,7 @@ def _wrap_spo_plus(spec: SolverSpec) -> TrainerFn:
             risk_mult=risk_mult,
             psd_eps=psd_eps,
             tee=tee,
+            theta_init=theta_init,
         )
         return ret
 

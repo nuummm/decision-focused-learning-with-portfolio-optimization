@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import json
 import logging
 import math
+import os
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+# Ensure a non-GUI backend for matplotlib (important when running model jobs in worker threads).
+# On macOS, GUI backends can crash if figures are created outside the main thread.
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 try:  # matplotlib is only needed for custom window plots
+    import matplotlib
+
+    matplotlib.use("Agg")  # must be set before importing pyplot
     import matplotlib.pyplot as plt  # type: ignore
 except Exception:  # pragma: no cover - best effort
     plt = None
@@ -201,6 +210,27 @@ def train_model_window(
         except Exception as exc:  # pragma: no cover - best-effort warm start
             if tee:
                 print(f"[IPO-GRAD] IPO closed-form warm-start failed: {exc}")
+    if model_key == "spo_plus" and spo_plus_options:
+        init_mode = str(spo_plus_options.get("spo_plus_init_mode", "zero")).lower()
+        if init_mode == "ipo":
+            try:
+                theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
+                    bundle.dataset.X,
+                    bundle.dataset.Y,
+                    bundle.covariances,
+                    bundle.cov_indices.tolist(),
+                    start_index=train_start,
+                    end_index=train_end,
+                    delta=delta_for_training,
+                    mode="budget",
+                    psd_eps=1e-12,
+                    ridge_theta=1e-10,
+                    tee=tee,
+                )
+                theta_init_override = np.asarray(theta_ipo, dtype=float)
+            except Exception as exc:  # pragma: no cover
+                if tee:
+                    print(f"[SPO+] IPO warm-start failed; falling back to zero init. err={exc}")
     if theta_init_override is not None:
         trainer_kwargs["theta_init"] = theta_init_override
     if model_key == "ipo_grad":
@@ -887,8 +917,31 @@ def main() -> None:
         "spo_plus_lambda_reg": getattr(args, "spo_plus_lambda_reg", 0.0),
         "spo_plus_risk_constraint": getattr(args, "spo_plus_risk_constraint", True),
         "spo_plus_risk_mult": getattr(args, "spo_plus_risk_mult", 2.0),
+        "spo_plus_init_mode": getattr(args, "spo_plus_init_mode", "zero"),
     }
 
+    @dataclass(frozen=True)
+    class _RunSpec:
+        order: int
+        model_key: str
+        label: str
+        form: Optional[str]
+        train_window: int
+
+    def _group_name(model_key: str) -> str:
+        if model_key in {"ols", "ipo"}:
+            return "base"
+        if model_key == "ipo_grad":
+            return "ipo_grad"
+        if model_key == "spo_plus":
+            return "spo_plus"
+        if model_key == "flex":
+            return "flex"
+        return "other"
+
+    # Expand (model_key, formulation) into per-run labels, then group them into jobs.
+    run_specs: List[_RunSpec] = []
+    order = 0
     for model_key in model_list:
         if model_key not in {"ols", "ipo", "ipo_grad", "spo_plus", "flex"}:
             print(f"[real-data] skipping unsupported model '{model_key}'")
@@ -898,36 +951,70 @@ def main() -> None:
             label = model_key
             if model_key == "flex" and (len(formulations) > 1 or (form and form != "dual")):
                 label = f"{model_key}_{form}"
-            print(f"[real-data] rolling model={label}")
-            if model_key == "flex":
+            effective_train_window = model_train_windows.get(model_key, args.train_window)
+            run_specs.append(
+                _RunSpec(
+                    order=order,
+                    model_key=model_key,
+                    label=label,
+                    form=form,
+                    train_window=int(effective_train_window),
+                )
+            )
+            train_window_records.append(
+                {
+                    "model": label,
+                    "base_model": model_key,
+                    "train_window": int(effective_train_window),
+                    "override": "yes" if model_key in model_train_windows else "no",
+                }
+            )
+            order += 1
+
+    for spec in run_specs:
+        if spec.model_key in model_train_windows:
+            print(
+                f"[real-data] overriding train_window for {spec.label}: "
+                f"{spec.train_window} (default {args.train_window})"
+            )
+
+    jobs: Dict[str, List[_RunSpec]] = {}
+    for spec in run_specs:
+        jobs.setdefault(_group_name(spec.model_key), []).append(spec)
+
+    # Stable job ordering for reproducible logs.
+    job_order = ["base", "ipo_grad", "spo_plus", "flex"]
+    job_items: List[Tuple[str, List[_RunSpec]]] = [
+        (name, jobs[name]) for name in job_order if name in jobs and jobs[name]
+    ]
+
+    auto_workers = len(job_items)
+    requested_workers = int(getattr(args, "jobs", 0) or 0)
+    max_workers = requested_workers if requested_workers > 0 else auto_workers
+    max_workers = max(1, min(max_workers, auto_workers)) if auto_workers > 0 else 1
+
+    if auto_workers > 1:
+        print(f"[real-data] running model jobs in parallel: {auto_workers} groups, max_workers={max_workers}")
+
+    def _run_group(group: str, specs: List[_RunSpec]) -> List[Tuple[_RunSpec, Dict[str, object]]]:
+        outputs: List[Tuple[_RunSpec, Dict[str, object]]] = []
+        for spec in specs:
+            print(f"[real-data] rolling model={spec.label}")
+            if spec.model_key == "flex":
                 solver_name = args.flex_solver
-            elif model_key == "spo_plus":
+            elif spec.model_key == "spo_plus":
                 solver_name = "gurobi"
             else:
                 solver_name = "analytic"
             solver_spec = SolverSpec(name=solver_name, tee=args.tee)
             flex_options = None
-            if model_key == "flex":
+            if spec.model_key == "flex":
                 flex_options = dict(flex_base_options)
-                flex_options["formulation"] = form or "dual"
-            results_dir = model_outputs_dir / label
-            effective_train_window = model_train_windows.get(model_key, args.train_window)
-            train_window_records.append(
-                {
-                    "model": label,
-                    "base_model": model_key,
-                    "train_window": effective_train_window,
-                    "override": "yes" if model_key in model_train_windows else "no",
-                }
-            )
-            if model_key in model_train_windows:
-                print(
-                    f"[real-data] overriding train_window for {label}: "
-                    f"{effective_train_window} (default {args.train_window})"
-                )
+                flex_options["formulation"] = spec.form or "dual"
+            results_dir = model_outputs_dir / spec.label
             run_result = run_rolling_experiment(
-                model_key=model_key,
-                model_label=label,
+                model_key=spec.model_key,
+                model_label=spec.label,
                 bundle=bundle,
                 delta_up=delta_up,
                 delta_down_candidates=delta_down_list,
@@ -935,7 +1022,8 @@ def main() -> None:
                 asset_cost_overrides=asset_cost_overrides_dec,
                 solver_spec=solver_spec,
                 flex_options=flex_options,
-                train_window=effective_train_window,
+                spo_plus_options=spo_plus_options,
+                train_window=spec.train_window,
                 rebal_interval=args.rebal_interval,
                 debug_roll=args.debug_roll,
                 debug_dir=debug_dir,
@@ -944,47 +1032,62 @@ def main() -> None:
                 asset_pred_dir=asset_pred_dir,
                 eval_start=eval_start_ts,
                 ipo_grad_debug_kkt=getattr(args, "ipo_grad_debug_kkt", False),
-                spo_plus_options=spo_plus_options,
             )
-            stats_results.append(run_result["stats"])
-            if model_key == "flex":
-                hist = run_result.get("delta_history", [])
-                if hist:
-                    delta_records.extend(hist)
-            reb_df = run_result.get("rebalance_df", pd.DataFrame())
-            if model_key == "flex" and isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
-                flex_rebalance_logs.append(reb_df.copy())
-            if isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
-                rebalance_log_frames.append(reb_df.copy())
-            reb_summary = run_result.get("rebalance_summary", {})
-            if reb_summary:
-                record = {
-                    "model": label,
-                    "base_model": model_key,
-                    "n_cycles": reb_summary.get("n_cycles"),
-                    "train_length_min": reb_summary.get("train_length_min"),
-                    "train_length_max": reb_summary.get("train_length_max"),
-                    "elapsed_mean": reb_summary.get("elapsed_mean"),
-                    "elapsed_max": reb_summary.get("elapsed_max"),
-                    "solver_status_counts": json.dumps(
-                        reb_summary.get("solver_status_counts", {}) or {}, ensure_ascii=False
-                    ),
-                }
-                status_counts = reb_summary.get("solver_status_counts", {}) or {}
-                for status, count in status_counts.items():
-                    record[f"solver_status_{status}"] = count
-                record["solver_status_optimal_total"] = status_counts.get("optimal", 0)
-                rebalance_records.append(record)
-            for row in run_result["period_metrics"]:
-                period_entry = dict(row)
-                period_entry["model"] = display_model_name(label)
-                period_entry["train_window"] = run_result["stats"].get(
-                    "train_window", effective_train_window
-                )
-                period_rows.append(period_entry)
-            wealth_dict[label] = run_result["wealth_df"][["date", "wealth"]]
-            if not run_result["weights_df"].empty:
-                weight_dict[label] = run_result["weights_df"]
+            outputs.append((spec, run_result))
+        return outputs
+
+    all_outputs: List[Tuple[_RunSpec, Dict[str, object]]] = []
+    if auto_workers <= 1:
+        for group, specs in job_items:
+            all_outputs.extend(_run_group(group, specs))
+    else:
+        with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(_run_group, group, specs): group for group, specs in job_items
+            }
+            for fut in cf.as_completed(futures):
+                all_outputs.extend(fut.result())
+
+    # Merge results in original spec order
+    all_outputs.sort(key=lambda t: t[0].order)
+    for spec, run_result in all_outputs:
+        stats_results.append(run_result["stats"])
+        if spec.model_key == "flex":
+            hist = run_result.get("delta_history", [])
+            if hist:
+                delta_records.extend(hist)
+        reb_df = run_result.get("rebalance_df", pd.DataFrame())
+        if spec.model_key == "flex" and isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
+            flex_rebalance_logs.append(reb_df.copy())
+        if isinstance(reb_df, pd.DataFrame) and not reb_df.empty:
+            rebalance_log_frames.append(reb_df.copy())
+        reb_summary = run_result.get("rebalance_summary", {})
+        if reb_summary:
+            record = {
+                "model": spec.label,
+                "base_model": spec.model_key,
+                "n_cycles": reb_summary.get("n_cycles"),
+                "train_length_min": reb_summary.get("train_length_min"),
+                "train_length_max": reb_summary.get("train_length_max"),
+                "elapsed_mean": reb_summary.get("elapsed_mean"),
+                "elapsed_max": reb_summary.get("elapsed_max"),
+                "solver_status_counts": json.dumps(
+                    reb_summary.get("solver_status_counts", {}) or {}, ensure_ascii=False
+                ),
+            }
+            status_counts = reb_summary.get("solver_status_counts", {}) or {}
+            for status, count in status_counts.items():
+                record[f"solver_status_{status}"] = count
+            record["solver_status_optimal_total"] = status_counts.get("optimal", 0)
+            rebalance_records.append(record)
+        for row in run_result["period_metrics"]:
+            period_entry = dict(row)
+            period_entry["model"] = display_model_name(spec.label)
+            period_entry["train_window"] = run_result["stats"].get("train_window", spec.train_window)
+            period_rows.append(period_entry)
+        wealth_dict[spec.label] = run_result["wealth_df"][["date", "wealth"]]
+        if not run_result["weights_df"].empty:
+            weight_dict[spec.label] = run_result["weights_df"]
 
     # Build flex dual/kkt ensemble if requested, using step_log.csv (convex combination of returns).
     if flex_ensemble_enabled:
@@ -1388,6 +1491,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --delta-down 0.5 \
   --models "ols,ipo,ipo_grad,spo_plus,flex" \
   --spo-plus-risk-constraint \
+  --spo-plus-init-mode ipo \
   --flex-solver knitro \
   --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-lambda-theta-anchor 10.0 \
@@ -1449,6 +1553,7 @@ SPO+ 設定
 - `--spo-plus-lambda-reg` (float, default `0.0`): SPO+ の L2 正則化係数（θ）。
 - `--spo-plus-risk-mult` (float, default `2.0`): リスク制約の強さ（κ = mult × min-var risk）。
 - `--spo-plus-risk-constraint` / `--spo-plus-no-risk-constraint`: リスク制約の有効/無効（デフォルト有効）。
+- `--spo-plus-init-mode` (str, default `zero`): SPO+ の初期化モード（`zero|ols|ipo`）。
 
 取引コスト
 - `--trading-cost-bps` (float, default `0.0`): 正の値を指定すると、内蔵のティッカー別コスト表（bps）を有効化。
@@ -1456,6 +1561,7 @@ SPO+ 設定
 
 実行制御・出力
 - `--tee`: ソルバログを表示。
+- `--jobs` (int, default `0` → 自動): モデルグループ並列実行数。
 - `--debug-roll` / `--no-debug-roll`: ローリング進捗ログの表示切替（デフォルト有効）。
 - `--benchmarks` (str, default `""`): 新しいベンチマーク指定（例 `spy,1/n,tsmom_spy`）。空文字のときは従来フラグにフォールバック。
 - `--outdir` (Path, default `None` → `results/exp_real_data/<timestamp>` に自動作成)。

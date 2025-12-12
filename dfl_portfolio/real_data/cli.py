@@ -290,6 +290,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable SPO+ risk constraint (simplex-only oracle).",
     )
     parser.add_argument(
+        "--spo-plus-init-mode",
+        type=str,
+        default="zero",
+        choices=["zero", "ipo"],
+        help="Initial theta for SPO+ (zero or IPO closed-form).",
+    )
+    parser.add_argument(
         "--benchmarks",
         type=str,
         default="",
@@ -299,6 +306,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--tee", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=0,
+        help=(
+            "Number of parallel jobs for model groups (0 = auto based on selected models). "
+            "Groups are: (ols+ipo), (ipo_grad), (spo_plus), (flex: dual/kkt)."
+        ),
+    )
     parser.add_argument(
         "--debug-roll",
         dest="debug_roll",

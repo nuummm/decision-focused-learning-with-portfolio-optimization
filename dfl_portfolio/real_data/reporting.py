@@ -12,8 +12,10 @@ import pandas as pd
 
 try:
     import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
 except ImportError:  # pragma: no cover
     plt = None
+    mdates = None
 
 try:
     import seaborn as sns
@@ -63,15 +65,17 @@ MODEL_COLOR_MAP: Dict[str, str] = {
 
 # 線種やアルファをモデルごとに統一的に指定（DFL系は同系色、ensは目立ちすぎない点線）
 MODEL_LINESTYLE_MAP: Dict[str, str] = {
+    # すべて実線に揃え、ens のみ点線で補助扱い
     "ols": "-",
     "ipo": "-",
-    "ipo_grad": "-.",
+    "ipo_grad": "-",
+    "spo_plus": "-",
     "flex": "-",
     "flex_dual": "-",
-    "flex_kkt": "--",
+    "flex_kkt": "-",
     "flex_dual_kkt_ens": ":",
-    "benchmark_SPY": "--",
-    "benchmark_tsmom_spy": "-.",
+    "benchmark_SPY": "-",
+    "benchmark_tsmom_spy": "-",
     "benchmark_equal_weight": "-",
 }
 MODEL_LINEWIDTH_MAP: Dict[str, float] = {
@@ -121,26 +125,18 @@ def _add_range_markers(ax, start_ts: Optional[pd.Timestamp], end_ts: Optional[pd
     """開始・終了を示す縦線と日付ラベルを控えめに追加する。"""
     if start_ts is None or end_ts is None:
         return
-    y_min, y_max = ax.get_ylim()
-    y_span = max(y_max - y_min, 1e-9)
-    y_pos = y_min + 0.02 * y_span
+    dates = []
     for ts in [start_ts, end_ts]:
         if pd.isna(ts):
             continue
         ts_dt = pd.to_datetime(ts)
+        dates.append(ts_dt)
         ax.axvline(ts_dt, color="0.35", linestyle=":", linewidth=0.9, alpha=0.8)
-        ax.text(
-            ts_dt,
-            y_pos,
-            ts_dt.date().isoformat(),
-            rotation=90,
-            va="bottom",
-            ha="center",
-            fontsize=8,
-            color="0.35",
-            alpha=0.9,
-            clip_on=False,
-        )
+    # x 軸の目盛に開始・終了を追加（ラベルは自動フォーマットに任せる）
+    if dates and mdates is not None:
+        current_ticks = list(ax.get_xticks())
+        extra = [mdates.date2num(d) for d in dates]
+        ax.set_xticks(sorted(set(current_ticks + extra)))
 
 
 def display_model_name(model: str) -> str:

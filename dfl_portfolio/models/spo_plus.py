@@ -51,6 +51,8 @@ def _oracle_risk_qcp_gurobi(
     if d == 0:
         return np.zeros(0, dtype=float)
     V = _sym_psd(V, psd_eps=psd_eps)
+    if V.shape != (d, d):
+        raise ValueError(f"SPO+ oracle: V shape mismatch (got {V.shape}, expected {(d, d)})")
     kappa = float(kappa)
     if not np.isfinite(kappa) or kappa <= 0:
         return None
@@ -61,15 +63,30 @@ def _oracle_risk_qcp_gurobi(
     if time_limit is not None:
         m.Params.TimeLimit = float(time_limit)
 
-    z = m.addMVar(d, lb=0.0, name="z")
-    m.addConstr(z.sum() == 1.0, name="budget")
+    # Use scalar vars (addVars) to avoid MVar quadratic constraint incompatibilities.
+    z_vars = m.addVars(d, lb=0.0, name="z")
+    m.addConstr(gp.quicksum(z_vars[i] for i in range(d)) == 1.0, name="budget")
     # Quadratic risk constraint (convex when V is PSD).
-    m.addQConstr(z @ V @ z <= kappa, name="risk")
-    m.setObjective(u @ z, GRB.MINIMIZE)
+    # NOTE: Build a scalar QuadExpr explicitly. Some gurobipy versions do not
+    # accept the MVar-based matrix quadratic expression in addQConstr.
+    risk_expr = gp.QuadExpr()
+    for i in range(d):
+        risk_expr += float(V[i, i]) * z_vars[i] * z_vars[i]
+        for j in range(i + 1, d):
+            vij = float(V[i, j])
+            if vij != 0.0:
+                risk_expr += 2.0 * vij * z_vars[i] * z_vars[j]
+    m.addQConstr(risk_expr, GRB.LESS_EQUAL, kappa, name="risk")
+    obj = gp.LinExpr()
+    for i in range(d):
+        ui = float(u[i])
+        if ui != 0.0:
+            obj += ui * z_vars[i]
+    m.setObjective(obj, GRB.MINIMIZE)
     m.optimize()
 
     if m.status == GRB.OPTIMAL:
-        sol = np.asarray(z.X, dtype=float).reshape(-1)
+        sol = np.asarray([z_vars[i].X for i in range(d)], dtype=float).reshape(-1)
         return sol
     return None
 
@@ -88,6 +105,8 @@ def _solve_min_var_simplex(
     if d == 0:
         return np.zeros(0, dtype=float)
     V = _sym_psd(V, psd_eps=psd_eps)
+    if V.shape != (d, d):
+        raise ValueError(f"SPO+ min-var: V shape mismatch (got {V.shape}, expected {(d, d)})")
 
     m = gp.Model()
     m.Params.OutputFlag = 1 if output else 0
@@ -95,13 +114,20 @@ def _solve_min_var_simplex(
     if time_limit is not None:
         m.Params.TimeLimit = float(time_limit)
 
-    z = m.addMVar(d, lb=0.0, name="z")
-    m.addConstr(z.sum() == 1.0, name="budget")
-    m.setObjective(z @ V @ z, GRB.MINIMIZE)
+    z_vars = m.addVars(d, lb=0.0, name="z")
+    m.addConstr(gp.quicksum(z_vars[i] for i in range(d)) == 1.0, name="budget")
+    obj = gp.QuadExpr()
+    for i in range(d):
+        obj += float(V[i, i]) * z_vars[i] * z_vars[i]
+        for j in range(i + 1, d):
+            vij = float(V[i, j])
+            if vij != 0.0:
+                obj += 2.0 * vij * z_vars[i] * z_vars[j]
+    m.setObjective(obj, GRB.MINIMIZE)
     m.optimize()
 
     if m.status == GRB.OPTIMAL:
-        sol = np.asarray(z.X, dtype=float).reshape(-1)
+        sol = np.asarray([z_vars[i].X for i in range(d)], dtype=float).reshape(-1)
         return sol
     return None
 
@@ -125,6 +151,7 @@ def fit_spo_plus(
     risk_mult: float = 2.0,
     psd_eps: float = 1e-9,
     tee: bool = False,
+    theta_init: Optional[np.ndarray] = None,
 ) -> Tuple[NDArray, NDArray, NDArray, NDArray, List[int], Dict[str, Any]]:
     """SPO+ trainer for portfolio allocation (linear objective + convex constraints).
 
@@ -195,7 +222,13 @@ def fit_spo_plus(
 
     device = torch.device("cpu")
     x_t = torch.from_numpy(X_train).to(device=device, dtype=torch.float32)
-    theta = torch.nn.Parameter(torch.zeros(d, device=device, dtype=torch.float32))
+    if theta_init is not None:
+        theta_init = np.asarray(theta_init, dtype=float).reshape(-1)
+    if theta_init is not None and theta_init.shape[0] == d and np.all(np.isfinite(theta_init)):
+        theta0 = torch.from_numpy(theta_init).to(device=device, dtype=torch.float32)
+    else:
+        theta0 = torch.zeros(d, device=device, dtype=torch.float32)
+    theta = torch.nn.Parameter(theta0)
     opt = torch.optim.Adam([theta], lr=float(lr))
 
     n_train = x_t.shape[0]
@@ -317,4 +350,3 @@ def fit_spo_plus(
         "oracle_fallback_tilde": int(oracle_fallback_tilde),
     }
     return theta_hat, Z, MU, LAM, used_idx, meta
-
