@@ -96,13 +96,22 @@ def _wrap_flex(spec: SolverSpec) -> TrainerFn:
             use_opts.update(solver_options)
         local_tee = bool(tee or spec.tee)
 
+        fit_kwargs: Dict[str, Any] = dict(
+            start_index=start_index,
+            end_index=end_index,
+            delta=delta,
+            solver=use_solver,
+            solver_options=use_opts,
+            tee=local_tee,
+        )
+        # theta_init が None の場合は渡さない（内部で shape を参照してクラッシュするため）
+        if theta_init is not None:
+            fit_kwargs["theta_init"] = theta_init
+        fit_kwargs.update(kw)
+
         ret = _fit_flex(
             X, Y, Vhats, idx,
-            start_index=start_index, end_index=end_index,
-            delta=delta, theta_init=theta_init,
-            solver=use_solver, solver_options=use_opts,
-            tee=local_tee,
-            **kw,
+            **fit_kwargs,
         )
 
         if isinstance(ret, (list, tuple)) and len(ret) >= 6:
@@ -189,6 +198,7 @@ def _wrap_ipo_grad(spec: SolverSpec) -> TrainerFn:
         qp_max_iter = int(kw.pop("ipo_grad_qp_max_iter", 5000))
         qp_tol = float(kw.pop("ipo_grad_qp_tol", 1e-6))
         debug_kkt = bool(kw.pop("ipo_grad_debug_kkt", False))
+        seed = kw.pop("ipo_grad_seed", None)
         ret = fit_ipo_grad(
             X,
             Y,
@@ -202,6 +212,7 @@ def _wrap_ipo_grad(spec: SolverSpec) -> TrainerFn:
             batch_size=batch_size,
             qp_max_iter=qp_max_iter,
             qp_tol=qp_tol,
+            seed=seed,
             theta_init=theta_init,
             tee=tee,
             debug_kkt=debug_kkt,

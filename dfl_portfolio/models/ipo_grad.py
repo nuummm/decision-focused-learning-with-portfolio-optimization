@@ -24,6 +24,7 @@ def fit_ipo_grad(
     batch_size: int = 0,
     qp_max_iter: int = 5000,
     qp_tol: float = 1e-6,
+    seed: Optional[int] = None,
     theta_init: Optional[NDArray] = None,
     tee: bool = False,
     debug_kkt: bool = False,
@@ -71,6 +72,8 @@ def fit_ipo_grad(
     V_train = np.stack([v for (_, v) in pairs], axis=0)
 
     device = torch.device("cpu")
+    if seed is not None:
+        torch.manual_seed(int(seed))
     x_t = torch.from_numpy(X_train).to(device=device, dtype=torch.float32)
     y_t = torch.from_numpy(Y_train).to(device=device, dtype=torch.float32)
     V_t = torch.from_numpy(V_train).to(device=device, dtype=torch.float32)
@@ -208,6 +211,7 @@ def fit_ipo_grad(
         "batch_size": int(batch_size),
         "qp_max_iter": int(qp_max_iter),
         "qp_tol": float(qp_tol),
+        "seed": int(seed) if seed is not None else None,
         "eq_viol_max": float(global_eq_viol),
         "ineq_viol_max": float(global_ineq_viol),
         "debug_kkt": bool(debug_kkt),

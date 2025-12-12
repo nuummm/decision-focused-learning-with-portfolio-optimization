@@ -104,6 +104,12 @@ def fit_dfl_p1_flex(
     formulation: str = "dual",   # "dual" or "kkt"
     delta: float = 1.0,
     theta_init: Optional[Sequence[float]] = None,
+    # A-study: randomize auxiliary initial values while keeping theta fixed
+    aux_init_mode: str = "none",  # "none" or "random"
+    aux_init_seed: Optional[int] = None,
+    aux_init_sigma_w: float = 0.05,
+    aux_init_sigma_lam: float = 1e-2,
+    aux_init_sigma_mu: float = 1e-2,
     solver: str = "gurobi",
     solver_options: Optional[dict] = None,
     tee: bool = False,
@@ -254,10 +260,50 @@ def fit_dfl_p1_flex(
             theta_init_vec = np.asarray(theta_init, float).reshape(-1)
             theta_init_source = "provided"
 
-        if theta_init_vec.shape[0] != d:
-            raise ValueError("theta_init must have length d")
-        for j in m.J:
-            m.theta[j].value = float(theta_init_vec[int(j)])
+    if theta_init_vec.shape[0] != d:
+        raise ValueError("theta_init must have length d")
+    for j in m.J:
+        m.theta[j].value = float(theta_init_vec[int(j)])
+
+    def _project_simplex(v: np.ndarray) -> np.ndarray:
+        """Project onto the probability simplex {x>=0, sum x = 1}."""
+        v = np.asarray(v, dtype=float).reshape(-1)
+        n = int(v.shape[0])
+        if n == 0:
+            return v
+        u = np.sort(v)[::-1]
+        cssv = np.cumsum(u)
+        rho = np.nonzero(u * np.arange(1, n + 1) > (cssv - 1.0))[0]
+        if rho.size == 0:
+            # Fallback: uniform
+            return np.ones(n, dtype=float) / float(n)
+        rho = int(rho[-1])
+        theta = (cssv[rho] - 1.0) / float(rho + 1)
+        w = np.maximum(v - theta, 0.0)
+        s = float(np.sum(w))
+        if not np.isfinite(s) or s <= 0.0:
+            return np.ones(n, dtype=float) / float(n)
+        return w / s
+
+    # Randomize auxiliary starting values (A-study) while keeping theta fixed.
+    aux_mode = (aux_init_mode or "none").lower().strip()
+    if aux_mode not in {"none", "random"}:
+        raise ValueError("aux_init_mode must be 'none' or 'random'")
+    if aux_mode == "random" and aux_init_seed is not None:
+        rng = np.random.default_rng(int(aux_init_seed))
+        sigma_w = float(aux_init_sigma_w)
+        sigma_lam = float(aux_init_sigma_lam)
+        sigma_mu = float(aux_init_sigma_mu)
+        w_base = np.ones(d, dtype=float) / float(d)
+        for t in m.T:
+            noise_w = rng.normal(0.0, sigma_w, size=d)
+            w0 = _project_simplex(w_base + noise_w)
+            for j in m.J:
+                m.w[t, j].value = float(w0[int(j)])
+            lam0 = np.abs(rng.normal(0.0, sigma_lam, size=d))
+            for j in m.J:
+                m.lam[t, j].value = float(lam0[int(j)])
+            m.mu[t].value = float(rng.normal(0.0, sigma_mu))
     else:
         for j in m.J:
             m.theta[j].value = 0.0

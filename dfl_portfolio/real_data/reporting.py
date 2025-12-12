@@ -106,6 +106,20 @@ ASSET_COLOR_SEQUENCE = [
     "tab:cyan",
 ]
 
+# 表示用の並び順（summary と統一）
+PREFERRED_MODEL_ORDER = [
+    "DFL-QCQP-dual",
+    "DFL-QCQP-kkt",
+    "DFL-QCQP-ens",
+    "SPO+",
+    "IPO-GRAD",
+    "IPO-analytic",
+    "OLS",
+    "Buy&Hold SPY",
+    "1/N",
+    "TSMOM (SPY)",
+]
+
 
 def _model_plot_kwargs(model: str, base_alpha: float = 1.0) -> Dict[str, object]:
     """統一した色・線種を返すヘルパー。"""
@@ -123,6 +137,15 @@ def _model_plot_kwargs(model: str, base_alpha: float = 1.0) -> Dict[str, object]
     if alpha != 1.0:
         kwargs["alpha"] = alpha
     return kwargs
+
+
+def _sort_models_for_display(models: Sequence[str]) -> List[str]:
+    """display 名ベースで PREFERRED_MODEL_ORDER に従って並べ替える。"""
+    order_map = {name: idx for idx, name in enumerate(PREFERRED_MODEL_ORDER)}
+    return sorted(
+        models,
+        key=lambda m: order_map.get(display_model_name(m), len(order_map)),
+    )
 
 
 def _add_range_markers(ax, start_ts: Optional[pd.Timestamp], end_ts: Optional[pd.Timestamp]) -> None:
@@ -222,7 +245,7 @@ def plot_weight_comparison(
 ) -> None:
     if plt is None or not weight_dict:
         return
-    models = list(weight_dict.keys())
+    models = _sort_models_for_display(list(weight_dict.keys()))
     n = len(models)
     fig, axes = plt.subplots(n, 1, figsize=(10, 3 * n), sharex=True)
     if n == 1:
@@ -281,6 +304,10 @@ def export_weight_variance_correlation(
 def plot_wealth_correlation_heatmap(corr_df: pd.DataFrame, path: Path) -> None:
     if plt is None or corr_df.empty:
         return
+    # 並び順を summary に合わせる
+    desired = _sort_models_for_display(list(corr_df.index))
+    corr_df = corr_df.reindex(index=desired, columns=desired)
+
     fig, ax = plt.subplots(figsize=(7, 6))
     data = corr_df.to_numpy()
     cax = ax.imshow(data, cmap="coolwarm", vmin=-1, vmax=1)
@@ -395,10 +422,18 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     for col in percent_cols:
         if col in df.columns:
             df[col] = (df[col].astype(float) * 100.0).round(2)
-    # Sharpe / Sortino / R^2 は生値のまま 4 桁表示
-    for col in ["sharpe", "sortino", "r2"]:
-        if col in df.columns:
-            df[col] = df[col].astype(float).round(4)
+    # Sharpe / Sortino は基本 4 桁だが net 系は 2 桁に抑える
+    if "sharpe" in df.columns:
+        df["sharpe"] = df["sharpe"].astype(float).round(4)
+    if "sortino" in df.columns:
+        df["sortino"] = df["sortino"].astype(float).round(4)
+    if "sharpe_net" in df.columns:
+        df["sharpe_net"] = df["sharpe_net"].astype(float).round(2)
+    if "sortino_net" in df.columns:
+        df["sortino_net"] = df["sortino_net"].astype(float).round(2)
+    # R^2 は高精度確認用に 6 桁
+    if "r2" in df.columns:
+        df["r2"] = df["r2"].astype(float).round(6)
     # CVaR は「損失期待値」なので負の値のまま % 表示
     if "cvar_95" in df.columns:
         df["cvar_95"] = (df["cvar_95"].astype(float) * 100.0).round(2)
@@ -406,9 +441,7 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         df["max_drawdown"] = (-df["max_drawdown"].astype(float) * 100.0).round(2)
     if "avg_trading_cost" in df.columns:
         series = pd.to_numeric(df["avg_trading_cost"], errors="coerce")
-        df["avg_trading_cost"] = series.apply(
-            lambda x: f"{x:.4f}" if pd.notna(x) else ""
-        )
+        df["avg_trading_cost"] = series.apply(lambda x: f"{x:.6f}" if pd.notna(x) else "")
     if "terminal_wealth" in df.columns:
         df["terminal_wealth"] = df["terminal_wealth"].astype(float).round(2)
     if "terminal_wealth_net" in df.columns:
@@ -446,6 +479,24 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     # 上記以外の列があれば末尾に付ける
     remaining = [c for c in existing_cols if c not in ordered_cols]
     df = df[ordered_cols + remaining]
+
+    # モデル表示順（提案手法 → 近縁手法 → ベンチマーク）
+    preferred_model_order = [
+        "DFL-QCQP-dual",
+        "DFL-QCQP-kkt",
+        "DFL-QCQP-ens",
+        "SPO+",
+        "IPO-GRAD",
+        "IPO-analytic",
+        "OLS",
+        "Buy&Hold SPY",
+        "1/N",
+        "TSMOM (SPY)",
+    ]
+    if "model" in df.columns:
+        order_map = {name: idx for idx, name in enumerate(preferred_model_order)}
+        df = df.assign(_sort_key=df["model"].map(order_map).fillna(len(order_map)))
+        df = df.sort_values(by="_sort_key", kind="mergesort").drop(columns=["_sort_key"])
     return df
 
 
@@ -691,24 +742,29 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
         plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
     for _, start, end in PERIOD_WINDOWS:
         plt.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
+    all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
+    start_ts = all_dates.min() if not all_dates.empty else None
+    end_ts = all_dates.max() if not all_dates.empty else None
+    if start_ts is not None and end_ts is not None:
+        ax = plt.gca()
+        _add_range_markers(ax, start_ts, end_ts)
+        title_range = f"{start_ts.date()} – {end_ts.date()}"
+    else:
+        title_range = ""
     plt.xlabel("日付")
     plt.ylabel("累積リターン")
-    plt.title("危機局面付き累積リターン")
-    all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
-    if not all_dates.empty:
-        ax = plt.gca()
-        _add_range_markers(ax, all_dates.min(), all_dates.max())
+    plt.title(f"累積リターン {title_range}".strip())
+    # 凡例をモデル順で並べ替え
     handles, labels = plt.gca().get_legend_handles_labels()
-    seen = set()
-    unique_handles = []
-    unique_labels = []
+    seen = {}
     for h, l in zip(handles, labels):
         if l not in seen:
-            unique_handles.append(h)
-            unique_labels.append(l)
-            seen.add(l)
-    # 凡例は左上に固定
-    plt.legend(unique_handles, unique_labels, loc="upper left")
+            seen[l] = h
+    order_map = {name: idx for idx, name in enumerate(PREFERRED_MODEL_ORDER)}
+    sorted_items = sorted(seen.items(), key=lambda kv: order_map.get(kv[0], len(order_map)))
+    uniq_labels = [k for k, _ in sorted_items]
+    uniq_handles = [v for _, v in sorted_items]
+    plt.legend(uniq_handles, uniq_labels, loc="upper left")
     plt.tight_layout()
     fig_path = path
     if path.name == "wealth_events.png":
@@ -766,8 +822,8 @@ def plot_wealth_window_normalized(
         return
     plt.axhline(1.0, color="black", linestyle="--", linewidth=0.8, alpha=0.7)
     plt.xlabel("日付")
-    plt.ylabel("正規化累積リターン (開始=1)")
-    plt.title(f"期間内正規化リターン: {period_name}")
+    plt.ylabel("累積リターン（開始を1に正規化）")
+    plt.title(f"期間別累積リターン（開始=1）: {period_name}")
     ax = plt.gca()
     _add_range_markers(ax, start_ts, end_ts)
     plt.legend(loc="upper left")
@@ -896,14 +952,16 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
     # 1枚の図に avg と「w>=threshold の頻度」を並べる
     pivot_avg = avg_df.pivot(index="model", columns="ticker", values="avg_weight").fillna(0.0)
     pivot_freq = avg_df.pivot(index="model", columns="ticker", values="freq_ge_thresh").fillna(0.0)
-    models = list(pivot_avg.index)
+    models = _sort_models_for_display(list(pivot_avg.index))
+    pivot_avg = pivot_avg.reindex(index=models)
+    pivot_freq = pivot_freq.reindex(index=models)
     tickers = list(pivot_avg.columns)
     x = np.arange(len(models))
     width = 0.8 / max(len(tickers), 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
     hatch_patterns = ["", "//", "\\\\", "++", "xx", "..", "**"]
-    # モデルの色をバーのベース色にし、ティッカーはハッチで区別する
-    model_colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
+    # ティッカーごとに明確な色＋ハッチを割り当て、モデルで並べる
+    asset_colors = [ASSET_COLOR_SEQUENCE[i % len(ASSET_COLOR_SEQUENCE)] for i in range(len(tickers))]
 
     # 平均ウェイト
     ax = axes[0]
@@ -914,11 +972,11 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
             pivot_avg[ticker],
             width=width,
             label=ticker,
-            color=model_colors,
+            color=asset_colors[i],
             edgecolor="black",
-            linewidth=0.6,
+            linewidth=0.8,
             hatch=hatch,
-            alpha=0.85,
+            alpha=0.75,
         )
     ax.set_title("平均ウェイト（資産別）")
     ax.set_ylabel("平均ウェイト")
@@ -932,11 +990,11 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
             pivot_freq[ticker],
             width=width,
             label=ticker,
-            color=model_colors,
+            color=asset_colors[i],
             edgecolor="black",
-            linewidth=0.6,
+            linewidth=0.8,
             hatch=hatch,
-            alpha=0.85,
+            alpha=0.75,
         )
     ax.set_title(f"ウェイトが {WEIGHT_THRESHOLD:.2f} 以上となる頻度（資産別）")
     ax.set_ylabel("頻度")
@@ -1162,9 +1220,9 @@ def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
             use_log_scale = True
     if use_log_scale:
         ax_time.set_xscale("log")
-    ax_time.set_xlabel("elapsed time (sec)")
-    ax_time.set_ylabel("frequency")
-    ax_time.set_title("Flex solver elapsed time histogram")
+    ax_time.set_xlabel("解計算時間 (秒)")
+    ax_time.set_ylabel("頻度")
+    ax_time.set_title("Flex ソルバー計算時間の分布")
     ax_time.legend(loc="best", fontsize=8)
 
     fig.tight_layout()
@@ -1328,8 +1386,8 @@ def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
         bars = ax.bar(x, values, color=colors, alpha=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
-        ax.set_ylabel("warning count")
-        ax.set_title("Solver warning counts (flex / IPO-GRAD / SPO+)")
+        ax.set_ylabel("警告件数")
+        ax.set_title("ソルバー警告件数（flex / IPO-GRAD / SPO+）")
         for xi, bar, val, tot in zip(x, bars, values, totals):
             ax.text(
                 xi,
@@ -1352,8 +1410,8 @@ def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
         bars = ax.bar(x, elapsed_vals, color=colors, alpha=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
-        ax.set_ylabel("mean elapsed time per cycle (sec)")
-        ax.set_title("Solver mean elapsed time (flex / IPO-GRAD / SPO+)")
+        ax.set_ylabel("1サイクルあたり平均解計算時間 (秒)")
+        ax.set_title("ソルバー平均計算時間（flex / IPO-GRAD / SPO+）")
         for xi, bar, val in zip(x, bars, elapsed_vals):
             if np.isfinite(val):
                 ax.text(
@@ -1472,6 +1530,8 @@ def export_max_return_winner_counts(
     returns_df: pd.DataFrame,
     csv_path: Path,
     fig_path: Path,
+    *,
+    mse_fig_path: Path | None = None,
 ) -> None:
     """Count how often each asset achieves the maximum return per date.
 
@@ -1515,12 +1575,53 @@ def export_max_return_winner_counts(
             linewidth=0.6,
             hatch=hatch,
         )
+        plt.text(xi, val + max(values) * 0.01, f"{val:.0f}", ha="center", va="bottom", fontsize=9)
     plt.xticks(x, labels, rotation=45, ha="right")
     plt.ylabel("最大リターン獲得日数")
     plt.title("各資産がその日の最高リターンとなった回数")
     plt.tight_layout()
     plt.savefig(fig_path)
     plt.close()
+
+    # 予測誤差（MSE）を横軸にした散布図を追加（asset_predictions を集計）
+    if mse_fig_path and plt is not None:
+        try:
+            asset_pred_dir = mse_fig_path.parent.parent / "csv" / "asset_predictions"
+            if asset_pred_dir.exists():
+                dfs: list[pd.DataFrame] = []
+                for csv_file in asset_pred_dir.glob("*.csv"):
+                    df_pred = pd.read_csv(csv_file)
+                    if {"pred_ret", "real_ret", "model", "ticker"}.issubset(df_pred.columns):
+                        dfs.append(df_pred[["model", "ticker", "pred_ret", "real_ret"]])
+                if dfs:
+                    big = pd.concat(dfs, ignore_index=True)
+                    big["pred_ret"] = pd.to_numeric(big["pred_ret"], errors="coerce")
+                    big["real_ret"] = pd.to_numeric(big["real_ret"], errors="coerce")
+                    big = big.dropna(subset=["pred_ret", "real_ret", "ticker"])
+                    mse_df = (
+                        big.groupby("ticker")
+                        .apply(lambda g: float(np.mean((g["pred_ret"] - g["real_ret"]) ** 2)))
+                        .reset_index(name="mse")
+                    )
+                    plt.figure(figsize=(8, 4))
+                    plt.bar(
+                        mse_df["ticker"],
+                        mse_df["mse"],
+                        color=[ASSET_COLOR_SEQUENCE[i % len(ASSET_COLOR_SEQUENCE)] for i in range(len(mse_df))],
+                        edgecolor="black",
+                        linewidth=0.6,
+                        alpha=0.85,
+                    )
+                    for xi, (_, row) in enumerate(mse_df.iterrows()):
+                        plt.text(xi, row["mse"] * 1.01, f"{row['mse']:.4f}", ha="center", va="bottom", fontsize=9)
+                    plt.xlabel("ティッカー")
+                    plt.ylabel("MSE")
+                    plt.title("資産別予測誤差 (MSE)")
+                    plt.tight_layout()
+                    plt.savefig(mse_fig_path)
+                    plt.close()
+        except Exception:
+            pass
 
 
 def compute_pairwise_mean_return_tests(
@@ -1796,39 +1897,26 @@ def run_concentration_analysis(
     if len(axes.shape) == 0:  # pragma: no cover - defensive
         axes = [axes]
 
-    # モデルごとの色を固定
-    color_map = {
-        "ols": "blue",
-        "ipo": "orange",
-        "DFL-QCQP-dual": "green",
-        "DFL-QCQP-kkt": "red",
-        "DFL-QCQP-ens": "black",
-        "1/N": "grey",
-    }
-    bar_colors = []
-    for i, m in enumerate(models):
-        c = color_map.get(m)
-        if c is None:
-            c = f"C{i % 10}"
-        bar_colors.append(c)
+    # モデルごとの色は共通マップに合わせる
+    bar_colors = [MODEL_COLOR_MAP.get(str(m).lower(), MODEL_COLOR_MAP.get(str(m), f"C{i%10}")) for i, m in enumerate(models)]
 
     # Neff
     ax = axes[0]
     ax.bar(x, conc_df["N_eff_mean"], color=bar_colors)
-    ax.set_ylabel("Effective #assets (avg)")
+    ax.set_ylabel("有効資産数 (平均)")
     ax.set_title("Neff")
 
     # max weight
     ax = axes[1]
     ax.bar(x, conc_df["max_w_mean"], color=bar_colors)
-    ax.set_ylabel("Average max weight")
-    ax.set_title("Max weight")
+    ax.set_ylabel("最大ウェイト (平均)")
+    ax.set_title("最大ウェイト")
 
     # cap frequency
     ax = axes[2]
     ax.bar(x, conc_df["cap_hit_freq"], color=bar_colors)
-    ax.set_ylabel("Freq. of w_max ≥ 0.95")
-    ax.set_title("Concentration freq.")
+    ax.set_ylabel("最大ウェイトが0.95以上となる頻度")
+    ax.set_title("ウェイト集中度の頻度")
 
     for ax in axes:
         ax.set_xticks(x)
@@ -1906,11 +1994,12 @@ def run_mse_and_bias_analysis(
         y = row.get("sharpe", np.nan)
         if not np.isfinite(y):
             continue
-        plt.scatter(x, y)
-        plt.text(x, y, model, fontsize=8)
-    plt.xlabel("Out-of-sample $R^2$ (per asset)")
-    plt.ylabel("Sharpe ratio (annualized)")
-    plt.title("Predictive fit vs decision quality")
+        color = MODEL_COLOR_MAP.get(str(model).lower(), None) or MODEL_COLOR_MAP.get(model, "tab:blue")
+        plt.scatter(x, y, color=color)
+        plt.text(x, y, model, fontsize=8, color=color)
+    plt.xlabel("アウトオブサンプル $R^2$（資産別）")
+    plt.ylabel("シャープレシオ（年率換算）")
+    plt.title("予測精度と意思決定品質の関係")
     plt.tight_layout()
     plt.savefig(bias_fig_dir / "mse_vs_sharpe_scatter.png")
     plt.close()
@@ -1933,7 +2022,7 @@ def run_mse_and_bias_analysis(
         try:
             plt.figure(figsize=(8, 5))
             # 各モデルごとに Down（赤）/Up（緑）の箱ひげを並べる
-            models_order = sorted(df["model"].unique())
+            models_order = sorted(df["model"].unique(), key=lambda m: PREFERRED_MODEL_ORDER.index(m) if m in PREFERRED_MODEL_ORDER else len(PREFERRED_MODEL_ORDER))
             positions: List[float] = []
             data: List[np.ndarray] = []
             colors: List[str] = []
@@ -1946,11 +2035,11 @@ def run_mse_and_bias_analysis(
                 if down_bias.size:
                     positions.append(x_base[i] - width)
                     data.append(down_bias)
-                    colors.append("red")
+                    colors.append("lightcoral")
                 if up_bias.size:
                     positions.append(x_base[i] + width)
                     data.append(up_bias)
-                    colors.append("green")
+                    colors.append("lightseagreen")
             if data:
                 box = plt.boxplot(
                     data,
@@ -1960,20 +2049,24 @@ def run_mse_and_bias_analysis(
                 )
                 for patch, c in zip(box["boxes"], colors):
                     patch.set_facecolor(c)
-                    patch.set_alpha(0.6)
+                    patch.set_alpha(0.8)
+                # median の色を見やすい濃いグレーに
+                for med in box["medians"]:
+                    med.set_color("dimgray")
+                    med.set_linewidth(1.5)
             # x 軸はモデル名のみ表示
             display_labels = [display_model_name(m) for m in models_order]
             plt.xticks(x_base, display_labels, rotation=45, ha="right")
             # 色の意味は凡例で示す
             from matplotlib.patches import Patch  # type: ignore
             legend_handles = [
-                Patch(facecolor="red", alpha=0.6, label="Down"),
-                Patch(facecolor="green", alpha=0.6, label="Up"),
+                Patch(facecolor="lightcoral", alpha=0.8, label="Down"),
+                Patch(facecolor="lightseagreen", alpha=0.8, label="Up"),
             ]
             plt.legend(handles=legend_handles, loc="upper right")
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
-            plt.ylabel("Bias = pred_ret - real_ret")
-            plt.title("Prediction bias by Up/Down group")
+            plt.ylabel("バイアス = 予測リターン - 実現リターン")
+            plt.title("Up/Down別の予測バイアス")
             plt.yscale("symlog", linthresh=1e-2)
             plt.tight_layout()
             plt.savefig(bias_fig_dir / "updown_bias_boxplot.png")
@@ -1997,8 +2090,13 @@ def run_mse_and_bias_analysis(
     if plt is not None:
         try:
             plt.figure(figsize=(8, 5))
-            # 各モデルごとに OUT（赤）/IN（緑）の箱ひげを並べる
-            models_order = sorted(df["model"].unique())
+            # 各モデルごとに OUT/IN の箱ひげを並べる（summary と同じモデル順）
+            models_order = sorted(
+                df["model"].unique(),
+                key=lambda m: PREFERRED_MODEL_ORDER.index(m)
+                if m in PREFERRED_MODEL_ORDER
+                else len(PREFERRED_MODEL_ORDER),
+            )
             positions: List[float] = []
             data: List[np.ndarray] = []
             colors: List[str] = []
@@ -2011,11 +2109,11 @@ def run_mse_and_bias_analysis(
                 if out_bias.size:
                     positions.append(x_base[i] - width)
                     data.append(out_bias)
-                    colors.append("red")
+                    colors.append("lightcoral")
                 if in_bias.size:
                     positions.append(x_base[i] + width)
                     data.append(in_bias)
-                    colors.append("green")
+                    colors.append("lightseagreen")
             if data:
                 box = plt.boxplot(
                     data,
@@ -2025,18 +2123,22 @@ def run_mse_and_bias_analysis(
                 )
                 for patch, c in zip(box["boxes"], colors):
                     patch.set_facecolor(c)
-                    patch.set_alpha(0.6)
+                    patch.set_alpha(0.8)
+                # 中央値線を見やすいダークグレーに
+                for med in box["medians"]:
+                    med.set_color("dimgray")
+                    med.set_linewidth(1.5)
             display_labels = [display_model_name(m) for m in models_order]
             plt.xticks(x_base, display_labels, rotation=45, ha="right")
             from matplotlib.patches import Patch  # type: ignore
             legend_handles = [
-                Patch(facecolor="red", alpha=0.6, label="OUT"),
-                Patch(facecolor="green", alpha=0.6, label="IN"),
+                Patch(facecolor="lightcoral", alpha=0.8, label="OUT（低ウェイト）"),
+                Patch(facecolor="lightseagreen", alpha=0.8, label="IN（高ウェイト）"),
             ]
             plt.legend(handles=legend_handles, loc="upper right")
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
-            plt.ylabel("Bias = pred_ret - real_ret")
-            plt.title("Prediction bias for IN/OUT assets")
+            plt.ylabel("バイアス = 予測リターン - 実現リターン")
+            plt.title("IN/OUT（ウェイト大小別）の予測バイアス")
             plt.yscale("symlog", linthresh=1e-2)
             plt.tight_layout()
             plt.savefig(bias_fig_dir / "inout_bias_boxplot.png")
@@ -2077,7 +2179,7 @@ def run_mse_and_bias_analysis(
                     alpha=0.5,
                     density=True,
                     color="red",
-                    label="Down",
+                    label="Down（予測<0）",
                 )
             if up.size > 0:
                 ax.hist(
@@ -2086,13 +2188,13 @@ def run_mse_and_bias_analysis(
                     alpha=0.5,
                     density=True,
                     color="green",
-                    label="Up",
+                    label="Up（予測>=0）",
                 )
             ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
             ax.set_title(model)
             ax.set_xlim(bias_min, bias_max)
             ax.set_yscale("log")
-        axes[0].set_ylabel("Density (log scale)")
+        axes[0].set_ylabel("密度（対数スケール）")
         # 凡例は最初の軸にまとめて表示
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
@@ -2118,7 +2220,7 @@ def run_mse_and_bias_analysis(
                     alpha=0.5,
                     density=True,
                     color="red",
-                    label="OUT",
+                    label="OUT（低ウェイト）",
                 )
             if inside.size > 0:
                 ax.hist(
@@ -2127,13 +2229,13 @@ def run_mse_and_bias_analysis(
                     alpha=0.5,
                     density=True,
                     color="green",
-                    label="IN",
+                    label="IN（高ウェイト）",
                 )
             ax.axvline(0.0, linestyle="--", color="black", linewidth=1)
             ax.set_title(model)
             ax.set_xlim(bias_min, bias_max)
             ax.set_yscale("log")
-        axes[0].set_ylabel("Density (log scale)")
+        axes[0].set_ylabel("密度（対数スケール）")
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             axes[0].legend(handles, labels, loc="upper right")
@@ -2185,11 +2287,11 @@ def plot_asset_correlation(corr_df: pd.DataFrame, path: Path, stats: Optional[Di
     ax.set_xticklabels(corr_df.columns, rotation=45, ha="right")
     ax.set_yticks(range(len(corr_df.index)))
     ax.set_yticklabels(corr_df.index)
-    title = "Asset return correlation"
+    title = "資産リターン相関"
     if stats:
         mean_abs = stats.get("mean_abs_corr")
         if mean_abs is not None and not np.isnan(mean_abs):
-            title += f" (avg |ρ|={mean_abs:.2f})"
+            title += f" (平均|ρ|={mean_abs:.2f})"
     ax.set_title(title)
     for i in range(data.shape[0]):
         for j in range(data.shape[1]):

@@ -8,6 +8,7 @@ import math
 import os
 import shutil
 import time
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -97,12 +98,27 @@ DEBUG_ROOT = RESULTS_BASE / "debug_outputs"
 logging.getLogger("pyomo").setLevel(logging.ERROR)
 logging.getLogger("pyomo.solvers").setLevel(logging.ERROR)
 
+# 可視化・出力のモデル順（summary と統一）
+PREFERRED_MODEL_ORDER = [
+    "DFL-QCQP-dual",
+    "DFL-QCQP-kkt",
+    "DFL-QCQP-ens",
+    "SPO+",
+    "IPO-GRAD",
+    "IPO-analytic",
+    "OLS",
+    "Buy&Hold SPY",
+    "1/N",
+    "TSMOM (SPY)",
+]
+
 
 def plot_weight_window_with_connections(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
     """Render stacked weights and effective connection counts per model."""
 
     if plt is None or not weight_dict:
         return
+    order_map = {name: idx for idx, name in enumerate(PREFERRED_MODEL_ORDER)}
     entries: List[Tuple[str, pd.DataFrame]] = []
     for model_key, df in weight_dict.items():
         if df.empty or "date" not in df.columns:
@@ -111,6 +127,10 @@ def plot_weight_window_with_connections(weight_dict: Dict[str, pd.DataFrame], pa
         tmp["date"] = pd.to_datetime(tmp["date"])
         tmp = tmp.sort_values("date")
         entries.append((str(model_key), tmp))
+    # モデルを指定順で並べ替え（未知のものは末尾）
+    entries.sort(
+        key=lambda pair: order_map.get(display_model_name(pair[0]), len(order_map))
+    )
     if not entries:
         return
 
@@ -168,10 +188,12 @@ def train_model_window(
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     spo_plus_options: Dict[str, Any] | None,
+    ipo_grad_options: Dict[str, Any] | None,
     train_start: int,
     train_end: int,
     tee: bool,
     ipo_grad_debug_kkt: bool = False,
+    seed_event: Optional[int] = None,
 ):
     delta_for_training = delta_down if model_key == "flex" else delta_up
     trainer_kwargs: Dict[str, object] = dict(
@@ -235,8 +257,14 @@ def train_model_window(
         trainer_kwargs["theta_init"] = theta_init_override
     if model_key == "ipo_grad":
         trainer_kwargs["ipo_grad_debug_kkt"] = bool(ipo_grad_debug_kkt)
+        if ipo_grad_options:
+            trainer_kwargs.update(ipo_grad_options)
+        if seed_event is not None:
+            trainer_kwargs["ipo_grad_seed"] = int(seed_event)
     if model_key == "spo_plus" and spo_plus_options:
         trainer_kwargs.update(spo_plus_options)
+    if model_key == "flex" and seed_event is not None:
+        trainer_kwargs["aux_init_seed"] = int(seed_event)
 
     start_time = time.perf_counter()
     trainer_ret = trainer(**trainer_kwargs)
@@ -285,6 +313,7 @@ def run_rolling_experiment(
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
     spo_plus_options: Dict[str, Any] | None,
+    ipo_grad_options: Dict[str, Any] | None,
     train_window: int,
     rebal_interval: int,
     debug_roll: bool,
@@ -294,6 +323,7 @@ def run_rolling_experiment(
     asset_pred_dir: Path | None = None,
     eval_start: Optional[pd.Timestamp] = None,
     ipo_grad_debug_kkt: bool = False,
+    base_seed: Optional[int] = None,
 ) -> Dict[str, object]:
     trainer = get_trainer(model_key, solver_spec)
     schedule = build_rebalance_schedule(bundle, train_window, rebal_interval, eval_start=eval_start)
@@ -339,6 +369,11 @@ def run_rolling_experiment(
 
     total_cycles = len(schedule)
     for cycle_id, item in enumerate(schedule):
+        seed_event = None
+        if base_seed is not None:
+            msg = f"{int(base_seed)}|{cycle_id}|{int(item.rebalance_idx)}"
+            digest = hashlib.blake2b(msg.encode("utf-8"), digest_size=8).digest()
+            seed_event = int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFFFFFF
         candidate_list = (
             list(delta_down_candidates) if model_key == "flex" else [delta_down_candidates[0]]
         )
@@ -358,10 +393,12 @@ def run_rolling_experiment(
                     solver_spec,
                     flex_options,
                     spo_plus_options,
+                    ipo_grad_options,
                     item.train_start,
                     item.train_end,
                     tee,
                     ipo_grad_debug_kkt=ipo_grad_debug_kkt,
+                    seed_event=seed_event,
                 )
                 elapsed_total += elapsed_c
                 obj_raw = info_c.get("objective_value") if isinstance(info_c, dict) else None
@@ -384,10 +421,12 @@ def run_rolling_experiment(
                 solver_spec,
                 flex_options,
                 spo_plus_options,
+                ipo_grad_options,
                 item.train_start,
                 item.train_end,
                 tee,
                 ipo_grad_debug_kkt=ipo_grad_debug_kkt,
+                seed_event=seed_event,
             )
             obj_raw = info.get("objective_value") if isinstance(info, dict) else None
             train_objective = float(obj_raw) if obj_raw is not None else float("nan")
@@ -880,6 +919,7 @@ def main() -> None:
             returns_matrix,
             analysis_csv_dir / "asset_max_return_wins.csv",
             data_fig_dir / "asset_max_return_wins.png",
+            mse_fig_path=data_fig_dir / "asset_mse_per_ticker.png",
         )
 
     stats_results: List[Dict[str, object]] = []
@@ -918,6 +958,13 @@ def main() -> None:
         "spo_plus_risk_constraint": getattr(args, "spo_plus_risk_constraint", True),
         "spo_plus_risk_mult": getattr(args, "spo_plus_risk_mult", 2.0),
         "spo_plus_init_mode": getattr(args, "spo_plus_init_mode", "zero"),
+    }
+    ipo_grad_options: Dict[str, Any] = {
+        "ipo_grad_epochs": getattr(args, "ipo_grad_epochs", 500),
+        "ipo_grad_lr": getattr(args, "ipo_grad_lr", 1e-3),
+        "ipo_grad_batch_size": getattr(args, "ipo_grad_batch_size", 0),
+        "ipo_grad_qp_max_iter": getattr(args, "ipo_grad_qp_max_iter", 5000),
+        "ipo_grad_qp_tol": getattr(args, "ipo_grad_qp_tol", 1e-6),
     }
 
     @dataclass(frozen=True)
@@ -1023,6 +1070,7 @@ def main() -> None:
                 solver_spec=solver_spec,
                 flex_options=flex_options,
                 spo_plus_options=spo_plus_options,
+                ipo_grad_options=ipo_grad_options,
                 train_window=spec.train_window,
                 rebal_interval=args.rebal_interval,
                 debug_roll=args.debug_roll,
