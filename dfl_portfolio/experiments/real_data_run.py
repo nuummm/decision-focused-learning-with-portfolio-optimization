@@ -151,8 +151,8 @@ def plot_weight_window_with_connections(weight_dict: Dict[str, pd.DataFrame], pa
         )
 
     conn_ax.set_ylabel("N_eff")
-    conn_ax.set_xlabel("date")
-    conn_ax.set_title("Effective connection count (N_eff)")
+    conn_ax.set_xlabel("日付")
+    conn_ax.set_title("有効接続数 (N_eff)")
     conn_ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(path)
@@ -846,19 +846,19 @@ def main() -> None:
     data_fig_dir.mkdir(parents=True, exist_ok=True)
     plot_time_series(
         bundle.dataset.prices,
-        "Prices timeseries",
+        "価格時系列",
         start_ts,
         data_fig_dir / "data_prices.png",
     )
     plot_time_series(
         bundle.dataset.returns,
-        "Returns timeseries",
+        "リターン時系列",
         start_ts,
         data_fig_dir / "data_returns.png",
     )
     plot_time_series(
         bundle.dataset.momentum,
-        "Momentum timeseries",
+        "モメンタム指標",
         start_ts,
         data_fig_dir / "data_momentum.png",
     )
@@ -1496,6 +1496,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --flex-formulation 'dual,kkt,dual&kkt' \
   --flex-lambda-theta-anchor 10.0 \
   --flex-theta-anchor-mode ipo \
+  --flex-theta-init-mode none \
   --benchmarks "spy,1/n,tsmom_spy" \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
   --debug-roll

@@ -16,6 +16,10 @@ try:
 except ImportError:  # pragma: no cover
     plt = None
     mdates = None
+try:  # Optional: 日本語フォント環境があれば自動設定
+    import japanize_matplotlib  # type: ignore  # noqa: F401
+except Exception:  # pragma: no cover
+    pass
 
 try:
     import seaborn as sns
@@ -122,21 +126,14 @@ def _model_plot_kwargs(model: str, base_alpha: float = 1.0) -> Dict[str, object]
 
 
 def _add_range_markers(ax, start_ts: Optional[pd.Timestamp], end_ts: Optional[pd.Timestamp]) -> None:
-    """開始・終了を示す縦線と日付ラベルを控えめに追加する。"""
+    """開始・終了を示す縦線を控えめに追加する（ラベルは付けない）。"""
     if start_ts is None or end_ts is None:
         return
-    dates = []
     for ts in [start_ts, end_ts]:
         if pd.isna(ts):
             continue
         ts_dt = pd.to_datetime(ts)
-        dates.append(ts_dt)
         ax.axvline(ts_dt, color="0.35", linestyle=":", linewidth=0.9, alpha=0.8)
-    # x 軸の目盛に開始・終了を追加（ラベルは自動フォーマットに任せる）
-    if dates and mdates is not None:
-        current_ticks = list(ax.get_xticks())
-        extra = [mdates.date2num(d) for d in dates]
-        ax.set_xticks(sorted(set(current_ticks + extra)))
 
 
 def display_model_name(model: str) -> str:
@@ -167,9 +164,9 @@ def plot_wealth_curve(dates: Sequence[pd.Timestamp], wealth: Sequence[float], pa
         return
     plt.figure(figsize=(10, 4))
     plt.plot(dates, wealth, label="wealth")
-    plt.xlabel("date")
-    plt.ylabel("wealth")
-    plt.title("Portfolio wealth trajectory")
+    plt.xlabel("日付")
+    plt.ylabel("累積リターン")
+    plt.title("ポートフォリオ累積リターン")
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -197,9 +194,9 @@ def plot_weight_paths(weights_df: pd.DataFrame, model: str, path: Path) -> None:
         plt.bar(dates, values[col], bottom=bottom, label=col, width=width, align="center")
         bottom += values[col].to_numpy()
     plt.ylim(0, 1)
-    plt.title(f"Weight allocation (stacked) - {model}")
-    plt.xlabel("date")
-    plt.ylabel("weight share")
+    plt.title(f"資産ウェイト推移 (積み上げ) - {model}")
+    plt.xlabel("日付")
+    plt.ylabel("ウェイト")
     plt.legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(path)
@@ -208,9 +205,9 @@ def plot_weight_paths(weights_df: pd.DataFrame, model: str, path: Path) -> None:
     for col in value_cols_sorted:
         plt.plot(dates, values[col], label=col)
     plt.ylim(0, 1)
-    plt.title(f"Weight trajectories ({model})")
-    plt.xlabel("date")
-    plt.ylabel("weight")
+    plt.title(f"資産ウェイト推移 ({model})")
+    plt.xlabel("日付")
+    plt.ylabel("ウェイト")
     plt.legend(loc="upper right")
     plt.tight_layout()
     plt.savefig(path.with_name(path.stem + "_lines" + path.suffix))
@@ -244,8 +241,8 @@ def plot_weight_comparison(
         ax.set_ylim(0, 1)
         ax.set_ylabel(model)
         ax.legend(loc="upper right")
-    axes[-1].set_xlabel("date")
-    fig.suptitle("Weight allocation (stacked) per model (last points)")
+    axes[-1].set_xlabel("日付")
+    fig.suptitle("資産ウェイト推移（直近ポイント）")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -284,14 +281,14 @@ def export_weight_variance_correlation(
 def plot_wealth_correlation_heatmap(corr_df: pd.DataFrame, path: Path) -> None:
     if plt is None or corr_df.empty:
         return
-    fig, ax = plt.subplots(figsize=(5, 4))
+    fig, ax = plt.subplots(figsize=(7, 6))
     data = corr_df.to_numpy()
     cax = ax.imshow(data, cmap="coolwarm", vmin=-1, vmax=1)
     ax.set_xticks(range(len(corr_df.columns)))
     ax.set_xticklabels(corr_df.columns, rotation=45, ha="right")
     ax.set_yticks(range(len(corr_df.index)))
     ax.set_yticklabels(corr_df.index)
-    ax.set_title("Wealth return correlation")
+    ax.set_title("累積リターン相関")
     for i in range(data.shape[0]):
         for j in range(data.shape[1]):
             ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
@@ -502,9 +499,9 @@ def plot_delta_paths(delta_df: pd.DataFrame, path: Path) -> None:
         for _, start, end in PERIOD_WINDOWS:
             ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
 
-    ax.set_xlabel("date" if use_date_axis else "cycle")
-    ax.set_ylabel("delta")
-    ax.set_title("Learned delta trajectories per model")
+    ax.set_xlabel("日付" if use_date_axis else "サイクル")
+    ax.set_ylabel("デルタ")
+    ax.set_title("学習されたデルタ推移（モデル別）")
     ax.set_ylim(0.0, 1.0)
     # ラベル重複を除去
     handles, labels = ax.get_legend_handles_labels()
@@ -599,9 +596,9 @@ def plot_phi_paths(phi_df: pd.DataFrame, path: Path) -> None:
         for _, start, end in PERIOD_WINDOWS:
             ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
 
-    ax.set_xlabel("date" if use_date_axis else "cycle")
-    ax.set_ylabel("phi")
-    ax.set_title("Learned covariance shrinkage trajectories per model")
+    ax.set_xlabel("日付" if use_date_axis else "サイクル")
+    ax.set_ylabel("φ (縮小パラメータ)")
+    ax.set_title("共分散縮小パラメータ φ の推移（モデル別）")
     ax.set_ylim(0.0, 1.0)
     handles, labels = ax.get_legend_handles_labels()
     seen = set()
@@ -639,9 +636,9 @@ def plot_beta_paths(beta_df: pd.DataFrame, path: Path) -> None:
         for _, start, end in PERIOD_WINDOWS:
             ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
 
-    ax.set_xlabel("date" if use_date_axis else "cycle")
-    ax.set_ylabel("beta")
-    ax.set_title("EWMA beta trajectories per model")
+    ax.set_xlabel("日付" if use_date_axis else "サイクル")
+    ax.set_ylabel("β (EWMA)")
+    ax.set_title("EWMA β の推移（モデル別）")
     ax.set_ylim(0.0, 1.0)
     handles, labels = ax.get_legend_handles_labels()
     seen = set()
@@ -666,9 +663,9 @@ def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
         kwargs = {"label": display_label}
         kwargs.update(_model_plot_kwargs(model))
         plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
-    plt.xlabel("date")
-    plt.ylabel("wealth")
-    plt.title("Wealth comparison")
+    plt.xlabel("日付")
+    plt.ylabel("累積リターン")
+    plt.title("累積リターン比較")
     # 開始・終了を控えめにマーキング
     all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
     if not all_dates.empty:
@@ -694,9 +691,9 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
         plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
     for _, start, end in PERIOD_WINDOWS:
         plt.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.15)
-    plt.xlabel("date")
-    plt.ylabel("wealth")
-    plt.title("Wealth comparison with crisis windows")
+    plt.xlabel("日付")
+    plt.ylabel("累積リターン")
+    plt.title("危機局面付き累積リターン")
     all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
     if not all_dates.empty:
         ax = plt.gca()
@@ -768,9 +765,9 @@ def plot_wealth_window_normalized(
         plt.close()
         return
     plt.axhline(1.0, color="black", linestyle="--", linewidth=0.8, alpha=0.7)
-    plt.xlabel("date")
-    plt.ylabel("normalized wealth (start=1)")
-    plt.title(f"Wealth normalized in window: {period_name}")
+    plt.xlabel("日付")
+    plt.ylabel("正規化累積リターン (開始=1)")
+    plt.title(f"期間内正規化リターン: {period_name}")
     ax = plt.gca()
     _add_range_markers(ax, start_ts, end_ts)
     plt.legend(loc="upper left")
@@ -828,7 +825,7 @@ def plot_time_series(df: pd.DataFrame, title: str, start_date: pd.Timestamp, pat
     if not pd.isna(start_date):
         plt.axvline(start_date, color="red", linestyle="--", label="start_date")
     plt.title(title)
-    plt.xlabel("date")
+    plt.xlabel("日付")
     plt.legend()
     plt.tight_layout()
     plt.savefig(path)
@@ -923,8 +920,8 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
             hatch=hatch,
             alpha=0.85,
         )
-    ax.set_title("Average weight per asset")
-    ax.set_ylabel("average weight")
+    ax.set_title("平均ウェイト（資産別）")
+    ax.set_ylabel("平均ウェイト")
 
     # 95%以上採用頻度
     ax = axes[1]
@@ -941,8 +938,8 @@ def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path,
             hatch=hatch,
             alpha=0.85,
         )
-    ax.set_title(f"Freq(weight ≥ {WEIGHT_THRESHOLD:.2f}) per asset")
-    ax.set_ylabel("frequency")
+    ax.set_title(f"ウェイトが {WEIGHT_THRESHOLD:.2f} 以上となる頻度（資産別）")
+    ax.set_ylabel("頻度")
 
     # x 軸ラベルは display_model_name で人間向けに整形
     display_labels = [display_model_name(m) for m in models]
@@ -991,7 +988,7 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
                 ax.set_xlabel(ticker)
             if c == 0:
                 ax.set_ylabel(model)
-    fig.suptitle("Weight distributions (histograms)")
+    fig.suptitle("ウェイト分布（ヒストグラム）")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -1016,9 +1013,9 @@ def plot_condition_numbers(step_df: pd.DataFrame, path: Path, *, max_points: int
     values = df["condition_number"].astype(float)
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.bar(dates, values, width=3, color="tab:blue", alpha=0.8)
-    ax.set_xlabel("date")
-    ax.set_ylabel("condition number")
-    ax.set_title("Covariance condition number over time")
+    ax.set_xlabel("日付")
+    ax.set_ylabel("条件数")
+    ax.set_title("共分散行列の条件数推移")
     ax.grid(axis="y", alpha=0.3)
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -1519,8 +1516,8 @@ def export_max_return_winner_counts(
             hatch=hatch,
         )
     plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("count of max-return days")
-    plt.title("How often each asset had the highest daily return")
+    plt.ylabel("最大リターン獲得日数")
+    plt.title("各資産がその日の最高リターンとなった回数")
     plt.tight_layout()
     plt.savefig(fig_path)
     plt.close()
