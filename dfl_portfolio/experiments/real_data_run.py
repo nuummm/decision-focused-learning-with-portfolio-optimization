@@ -194,6 +194,7 @@ def train_model_window(
     tee: bool,
     ipo_grad_debug_kkt: bool = False,
     seed_event: Optional[int] = None,
+    seed_theta_init: Optional[int] = None,
 ):
     delta_for_training = delta_down if model_key == "flex" else delta_up
     trainer_kwargs: Dict[str, object] = dict(
@@ -208,8 +209,11 @@ def train_model_window(
     )
     theta_init_override: Optional[np.ndarray] = None
     if model_key == "flex" and flex_options:
+        flex_options_local = dict(flex_options)
+        if seed_theta_init is not None:
+            flex_options_local["theta_init_seed"] = int(seed_theta_init)
         theta_init_override, resolved_flex = prepare_flex_training_args(
-            bundle, train_start, train_end, delta_for_training, tee, flex_options
+            bundle, train_start, train_end, delta_for_training, tee, flex_options_local
         )
         trainer_kwargs.update(resolved_flex)
     if model_key == "ipo_grad":
@@ -324,6 +328,7 @@ def run_rolling_experiment(
     eval_start: Optional[pd.Timestamp] = None,
     ipo_grad_debug_kkt: bool = False,
     base_seed: Optional[int] = None,
+    init_seed: Optional[int] = None,
 ) -> Dict[str, object]:
     trainer = get_trainer(model_key, solver_spec)
     schedule = build_rebalance_schedule(bundle, train_window, rebal_interval, eval_start=eval_start)
@@ -374,6 +379,11 @@ def run_rolling_experiment(
             msg = f"{int(base_seed)}|{cycle_id}|{int(item.rebalance_idx)}"
             digest = hashlib.blake2b(msg.encode("utf-8"), digest_size=8).digest()
             seed_event = int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFFFFFF
+        seed_theta_init = None
+        if init_seed is not None:
+            msg = f"{int(init_seed)}|{cycle_id}|{int(item.rebalance_idx)}|theta"
+            digest = hashlib.blake2b(msg.encode("utf-8"), digest_size=8).digest()
+            seed_theta_init = int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFFFFFF
         candidate_list = (
             list(delta_down_candidates) if model_key == "flex" else [delta_down_candidates[0]]
         )
@@ -399,6 +409,7 @@ def run_rolling_experiment(
                     tee,
                     ipo_grad_debug_kkt=ipo_grad_debug_kkt,
                     seed_event=seed_event,
+                    seed_theta_init=seed_theta_init,
                 )
                 elapsed_total += elapsed_c
                 obj_raw = info_c.get("objective_value") if isinstance(info_c, dict) else None
@@ -427,6 +438,7 @@ def run_rolling_experiment(
                 tee,
                 ipo_grad_debug_kkt=ipo_grad_debug_kkt,
                 seed_event=seed_event,
+                seed_theta_init=seed_theta_init,
             )
             obj_raw = info.get("objective_value") if isinstance(info, dict) else None
             train_objective = float(obj_raw) if obj_raw is not None else float("nan")
@@ -1040,6 +1052,9 @@ def main() -> None:
     max_workers = requested_workers if requested_workers > 0 else auto_workers
     max_workers = max(1, min(max_workers, auto_workers)) if auto_workers > 0 else 1
 
+    base_seed = int(getattr(args, "base_seed", 0))
+    init_seed = int(getattr(args, "init_seed", 1))
+
     if auto_workers > 1:
         print(f"[real-data] running model jobs in parallel: {auto_workers} groups, max_workers={max_workers}")
 
@@ -1080,6 +1095,8 @@ def main() -> None:
                 asset_pred_dir=asset_pred_dir,
                 eval_start=eval_start_ts,
                 ipo_grad_debug_kkt=getattr(args, "ipo_grad_debug_kkt", False),
+                base_seed=base_seed,
+                init_seed=init_seed,
             )
             outputs.append((spec, run_result))
         return outputs
@@ -1547,6 +1564,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --flex-theta-init-mode none \
   --benchmarks "spy,1/n,tsmom_spy" \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
+  --jobs 1 \
   --debug-roll
 
 

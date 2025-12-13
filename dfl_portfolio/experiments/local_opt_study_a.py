@@ -14,23 +14,16 @@ import pandas as pd
 
 # Avoid GUI backends (safe for multiprocessing / threads on macOS)
 os.environ.setdefault("MPLBACKEND", "Agg")
-
-try:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except Exception:  # pragma: no cover
-    plt = None
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.getenv("TMPDIR", "/tmp"), "mplconfig"))
 
 from dfl_portfolio.real_data.loader import MarketLoaderConfig
 from dfl_portfolio.real_data.pipeline import PipelineConfig, build_data_bundle
 from dfl_portfolio.real_data.cli import make_output_dir, parse_tickers, parse_trading_cost_map
-from dfl_portfolio.real_data.reporting import MODEL_COLOR_MAP, display_model_name
-from dfl_portfolio.registry import SolverSpec, KNITRO_DEFAULTS
-from dfl_portfolio.experiments.real_data_run import run_rolling_experiment, RESULTS_BASE
 
 
+HERE = Path(__file__).resolve()
+PROJECT_ROOT = HERE.parents[3]
+RESULTS_BASE = PROJECT_ROOT / "results"
 RESULTS_ROOT = RESULTS_BASE / "exp_localopt_A"
 
 
@@ -102,7 +95,14 @@ def _summary_stats(values: Sequence[float]) -> Dict[str, float]:
 
 
 def _plot_cumret_overlay(curves: Dict[int, pd.DataFrame], out_path: Path, title: str) -> None:
-    if plt is None or not curves:
+    if not curves:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:  # pragma: no cover
         return
     fig, ax = plt.subplots(figsize=(10, 4))
     seeds = sorted(curves.keys())
@@ -189,6 +189,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # Heavy imports after parsing so `--help` stays lightweight.
+    from dfl_portfolio.real_data.reporting import MODEL_COLOR_MAP, display_model_name
+    from dfl_portfolio.experiments.real_data_run import run_rolling_experiment
+    from dfl_portfolio.registry import SolverSpec, KNITRO_DEFAULTS
     seeds = _parse_int_list(args.seeds)
 
     raw_asset_costs = parse_trading_cost_map(args.trading_cost_per_asset) if args.trading_cost_per_asset else {}

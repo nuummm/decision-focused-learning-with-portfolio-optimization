@@ -260,7 +260,10 @@ def fit_dfl_p1_flex(
             theta_init_vec = np.asarray(theta_init, float).reshape(-1)
             theta_init_source = "provided"
 
-    if theta_init_vec.shape[0] != d:
+    if theta_init_vec is None:
+        theta_init_vec = np.zeros(d, dtype=float)
+        theta_init_source = "none"
+    elif theta_init_vec.shape[0] != d:
         raise ValueError("theta_init must have length d")
     for j in m.J:
         m.theta[j].value = float(theta_init_vec[int(j)])

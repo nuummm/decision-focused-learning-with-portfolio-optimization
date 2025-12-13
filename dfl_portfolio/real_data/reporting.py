@@ -1977,32 +1977,57 @@ def run_mse_and_bias_analysis(
     bias_fig_dir = analysis_fig_dir / "bias_analysis"
     bias_fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # R^2 vs Sharpe scatter (summary の R^2 を使用)
-    plt.figure()
-    # R^2 が存在しない場合はプロットできないのでスキップ
-    for model, row in plot_df.iterrows():
+    def _should_skip_scatter(mstr: str) -> bool:
         # ベンチマーク系は散布図から除外（SPY, 1/N）
-        mstr = str(model)
-        if (
+        return (
             ("SPY" in mstr and "benchmark" in mstr)
-            or mstr in {"1/N", "[SPY]", "benchmark_SPY", "Buy&Hold SPY"}
-        ):
-            continue
-        x = row.get("r2", np.nan)
-        if not np.isfinite(x):
-            continue
-        y = row.get("sharpe", np.nan)
-        if not np.isfinite(y):
-            continue
-        color = MODEL_COLOR_MAP.get(str(model).lower(), None) or MODEL_COLOR_MAP.get(model, "tab:blue")
-        plt.scatter(x, y, color=color)
-        plt.text(x, y, model, fontsize=8, color=color)
-    plt.xlabel("アウトオブサンプル $R^2$（資産別）")
-    plt.ylabel("シャープレシオ（年率換算）")
-    plt.title("予測精度と意思決定品質の関係")
-    plt.tight_layout()
-    plt.savefig(bias_fig_dir / "mse_vs_sharpe_scatter.png")
-    plt.close()
+            or mstr in {"1/N", "[SPY]", "benchmark_SPY", "Buy&Hold SPY", "Buy&Hold(SPY)"}
+        )
+
+    # R^2 vs Sharpe scatter (summary の R^2 を使用)
+    if plt is not None:
+        plt.figure()
+        for model, row in plot_df.iterrows():
+            mstr = str(model)
+            if _should_skip_scatter(mstr):
+                continue
+            x = row.get("r2", np.nan)
+            if not np.isfinite(x):
+                continue
+            y = row.get("sharpe", np.nan)
+            if not np.isfinite(y):
+                continue
+            color = MODEL_COLOR_MAP.get(str(model).lower(), None) or MODEL_COLOR_MAP.get(model, "tab:blue")
+            plt.scatter(x, y, color=color)
+            plt.text(x, y, model, fontsize=8, color=color)
+        plt.xlabel("アウトオブサンプル $R^2$（資産別）")
+        plt.ylabel("シャープレシオ（年率換算）")
+        plt.title("予測精度と意思決定品質の関係")
+        plt.tight_layout()
+        plt.savefig(bias_fig_dir / "r2_vs_sharpe_scatter.png")
+        plt.close()
+
+        # MSE vs Sharpe scatter (asset_predictions 由来の MSE を使用)
+        plt.figure()
+        for model, row in plot_df.iterrows():
+            mstr = str(model)
+            if _should_skip_scatter(mstr):
+                continue
+            x = row.get("mse", np.nan)
+            if not np.isfinite(x):
+                continue
+            y = row.get("sharpe", np.nan)
+            if not np.isfinite(y):
+                continue
+            color = MODEL_COLOR_MAP.get(str(model).lower(), None) or MODEL_COLOR_MAP.get(model, "tab:blue")
+            plt.scatter(x, y, color=color)
+            plt.text(x, y, model, fontsize=8, color=color)
+        plt.xlabel("アウトオブサンプル MSE（資産別）")
+        plt.ylabel("シャープレシオ（年率換算）")
+        plt.title("予測誤差と意思決定品質の関係")
+        plt.tight_layout()
+        plt.savefig(bias_fig_dir / "mse_vs_sharpe_scatter.png")
+        plt.close()
 
     # Bias-related analyses
     df["bias"] = df["pred_ret"] - df["real_ret"]

@@ -290,6 +290,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable SPO+ risk constraint (simplex-only oracle).",
     )
     parser.add_argument(
+        "--base-seed",
+        type=int,
+        default=0,
+        help="Base seed for reproducibility (per-cycle seed is derived from this).",
+    )
+    parser.add_argument(
+        "--init-seed",
+        type=int,
+        default=1,
+        help="Seed for theta-init randomness (used for flex auxiliary init).",
+    )
+    parser.add_argument(
         "--spo-plus-init-mode",
         type=str,
         default="zero",

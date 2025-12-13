@@ -143,6 +143,11 @@ def prepare_flex_training_args(
     flex_kwargs: Dict[str, Any] = dict(flex_options or {})
     theta_init_mode = str(flex_kwargs.pop("theta_init_mode", "none") or "none").lower()
     theta_anchor_mode = str(flex_kwargs.pop("theta_anchor_mode", "none") or "none").lower()
+    # Optional random-init knobs (used by local-opt study B). Pop early so they never reach the model.
+    theta_init_seed = flex_kwargs.pop("theta_init_seed", None)
+    theta_init_sigma = float(flex_kwargs.pop("theta_init_sigma", 0.0) or 0.0)
+    theta_init_clip = float(flex_kwargs.pop("theta_init_clip", 0.0) or 0.0)
+    theta_init_base_mode = str(flex_kwargs.pop("theta_init_base_mode", "none") or "none").lower()
     flex_kwargs["formulation"] = str(flex_kwargs.get("formulation", "dual") or "dual").lower()
 
     X = np.asarray(bundle.dataset.X, float)
@@ -200,7 +205,29 @@ def prepare_flex_training_args(
         raise ValueError(f"Unsupported theta source '{mode}' for {context}")
 
     theta_init = None
-    if theta_init_mode not in {"", "none"}:
+    if theta_init_mode in {"rand_zero", "randn_zero", "random_zero"}:
+        rng = np.random.default_rng(int(theta_init_seed) if theta_init_seed is not None else None)
+        d = int(X_train.shape[1])
+        sigma = float(theta_init_sigma) if theta_init_sigma > 0.0 else 0.1
+        theta = rng.normal(size=d) * sigma
+        if theta_init_clip > 0.0:
+            theta = np.clip(theta, -theta_init_clip, theta_init_clip)
+        theta_init = np.asarray(theta, dtype=float)
+    elif theta_init_mode in {"rand_local", "randn_local", "random_local"}:
+        base_theta = ensure_theta_source(theta_init_base_mode, fallback_to_ols=True, context="theta_init_base")
+        if base_theta is None:
+            base_theta = np.zeros(int(X_train.shape[1]), dtype=float)
+        rng = np.random.default_rng(int(theta_init_seed) if theta_init_seed is not None else None)
+        d = int(X_train.shape[1])
+        sigma = float(theta_init_sigma) if theta_init_sigma > 0.0 else 0.1
+        theta = np.asarray(base_theta, dtype=float).reshape(-1).copy()
+        if theta.shape[0] != d:
+            raise ValueError(f"theta_init_base has dim {theta.shape[0]} but expected {d}")
+        theta = theta + rng.normal(size=d) * sigma
+        if theta_init_clip > 0.0:
+            theta = np.clip(theta, -theta_init_clip, theta_init_clip)
+        theta_init = np.asarray(theta, dtype=float)
+    elif theta_init_mode not in {"", "none"}:
         theta_init = ensure_theta_source(theta_init_mode, fallback_to_ols=True, context="theta_init")
 
     lam_theta_anchor = float(flex_kwargs.get("lambda_theta_anchor", 0.0) or 0.0)

@@ -73,7 +73,9 @@ def fit_ipo_grad(
 
     device = torch.device("cpu")
     if seed is not None:
-        torch.manual_seed(int(seed))
+        seed_int = int(seed)
+        torch.manual_seed(seed_int)
+        np.random.seed(seed_int)
     x_t = torch.from_numpy(X_train).to(device=device, dtype=torch.float32)
     y_t = torch.from_numpy(Y_train).to(device=device, dtype=torch.float32)
     V_t = torch.from_numpy(V_train).to(device=device, dtype=torch.float32)
