@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # Ensure a non-GUI backend for matplotlib (important when running model jobs in worker threads).
 # On macOS, GUI backends can crash if figures are created outside the main thread.
 os.environ.setdefault("MPLBACKEND", "Agg")
+# Some OpenMP builds (notably Intel) try to use /dev/shm and can abort on macOS.
+os.environ.setdefault("KMP_USE_SHM", "0")
 
 try:  # matplotlib is only needed for custom window plots
     import matplotlib
@@ -195,8 +197,11 @@ def train_model_window(
     ipo_grad_debug_kkt: bool = False,
     seed_event: Optional[int] = None,
     seed_theta_init: Optional[int] = None,
+    theta_init_spec: Optional[Dict[str, Any]] = None,
+    theta_init_delta: Optional[float] = None,
 ):
     delta_for_training = delta_down if model_key == "flex" else delta_up
+    delta_for_theta_init = float(theta_init_delta) if theta_init_delta is not None else float(delta_for_training)
     trainer_kwargs: Dict[str, object] = dict(
         X=bundle.dataset.X,
         Y=bundle.dataset.Y,
@@ -213,29 +218,42 @@ def train_model_window(
         if seed_theta_init is not None:
             flex_options_local["theta_init_seed"] = int(seed_theta_init)
         theta_init_override, resolved_flex = prepare_flex_training_args(
-            bundle, train_start, train_end, delta_for_training, tee, flex_options_local
+            bundle, train_start, train_end, delta_for_theta_init, tee, flex_options_local
         )
         trainer_kwargs.update(resolved_flex)
+    if model_key == "ipo_grad" and theta_init_spec:
+        # Allow study drivers to provide an explicit θ init spec (for local-opt study B)
+        spec_local = dict(theta_init_spec)
+        if seed_theta_init is not None:
+            spec_local["theta_init_seed"] = int(seed_theta_init)
+        theta_init_override, _ = prepare_flex_training_args(
+            bundle, train_start, train_end, delta_for_theta_init, tee, spec_local
+        )
     if model_key == "ipo_grad":
-        # Warm-start IPO-GRAD from the analytical IPO closed-form solution
-        try:
-            theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
-                bundle.dataset.X,
-                bundle.dataset.Y,
-                bundle.covariances,
-                bundle.cov_indices.tolist(),
-                start_index=train_start,
-                end_index=train_end,
-                delta=delta_for_training,
-                mode="budget",
-                psd_eps=1e-12,
-                ridge_theta=1e-10,
-                tee=tee,
-            )
-            theta_init_override = np.asarray(theta_ipo, dtype=float)
-        except Exception as exc:  # pragma: no cover - best-effort warm start
-            if tee:
-                print(f"[IPO-GRAD] IPO closed-form warm-start failed: {exc}")
+        init_mode = str(ipo_grad_options.get("ipo_grad_init_mode", "none") if ipo_grad_options else "none").lower()
+        if theta_init_override is None:
+            if init_mode == "ipo":
+                # Warm-start IPO-GRAD from the analytical IPO closed-form solution
+                try:
+                    theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
+                        bundle.dataset.X,
+                        bundle.dataset.Y,
+                        bundle.covariances,
+                        bundle.cov_indices.tolist(),
+                        start_index=train_start,
+                        end_index=train_end,
+                        delta=delta_for_theta_init,
+                        mode="budget",
+                        psd_eps=1e-12,
+                        ridge_theta=1e-10,
+                        tee=tee,
+                    )
+                    theta_init_override = np.asarray(theta_ipo, dtype=float)
+                except Exception as exc:  # pragma: no cover - best-effort warm start
+                    if tee:
+                        print(f"[IPO-GRAD] IPO closed-form warm-start failed: {exc}")
+            else:
+                theta_init_override = np.zeros(bundle.dataset.X.shape[1], dtype=float)
     if model_key == "spo_plus" and spo_plus_options:
         init_mode = str(spo_plus_options.get("spo_plus_init_mode", "zero")).lower()
         if init_mode == "ipo":
@@ -263,6 +281,30 @@ def train_model_window(
         trainer_kwargs["ipo_grad_debug_kkt"] = bool(ipo_grad_debug_kkt)
         if ipo_grad_options:
             trainer_kwargs.update(ipo_grad_options)
+            # Anchor vector for IPO-GRAD (L2 penalty)
+            lam_anchor = float(ipo_grad_options.get("ipo_grad_lambda_anchor", 0.0))
+            if lam_anchor > 0.0:
+                anchor_mode = str(ipo_grad_options.get("ipo_grad_theta_anchor_mode", "ipo")).lower()
+                if anchor_mode == "ipo":
+                    try:
+                        theta_anchor, _, _, _, _, _ = fit_ipo_closed_form(
+                            bundle.dataset.X,
+                            bundle.dataset.Y,
+                            bundle.covariances,
+                            bundle.cov_indices.tolist(),
+                            start_index=train_start,
+                            end_index=train_end,
+                            delta=delta_for_theta_init,
+                            mode="budget",
+                            psd_eps=1e-12,
+                            ridge_theta=1e-10,
+                            tee=tee,
+                        )
+                        trainer_kwargs["ipo_grad_theta_anchor"] = np.asarray(theta_anchor, dtype=float)
+                    except Exception:
+                        trainer_kwargs["ipo_grad_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+                else:
+                    trainer_kwargs["ipo_grad_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
         if seed_event is not None:
             trainer_kwargs["ipo_grad_seed"] = int(seed_event)
     if model_key == "spo_plus" and spo_plus_options:
@@ -329,6 +371,8 @@ def run_rolling_experiment(
     ipo_grad_debug_kkt: bool = False,
     base_seed: Optional[int] = None,
     init_seed: Optional[int] = None,
+    theta_init_spec: Optional[Dict[str, Any]] = None,
+    theta_init_delta: Optional[float] = None,
 ) -> Dict[str, object]:
     trainer = get_trainer(model_key, solver_spec)
     schedule = build_rebalance_schedule(bundle, train_window, rebal_interval, eval_start=eval_start)
@@ -410,6 +454,8 @@ def run_rolling_experiment(
                     ipo_grad_debug_kkt=ipo_grad_debug_kkt,
                     seed_event=seed_event,
                     seed_theta_init=seed_theta_init,
+                    theta_init_spec=theta_init_spec,
+                    theta_init_delta=theta_init_delta,
                 )
                 elapsed_total += elapsed_c
                 obj_raw = info_c.get("objective_value") if isinstance(info_c, dict) else None
@@ -439,6 +485,8 @@ def run_rolling_experiment(
                 ipo_grad_debug_kkt=ipo_grad_debug_kkt,
                 seed_event=seed_event,
                 seed_theta_init=seed_theta_init,
+                theta_init_spec=theta_init_spec,
+                theta_init_delta=theta_init_delta,
             )
             obj_raw = info.get("objective_value") if isinstance(info, dict) else None
             train_objective = float(obj_raw) if obj_raw is not None else float("nan")
@@ -969,7 +1017,7 @@ def main() -> None:
         "spo_plus_lambda_reg": getattr(args, "spo_plus_lambda_reg", 0.0),
         "spo_plus_risk_constraint": getattr(args, "spo_plus_risk_constraint", True),
         "spo_plus_risk_mult": getattr(args, "spo_plus_risk_mult", 2.0),
-        "spo_plus_init_mode": getattr(args, "spo_plus_init_mode", "zero"),
+        "spo_plus_init_mode": getattr(args, "spo_plus_init_mode", "ipo"),
     }
     ipo_grad_options: Dict[str, Any] = {
         "ipo_grad_epochs": getattr(args, "ipo_grad_epochs", 500),
@@ -977,6 +1025,9 @@ def main() -> None:
         "ipo_grad_batch_size": getattr(args, "ipo_grad_batch_size", 0),
         "ipo_grad_qp_max_iter": getattr(args, "ipo_grad_qp_max_iter", 5000),
         "ipo_grad_qp_tol": getattr(args, "ipo_grad_qp_tol", 1e-6),
+        "ipo_grad_init_mode": getattr(args, "ipo_grad_init_mode", "none"),
+        "ipo_grad_lambda_anchor": getattr(args, "ipo_grad_lambda_anchor", 0.0),
+        "ipo_grad_theta_anchor_mode": getattr(args, "ipo_grad_theta_anchor_mode", "ipo"),
     }
 
     @dataclass(frozen=True)
@@ -1098,6 +1149,12 @@ def main() -> None:
                 base_seed=base_seed,
                 init_seed=init_seed,
             )
+            # condition_numbers を analysis/figures 配下にもコピー
+            cond_src = results_dir / "condition_numbers.png"
+            if cond_src.exists():
+                cond_dest_dir = analysis_fig_dir / "condition_numbers"
+                cond_dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cond_src, cond_dest_dir / f"condition_numbers_{spec.label}.png")
             outputs.append((spec, run_result))
         return outputs
 
@@ -1552,17 +1609,18 @@ python -m dfl_portfolio.experiments.real_data_run \
   --cov-method oas \
   --train-window 26 \
   --rebal-interval 4 \
-  --delta-up 0.5 \
-  --delta-down 0.5 \
+  --delta 0.5 \
   --models "ols,ipo,ipo_grad,spo_plus,flex" \
-  --spo-plus-risk-constraint \
-  --spo-plus-init-mode ipo \
   --flex-solver knitro \
   --flex-formulation 'dual,kkt,dual&kkt' \
-  --flex-lambda-theta-anchor 10.0 \
+  --flex-lambda-theta-anchor 0.0 \
   --flex-theta-anchor-mode ipo \
+  --ipo-grad-lambda-anchor 0.0 \
+  --ipo-grad-theta-anchor-mode ipo \
   --flex-theta-init-mode none \
+  --ipo-grad-init-mode none \
   --benchmarks "spy,1/n,tsmom_spy" \
+  --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
   --jobs 1 \
   --debug-roll
@@ -1597,11 +1655,11 @@ CLI options (defaults follow the parser definitions)
 - `--delta` (float ∈ [0,1], default `0.5`): 既定の δ。
 - `--delta-up` (float ∈ [0,1], default `None` → `--delta`): 目的関数で使う δ。
 - `--delta-down` (float ∈ [0,1], default `None` → `--delta-up`): DFL 制約で使う δ。
-- `--models` (str, default `ols,ipo,flex`): 走らせるモデル一覧（例 `ols,ipo,ipo_grad,flex`）。
+- `--models` (str, default `ols,ipo,ipo_grad,spo_plus,flex`): 走らせるモデル一覧。
 - `--flex-solver` (str, default `knitro`).
 - `--flex-formulation` (str, default `dual,kkt,dual&kkt`): Flex の定式化。
 - `--flex-ensemble-weight-dual` (float ∈ [0,1], default `0.5`): dual/kkt ensemble の重み。
-- `--flex-lambda-theta-anchor` / `--flex-lambda-theta-iso` (float, default `10.0` / `0.0`): θ 罰則。
+- `--flex-lambda-theta-anchor` / `--flex-lambda-theta-iso` (float, default `0.0` / `0.0`): θ 罰則。
 - `--flex-theta-anchor-mode` (str, default `ipo`), `--flex-theta-init-mode` (str, default `none`): θ アンカー / 初期化モード。
 - `--flex-lambda-phi-anchor` (float, default `0.0`): V-learning の φ アンカー罰則。
 
@@ -1611,6 +1669,9 @@ IPO-GRAD（IPO-NN）設定
 - `--ipo-grad-batch-size` (int, default `0`): IPO-GRAD のバッチサイズ（0 の場合はフルバッチ）。
 - `--ipo-grad-qp-max-iter` (int, default `5000`): IPO-GRAD 内部の QP ソルバの最大反復回数。
 - `--ipo-grad-qp-tol` (float, default `1e-6`): IPO-GRAD 内部の QP ソルバの収束許容誤差。
+- `--ipo-grad-init-mode` (str, default `none`): `ipo` なら解析解ウォームスタート、`none` ならゼロ初期化。
+- `--ipo-grad-lambda-anchor` (float, default `0.0`): θ に対する L2 アンカー強度（0 で無効）。
+- `--ipo-grad-theta-anchor-mode` (str, default `ipo`): アンカー基準 (`ipo` 解析解 or `zero`)。
 - `--ipo-grad-debug-kkt`: IPO-GRAD の各リバランスで KKT 条件のデバッグチェックを有効化。
 
 SPO+ 設定
@@ -1620,11 +1681,11 @@ SPO+ 設定
 - `--spo-plus-lambda-reg` (float, default `0.0`): SPO+ の L2 正則化係数（θ）。
 - `--spo-plus-risk-mult` (float, default `2.0`): リスク制約の強さ（κ = mult × min-var risk）。
 - `--spo-plus-risk-constraint` / `--spo-plus-no-risk-constraint`: リスク制約の有効/無効（デフォルト有効）。
-- `--spo-plus-init-mode` (str, default `zero`): SPO+ の初期化モード（`zero|ols|ipo`）。
+- `--spo-plus-init-mode` (str, default `ipo`): SPO+ の初期化モード（`zero|ipo`）。
 
 取引コスト
-- `--trading-cost-bps` (float, default `0.0`): 正の値を指定すると、内蔵のティッカー別コスト表（bps）を有効化。
-- `--trading-cost-per-asset` (str, default `""`): `SPY:5,GLD:8` のようにティッカー別コストを上書き。
+- `--trading-cost-bps` (float, default `1.0`): 正の値を指定すると、内蔵のティッカー別コスト表（bps）を有効化。
+- `--trading-cost-per-asset` (str, default `"SPY:5,GLD:10,EEM:10,TLT:5"`): ティッカー別コストをbpsで指定。
 
 実行制御・出力
 - `--tee`: ソルバログを表示。

@@ -9,12 +9,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
-import pandas as pd
-
-# Avoid GUI backends (safe for multiprocessing / threads on macOS)
+# Avoid GUI backends and OpenMP SHM issues; must be set before importing numpy/scipy.
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.getenv("TMPDIR", "/tmp"), "mplconfig"))
+os.environ.setdefault("KMP_USE_SHM", "0")
+
+import numpy as np
+import pandas as pd
 
 from dfl_portfolio.real_data.loader import MarketLoaderConfig
 from dfl_portfolio.real_data.pipeline import PipelineConfig, build_data_bundle
@@ -121,6 +122,240 @@ def _plot_cumret_overlay(curves: Dict[int, pd.DataFrame], out_path: Path, title:
     ax.set_title(title)
     ax.set_xlabel("date")
     ax.set_ylabel("wealth")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+def _plot_metric_boxplot(
+    *,
+    runs_df: pd.DataFrame,
+    metric: str,
+    out_path: Path,
+    title: str,
+    y_label: str,
+    model_order: List[str],
+    color_map: Optional[Dict[str, str]] = None,
+) -> None:
+    if metric not in runs_df.columns:
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:  # pragma: no cover
+        return
+
+    df = runs_df[["model_key", metric]].copy()
+    df[metric] = pd.to_numeric(df[metric], errors="coerce")
+    df = df[np.isfinite(df[metric].to_numpy())]
+    if df.empty:
+        return
+
+    present = sorted(df["model_key"].unique().tolist())
+    models = [m for m in model_order if m in present]
+    models.extend([m for m in present if m not in models])
+    if not models:
+        return
+
+    data: List[np.ndarray] = []
+    for m in models:
+        vals = df[df["model_key"] == m][metric].astype(float).to_numpy()
+        if vals.size == 0:
+            vals = np.asarray([np.nan], dtype=float)
+        data.append(vals)
+
+    fig_w = max(7.0, 1.7 * len(models))
+    fig, ax = plt.subplots(figsize=(fig_w, 4.2))
+    bp = ax.boxplot(
+        data,
+        patch_artist=True,
+        showfliers=False,
+        medianprops={"color": "black", "linewidth": 1.4},
+        boxprops={"linewidth": 1.0},
+        whiskerprops={"linewidth": 1.0},
+        capprops={"linewidth": 1.0},
+    )
+    for patch, m in zip(bp["boxes"], models):
+        c = None
+        if color_map and m in color_map:
+            c = color_map[m]
+        if not c:
+            c = "#1f77b4"
+        patch.set_facecolor(c)
+        patch.set_alpha(0.45)
+
+    # Mean markers per model.
+    means = [float(np.nanmean(arr)) if np.isfinite(arr).any() else float("nan") for arr in data]
+    ax.scatter(np.arange(1, len(models) + 1), means, color="black", marker="D", s=24, zorder=4, label="mean")
+
+    ax.set_xticks(np.arange(1, len(models) + 1))
+    ax.set_xticklabels(models, rotation=20, ha="right")
+    ax.set_title(title)
+    ax.set_ylabel(y_label)
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(loc="best", frameon=True, fontsize=9)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_metric_boxplots(runs_df: pd.DataFrame, out_dir: Path, *, color_map: Optional[Dict[str, str]] = None) -> None:
+    if runs_df.empty:
+        return
+    metrics = [
+        "ann_return",
+        "ann_return_net",
+        "sharpe",
+        "sharpe_net",
+        "sortino",
+        "sortino_net",
+        "ann_volatility",
+        "ann_volatility_net",
+        "max_drawdown",
+        "cvar_95",
+        "terminal_wealth",
+        "terminal_wealth_net",
+        "total_return",
+        "total_return_net",
+        "avg_turnover",
+        "avg_trading_cost",
+        "r2",
+        "elapsed_fit_time_mean",
+        "elapsed_total_fit_time",
+        "elapsed_total_run_sec",
+    ]
+    model_order = ["flex_dual", "flex_kkt", "ipo_grad"]
+    box_dir = out_dir / "metric_boxplots"
+    for metric in metrics:
+        if metric not in runs_df.columns:
+            continue
+        _plot_metric_boxplot(
+            runs_df=runs_df,
+            metric=metric,
+            out_path=box_dir / f"{metric}.png",
+            title=f"A: metric distribution ({metric})",
+            y_label=metric,
+            model_order=model_order,
+            color_map=color_map,
+        )
+
+
+def _plot_flex_solver_status_bars(runs_df: pd.DataFrame, out_path: Path) -> None:
+    """Compare flex_dual vs flex_kkt solver status counts across seeds + overall mean."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:  # pragma: no cover
+        return
+
+    needed = {"seed", "model_key", "success_count", "warning_count", "no_solution_count"}
+    if not needed.issubset(set(runs_df.columns)):
+        return
+
+    models = ["flex_dual", "flex_kkt"]
+    parts: Dict[str, pd.DataFrame] = {}
+    for m in models:
+        part = runs_df[runs_df["model_key"] == m].copy()
+        if part.empty:
+            continue
+        part = part.sort_values("seed")
+        mean_row = {
+            "seed": "mean",
+            "success_count": float(part["success_count"].mean()),
+            "warning_count": float(part["warning_count"].mean()),
+            "no_solution_count": float(part["no_solution_count"].mean()),
+        }
+        part2 = pd.concat(
+            [part[["seed", "success_count", "warning_count", "no_solution_count"]], pd.DataFrame([mean_row])],
+            ignore_index=True,
+        )
+        part2["seed"] = part2["seed"].astype(str)
+        parts[m] = part2
+
+    if not parts:
+        return
+
+    fig, axes = plt.subplots(1, len(parts), figsize=(12, 4), sharey=True)
+    if len(parts) == 1:
+        axes = [axes]
+
+    colors = {
+        "success_count": "#2ca02c",     # green
+        "warning_count": "#ff7f0e",     # orange
+        "no_solution_count": "#d62728",  # red
+    }
+    labels = {
+        "success_count": "OK",
+        "warning_count": "Warning",
+        "no_solution_count": "No-solution",
+    }
+
+    for ax, (model, part) in zip(axes, parts.items()):
+        x = np.arange(part.shape[0])
+        bottom = np.zeros(part.shape[0], dtype=float)
+        for col in ["success_count", "warning_count", "no_solution_count"]:
+            vals = part[col].astype(float).to_numpy()
+            ax.bar(x, vals, bottom=bottom, color=colors[col], label=labels[col])
+            bottom = bottom + vals
+        ax.set_title(f"Flex status counts ({model})")
+        ax.set_xlabel("seed")
+        ax.set_xticks(x)
+        ax.set_xticklabels(part["seed"].tolist(), rotation=0)
+        ax.grid(axis="y", alpha=0.2)
+
+    axes[0].set_ylabel("count (retrain events)")
+    handles, legend_labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, loc="upper center", ncol=3, frameon=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_flex_elapsed_bars(runs_df: pd.DataFrame, out_path: Path) -> None:
+    """Compare flex_dual vs flex_kkt elapsed fit time (mean per retrain) across seeds + overall mean."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:  # pragma: no cover
+        return
+
+    needed = {"seed", "model_key", "elapsed_fit_time_mean"}
+    if not needed.issubset(set(runs_df.columns)):
+        return
+
+    part = runs_df[runs_df["model_key"].isin(["flex_dual", "flex_kkt"])].copy()
+    if part.empty:
+        return
+
+    pivot = part.pivot_table(index="seed", columns="model_key", values="elapsed_fit_time_mean", aggfunc="mean").sort_index()
+    mean_row = pivot.mean(axis=0).to_frame().T
+    mean_row.index = ["mean"]
+    pivot2 = pd.concat([pivot, mean_row], axis=0)
+
+    x_labels = [str(i) for i in pivot2.index.tolist()]
+    x = np.arange(len(x_labels))
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    dual = pivot2.get("flex_dual", pd.Series(index=pivot2.index, dtype=float)).astype(float).to_numpy()
+    kkt = pivot2.get("flex_kkt", pd.Series(index=pivot2.index, dtype=float)).astype(float).to_numpy()
+    ax.bar(x - width / 2, dual, width=width, label="flex_dual", color="#1f77b4")
+    ax.bar(x + width / 2, kkt, width=width, label="flex_kkt", color="#9467bd")
+    ax.set_title("Flex elapsed fit time comparison")
+    ax.set_xlabel("seed")
+    ax.set_ylabel("elapsed_fit_time_mean (sec)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, rotation=0)
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(frameon=True)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -257,6 +492,9 @@ def main() -> None:
         "aux_init_sigma_w": float(args.flex_aux_init_sigma_w),
         "aux_init_sigma_lam": float(args.flex_aux_init_sigma_lam),
         "aux_init_sigma_mu": float(args.flex_aux_init_sigma_mu),
+        # Preserve randomized (w/lam/mu) initial values to probe local optima in Experiment A.
+        # Default behavior in flex is unchanged because this flag is only set here.
+        "aux_init_keep": True,
     }
     ipo_grad_options: Dict[str, Any] = {
         "ipo_grad_epochs": int(args.ipo_grad_epochs),
@@ -410,6 +648,14 @@ def main() -> None:
         color = MODEL_COLOR_MAP.get(model_label, None)
         _plot_cumret_overlay(curves, analysis_fig / f"cumret_{model_label}.png", title=title)
 
+    # Boxplots: metric distributions across seeds (compare models)
+    _plot_metric_boxplots(runs_df, analysis_fig, color_map=MODEL_COLOR_MAP)
+
+    # Flex dual/kkt comparisons (status + time)
+    if not runs_df.empty:
+        _plot_flex_solver_status_bars(runs_df, analysis_fig / "flex_solver_status_counts.png")
+        _plot_flex_elapsed_bars(runs_df, analysis_fig / "flex_elapsed_fit_time_mean.png")
+
     # Save config
     cfg = vars(args).copy()
     cfg["seeds"] = seeds
@@ -427,7 +673,4 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.local_opt_study_a \
   --seeds "0,1,2,3,4,5,6,7,8,9" \
-  --tickers "SPY,GLD,EEM,TLT" \
-  --start 2006-01-01 --end 2025-12-01 \
-  --flex-solver knitro \
 """

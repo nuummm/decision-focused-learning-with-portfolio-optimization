@@ -110,6 +110,7 @@ def fit_dfl_p1_flex(
     aux_init_sigma_w: float = 0.05,
     aux_init_sigma_lam: float = 1e-2,
     aux_init_sigma_mu: float = 1e-2,
+    aux_init_keep: bool = False,
     solver: str = "gurobi",
     solver_options: Optional[dict] = None,
     tee: bool = False,
@@ -292,7 +293,8 @@ def fit_dfl_p1_flex(
     aux_mode = (aux_init_mode or "none").lower().strip()
     if aux_mode not in {"none", "random"}:
         raise ValueError("aux_init_mode must be 'none' or 'random'")
-    if aux_mode == "random" and aux_init_seed is not None:
+    aux_randomized = aux_mode == "random" and aux_init_seed is not None
+    if aux_randomized:
         rng = np.random.default_rng(int(aux_init_seed))
         sigma_w = float(aux_init_sigma_w)
         sigma_lam = float(aux_init_sigma_lam)
@@ -328,14 +330,17 @@ def fit_dfl_p1_flex(
         except Exception:
             w_init_mat = None
 
-    for t in m.T:
-        for j in m.J:
-            if w_init_mat is not None:
-                m.w[t, j].value = float(w_init_mat[int(t), int(j)])
-            else:
-                m.w[t, j].value = 1.0 / d
-            m.lam[t, j].value = 0.0
-        m.mu[t].value = 0.0
+    # Note: Experiment A wants to preserve randomized auxiliary initial values to probe local optima.
+    # Keep default behavior (warm-start w; zero lam/mu) unless explicitly requested.
+    if not (aux_randomized and bool(aux_init_keep)):
+        for t in m.T:
+            for j in m.J:
+                if w_init_mat is not None:
+                    m.w[t, j].value = float(w_init_mat[int(t), int(j)])
+                else:
+                    m.w[t, j].value = 1.0 / d
+                m.lam[t, j].value = 0.0
+            m.mu[t].value = 0.0
 
     def budget(m, t):
         return sum(m.w[t, j] for j in m.J) == 1.0

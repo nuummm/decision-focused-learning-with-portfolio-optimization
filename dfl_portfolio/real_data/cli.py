@@ -155,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
             "value or a comma-separated grid (each in [0,1]). Defaults to delta-up."
         ),
     )
-    parser.add_argument("--models", type=str, default="ols,ipo,flex")
+    parser.add_argument("--models", type=str, default="ols,ipo,ipo_grad,spo_plus,flex")
     parser.add_argument("--flex-solver", type=str, default="knitro")
     parser.add_argument(
         "--flex-formulation",
@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(e.g., 'dual', 'dual,kkt', or 'dual,kkt,dual&kkt' for dual/kkt+ensemble)."
         ),
     )
-    parser.add_argument("--flex-lambda-theta-anchor", type=float, default=10.0)
+    parser.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0)
     parser.add_argument("--flex-lambda-theta-iso", type=float, default=0.0)
     parser.add_argument("--flex-theta-anchor-mode", type=str, default="ipo")
     parser.add_argument("--flex-theta-init-mode", type=str, default="none")
@@ -192,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trading-cost-bps",
         type=float,
-        default=0.0,
+        default=1.0,
         help=(
             "Set to a positive value to enable the built-in per-asset trading cost table "
             "(values expressed in basis points). "
@@ -202,7 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trading-cost-per-asset",
         type=parse_trading_cost_map,
-        default=None,
+        default={"SPY": 5.0, "GLD": 10.0, "EEM": 10.0, "TLT": 5.0},
         help="Optional overrides like 'SPY:5,GLD:8' (basis points) applied per ticker.",
     )
     parser.add_argument(
@@ -234,6 +234,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1e-6,
         help="Convergence tolerance for the QP solver inside IPO-GRAD.",
+    )
+    parser.add_argument(
+        "--ipo-grad-init-mode",
+        type=str,
+        default="none",
+        choices=["none", "ipo"],
+        help="Initial theta for IPO-GRAD (none=zero init, ipo=closed-form IPO warm start).",
+    )
+    parser.add_argument(
+        "--ipo-grad-lambda-anchor",
+        type=float,
+        default=0.0,
+        help="L2 anchor strength on theta for IPO-GRAD (0 to disable).",
+    )
+    parser.add_argument(
+        "--ipo-grad-theta-anchor-mode",
+        type=str,
+        default="ipo",
+        choices=["ipo", "zero"],
+        help="Theta anchor for IPO-GRAD: ipo=use IPO closed-form, zero=use zero vector.",
     )
     parser.add_argument(
         "--ipo-grad-debug-kkt",
@@ -304,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--spo-plus-init-mode",
         type=str,
-        default="zero",
+        default="ipo",
         choices=["zero", "ipo"],
         help="Initial theta for SPO+ (zero or IPO closed-form).",
     )

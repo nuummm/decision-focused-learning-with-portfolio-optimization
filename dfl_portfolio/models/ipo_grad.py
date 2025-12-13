@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from qpth.qp import QPFunction
 import time
+from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
 
 NDArray = Any
 
@@ -26,6 +27,8 @@ def fit_ipo_grad(
     qp_tol: float = 1e-6,
     seed: Optional[int] = None,
     theta_init: Optional[NDArray] = None,
+    lambda_anchor: float = 0.0,
+    theta_anchor: Optional[NDArray] = None,
     tee: bool = False,
     debug_kkt: bool = False,
 ) -> Tuple[NDArray, NDArray, NDArray, NDArray, List[int], Dict[str, Any]]:
@@ -80,6 +83,10 @@ def fit_ipo_grad(
     y_t = torch.from_numpy(Y_train).to(device=device, dtype=torch.float32)
     V_t = torch.from_numpy(V_train).to(device=device, dtype=torch.float32)
 
+    # Anchor (used for optional L2 penalty)
+    theta_anchor_vec: Optional[np.ndarray] = None
+    if theta_anchor is not None:
+        theta_anchor_vec = np.asarray(theta_anchor, float).reshape(-1)
     # Initialize theta. If a warm-start (e.g., IPO closed-form) is provided,
     # use it; otherwise fall back to zeros.
     if theta_init is not None:
@@ -90,6 +97,9 @@ def fit_ipo_grad(
     else:
         theta_t0 = torch.zeros(d, device=device, dtype=torch.float32)
     theta = torch.nn.Parameter(theta_t0)
+    if theta_anchor_vec is None:
+        theta_anchor_vec = np.zeros(d, dtype=float)
+    theta_anchor_t = torch.from_numpy(theta_anchor_vec).to(device=device, dtype=torch.float32)
     opt = torch.optim.Adam([theta], lr=lr)
 
     n_train = x_t.shape[0]
@@ -151,6 +161,9 @@ def fit_ipo_grad(
             ret = (z_star * yb).sum(dim=1)
             risk = torch.einsum("bi,bij,bj->b", z_star, Vb, z_star)
             loss_i = -alpha * ret + 0.5 * delta * risk
+            if float(lambda_anchor) > 0.0:
+                anchor_term = float(lambda_anchor) * torch.sum((theta - theta_anchor_t) ** 2)
+                loss_i = loss_i + anchor_term
             loss = loss_i.mean()
 
             loss.backward()

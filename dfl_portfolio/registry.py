@@ -199,6 +199,8 @@ def _wrap_ipo_grad(spec: SolverSpec) -> TrainerFn:
         qp_tol = float(kw.pop("ipo_grad_qp_tol", 1e-6))
         debug_kkt = bool(kw.pop("ipo_grad_debug_kkt", False))
         seed = kw.pop("ipo_grad_seed", None)
+        lambda_anchor = float(kw.pop("ipo_grad_lambda_anchor", 0.0))
+        theta_anchor = kw.pop("ipo_grad_theta_anchor", None)
         ret = fit_ipo_grad(
             X,
             Y,
@@ -214,6 +216,8 @@ def _wrap_ipo_grad(spec: SolverSpec) -> TrainerFn:
             qp_tol=qp_tol,
             seed=seed,
             theta_init=theta_init,
+            lambda_anchor=lambda_anchor,
+            theta_anchor=theta_anchor,
             tee=tee,
             debug_kkt=debug_kkt,
         )
