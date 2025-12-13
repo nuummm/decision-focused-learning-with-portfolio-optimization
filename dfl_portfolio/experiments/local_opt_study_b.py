@@ -161,6 +161,164 @@ def _get_plt():  # type: ignore
         return None
 
 
+def _classify_solver_outcome(solver_term: object, solver_status: object) -> str:
+    term = str(solver_term or "").strip().lower()
+    status = str(solver_status or "").strip().lower()
+    text = f"{term} {status}"
+    if "optimal" in text:
+        return "success"
+    if any(k in text for k in ("infeasible", "unbounded", "error", "fail", "failed", "exception")):
+        return "fail"
+    if not text.strip():
+        return "warn"
+    return "warn"
+
+
+def _plot_solver_status_by_seed(
+    retrain_df: pd.DataFrame, out_dir: Path, *, targets: Sequence[str], init_family: str
+) -> None:
+    """Flex only: show per-seed non-success counts and their mean for a given init_family."""
+    plt = _get_plt()
+    if plt is None:
+        return
+    if retrain_df.empty:
+        return
+    df = retrain_df.copy()
+    df = df[df["model_key"] == "flex"]
+    df = df[df["formulation"].isin(list(targets))]
+    df = df[df["init_family"] == init_family]
+    df = df[df["init_seed"].astype(str).str.len() > 0]
+    if df.empty:
+        return
+
+    df["outcome"] = [
+        _classify_solver_outcome(t, s) for t, s in zip(df.get("solver_term", ""), df.get("solver_status", ""))
+    ]
+    seeds = sorted({int(s) for s in df["init_seed"].astype(int).tolist()})
+    forms = list(targets)
+
+    non_success = (
+        df[df["outcome"] != "success"]
+        .groupby(["formulation", "init_seed"])
+        .size()
+        .unstack(fill_value=0)
+    )
+    for form in forms:
+        if form not in non_success.index:
+            non_success.loc[form] = 0
+    non_success = non_success.reindex(index=forms, columns=seeds, fill_value=0)
+
+    # mean across init seeds (counts per run; cycles are fixed so comparable)
+    means = non_success.mean(axis=1)
+    stds = non_success.std(axis=1, ddof=1) if len(seeds) > 1 else non_success.std(axis=1, ddof=0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [3, 1]})
+    ax0, ax1 = axes[0], axes[1]
+
+    x = np.arange(len(seeds), dtype=float)
+    width = 0.38
+    colors = {"dual": "#1f77b4", "kkt": "#ff7f0e"}
+    for i, form in enumerate(forms):
+        offs = (-0.5 + i) * width
+        y = non_success.loc[form].to_numpy(dtype=float)
+        ax0.bar(x + offs, y, width=width, color=colors.get(form, None), alpha=0.85, label=form)
+    ax0.set_xticks(x)
+    ax0.set_xticklabels([str(s) for s in seeds], rotation=0)
+    ax0.set_xlabel("init_seed")
+    ax0.set_ylabel("non-success retrain count")
+    ax0.set_title(f"Solver non-success counts by init_seed ({init_family})")
+    ax0.legend(loc="best", fontsize=9)
+
+    ax1.bar(
+        np.arange(len(forms)),
+        [means.loc[f] for f in forms],
+        yerr=[stds.loc[f] for f in forms],
+        capsize=3,
+        color=[colors.get(f, None) for f in forms],
+        alpha=0.85,
+    )
+    ax1.set_xticks(np.arange(len(forms)))
+    ax1.set_xticklabels(forms, rotation=0)
+    ax1.set_title("mean±std")
+    ax1.set_ylabel("non-success count")
+
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_dir / f"solver_status_non_success_counts_{init_family}.png")
+    plt.close(fig)
+
+
+def _plot_elapsed_time_boxplot(runs_df: pd.DataFrame, out_dir: Path) -> None:
+    plt = _get_plt()
+    if plt is None:
+        return
+    if runs_df.empty or "elapsed_total_run_sec" not in runs_df.columns:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+    for ax, fam in zip(axes, ["local", "global"]):
+        part = runs_df[runs_df["init_family"] == fam]
+        if part.empty:
+            ax.axis("off")
+            continue
+        labels = sorted(part["model_label"].unique().tolist())
+        data = [part.loc[part["model_label"] == lab, "elapsed_total_run_sec"].astype(float).to_numpy() for lab in labels]
+        ax.boxplot(data, labels=labels, showfliers=False)
+        # base points (single runs) as markers
+        base = runs_df[runs_df["init_family"] == "base"]
+        for i, lab in enumerate(labels, start=1):
+            b = base.loc[base["model_label"] == lab, "elapsed_total_run_sec"]
+            if not b.empty:
+                ax.scatter([i], [float(b.iloc[0])], color="black", marker="D", s=24, zorder=3, label="base" if i == 1 else None)
+        ax.set_title(f"elapsed_total_run_sec ({fam})")
+        ax.set_xlabel("model")
+        ax.tick_params(axis="x", rotation=15)
+    axes[0].set_ylabel("seconds")
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper right", fontsize=9)
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_dir / "elapsed_total_run_sec_boxplot.png")
+    plt.close(fig)
+
+
+def _plot_metric_boxplots(runs_df: pd.DataFrame, out_dir: Path, metrics: Sequence[str]) -> None:
+    plt = _get_plt()
+    if plt is None:
+        return
+    if runs_df.empty:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base = runs_df[runs_df["init_family"] == "base"]
+    for metric in metrics:
+        if metric not in runs_df.columns:
+            continue
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=False)
+        for ax, fam in zip(axes, ["local", "global"]):
+            part = runs_df[runs_df["init_family"] == fam]
+            if part.empty:
+                ax.axis("off")
+                continue
+            labels = sorted(part["model_label"].unique().tolist())
+            data = [part.loc[part["model_label"] == lab, metric].astype(float).to_numpy() for lab in labels]
+            ax.boxplot(data, labels=labels, showfliers=False)
+            for i, lab in enumerate(labels, start=1):
+                b = base.loc[base["model_label"] == lab, metric]
+                if not b.empty and np.isfinite(float(b.iloc[0])):
+                    ax.scatter([i], [float(b.iloc[0])], color="black", marker="D", s=24, zorder=3, label="base" if i == 1 else None)
+            ax.set_title(f"{metric} ({fam})")
+            ax.set_xlabel("model")
+            ax.tick_params(axis="x", rotation=15)
+        handles, labels_leg = axes[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels_leg, loc="upper right", fontsize=9)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"boxplot_{metric}.png")
+        plt.close(fig)
+
+
 def _plot_family_plus_base(
     *,
     family_curves: Dict[int, pd.DataFrame],
@@ -723,8 +881,33 @@ def main() -> None:
         summary_rows.append(row)
     pd.DataFrame(summary_rows).to_csv(analysis_csv / "summary_table.csv", index=False)
 
-    # Boxplots: metric distributions across init seeds (compare models; split by local/global when available)
-    _plot_metric_boxplots(runs_df, analysis_fig)
+    # Debug/analysis plots (saved under analysis/figures/)
+    solver_fig_dir = analysis_fig / "solver_debug"
+    box_fig_dir = analysis_fig / "boxplots"
+
+    if isinstance(retrain_df, pd.DataFrame) and not retrain_df.empty:
+        # dual/kkt solver status summaries (seed-level + mean)
+        _plot_solver_status_by_seed(retrain_df, solver_fig_dir, targets=["dual", "kkt"], init_family="local")
+        _plot_solver_status_by_seed(retrain_df, solver_fig_dir, targets=["dual", "kkt"], init_family="global")
+
+    # Runtime comparison (dual/kkt/ipo_grad)
+    _plot_elapsed_time_boxplot(runs_df, solver_fig_dir)
+
+    # Metric distributions (boxplots per metric; compare models, split by local/global)
+    metric_list = [
+        "ann_return",
+        "total_return",
+        "terminal_wealth",
+        "sharpe",
+        "sortino",
+        "ann_volatility",
+        "max_drawdown",
+        "cvar_95",
+        "avg_turnover",
+        "avg_trading_cost",
+        "r2",
+    ]
+    _plot_metric_boxplots(runs_df, box_fig_dir, metric_list)
 
     # Plots: three figures per model (local+base, global+base, all)
     for form in plot_forms:
