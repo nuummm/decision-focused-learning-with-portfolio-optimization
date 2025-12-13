@@ -1977,6 +1977,85 @@ def run_mse_and_bias_analysis(
     bias_fig_dir = analysis_fig_dir / "bias_analysis"
     bias_fig_dir.mkdir(parents=True, exist_ok=True)
 
+    def _display_color_map() -> Dict[str, str]:
+        # Prefer a display-name keyed palette so downstream plots stay consistent even
+        # when DataFrames already contain display_model_name(model).
+        out: Dict[str, str] = {}
+        for internal_key, color in MODEL_COLOR_MAP.items():
+            out.setdefault(display_model_name(internal_key), color)
+            out.setdefault(str(internal_key), color)
+        # Common display-name aliases
+        out.setdefault("IPO-analytic", MODEL_COLOR_MAP.get("ipo", "tab:orange"))
+        out.setdefault("IPO-GRAD", MODEL_COLOR_MAP.get("ipo_grad", "tab:brown"))
+        out.setdefault("SPO+", MODEL_COLOR_MAP.get("spo_plus", "tab:cyan"))
+        out.setdefault("OLS", MODEL_COLOR_MAP.get("ols", "tab:blue"))
+        out.setdefault("DFL-QCQP-dual", MODEL_COLOR_MAP.get("flex_dual", "tab:green"))
+        out.setdefault("DFL-QCQP-kkt", MODEL_COLOR_MAP.get("flex_kkt", "tab:red"))
+        out.setdefault("DFL-QCQP-ens", MODEL_COLOR_MAP.get("flex_dual_kkt_ens", "black"))
+        return out
+
+    def _resolve_label_overlaps(fig, ax, labels, *, max_iter: int = 120) -> None:
+        """Heuristic label repulsion in screen space (no external deps)."""
+        try:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            ax_bbox = ax.get_window_extent(renderer)
+        except Exception:  # pragma: no cover
+            return
+        px_to_pt = 72.0 / float(fig.dpi or 100.0)
+
+        for _ in range(int(max_iter)):
+            moved = False
+            try:
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()
+            except Exception:  # pragma: no cover
+                break
+            bboxes = [t.get_window_extent(renderer).expanded(1.05, 1.15) for t in labels]
+            centers = [np.array([(bb.x0 + bb.x1) / 2.0, (bb.y0 + bb.y1) / 2.0]) for bb in bboxes]
+            for i in range(len(labels)):
+                for j in range(i):
+                    if not bboxes[i].overlaps(bboxes[j]):
+                        continue
+                    v = centers[i] - centers[j]
+                    if not np.isfinite(v).all() or float(np.linalg.norm(v)) < 1e-9:
+                        v = np.array([1.0, 0.0])
+                    v = v / float(np.linalg.norm(v))
+                    # Move in opposite directions (points units via px->pt)
+                    step_pt = 6.0
+                    delta_pt = v * (step_pt)
+                    pi = np.array(labels[i].get_position(), dtype=float)
+                    pj = np.array(labels[j].get_position(), dtype=float)
+                    labels[i].set_position(tuple(pi + delta_pt))
+                    labels[j].set_position(tuple(pj - delta_pt))
+                    moved = True
+
+            # Keep labels inside axes bounds (soft clamp)
+            if moved:
+                try:
+                    fig.canvas.draw()
+                    renderer = fig.canvas.get_renderer()
+                    for t in labels:
+                        bb = t.get_window_extent(renderer)
+                        dx = 0.0
+                        dy = 0.0
+                        if bb.x0 < ax_bbox.x0:
+                            dx += (ax_bbox.x0 - bb.x0) * px_to_pt
+                        if bb.x1 > ax_bbox.x1:
+                            dx -= (bb.x1 - ax_bbox.x1) * px_to_pt
+                        if bb.y0 < ax_bbox.y0:
+                            dy += (ax_bbox.y0 - bb.y0) * px_to_pt
+                        if bb.y1 > ax_bbox.y1:
+                            dy -= (bb.y1 - ax_bbox.y1) * px_to_pt
+                        if dx != 0.0 or dy != 0.0:
+                            p = np.array(t.get_position(), dtype=float)
+                            t.set_position(tuple(p + np.array([dx, dy])))
+                except Exception:  # pragma: no cover
+                    pass
+
+            if not moved:
+                break
+
     def _should_skip_scatter(mstr: str) -> bool:
         # ベンチマーク系は散布図から除外（SPY, 1/N）
         return (
@@ -1986,7 +2065,19 @@ def run_mse_and_bias_analysis(
 
     # R^2 vs Sharpe scatter (summary の R^2 を使用)
     if plt is not None:
-        plt.figure()
+        palette = _display_color_map()
+        label_offsets = [
+            (6, 6),
+            (6, -10),
+            (-10, 6),
+            (-10, -10),
+            (10, 0),
+            (0, 10),
+            (-12, 0),
+            (0, -12),
+        ]
+        fig, ax = plt.subplots(figsize=(7.2, 5.2))
+        labels: List[Any] = []
         for model, row in plot_df.iterrows():
             mstr = str(model)
             if _should_skip_scatter(mstr):
@@ -1997,18 +2088,30 @@ def run_mse_and_bias_analysis(
             y = row.get("sharpe", np.nan)
             if not np.isfinite(y):
                 continue
-            color = MODEL_COLOR_MAP.get(str(model).lower(), None) or MODEL_COLOR_MAP.get(model, "tab:blue")
-            plt.scatter(x, y, color=color)
-            plt.text(x, y, model, fontsize=8, color=color)
-        plt.xlabel("アウトオブサンプル $R^2$（資産別）")
-        plt.ylabel("シャープレシオ（年率換算）")
-        plt.title("予測精度と意思決定品質の関係")
-        plt.tight_layout()
-        plt.savefig(bias_fig_dir / "r2_vs_sharpe_scatter.png")
-        plt.close()
+            color = palette.get(mstr, "tab:blue")
+            ax.scatter(x, y, color=color, s=46, edgecolors="white", linewidths=0.8, zorder=3)
+            dx, dy = label_offsets[len(labels) % len(label_offsets)]
+            labels.append(
+                ax.annotate(
+                    mstr,
+                    xy=(x, y),
+                    xytext=(dx, dy),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color=color,
+                )
+            )
+        _resolve_label_overlaps(fig, ax, labels)
+        ax.set_xlabel("アウトオブサンプル $R^2$（資産別）")
+        ax.set_ylabel("シャープレシオ（年率換算）")
+        ax.set_title("予測精度と意思決定品質の関係")
+        fig.tight_layout()
+        fig.savefig(bias_fig_dir / "r2_vs_sharpe_scatter.png")
+        plt.close(fig)
 
         # MSE vs Sharpe scatter (asset_predictions 由来の MSE を使用)
-        plt.figure()
+        fig, ax = plt.subplots(figsize=(7.2, 5.2))
+        labels = []
         for model, row in plot_df.iterrows():
             mstr = str(model)
             if _should_skip_scatter(mstr):
@@ -2019,15 +2122,26 @@ def run_mse_and_bias_analysis(
             y = row.get("sharpe", np.nan)
             if not np.isfinite(y):
                 continue
-            color = MODEL_COLOR_MAP.get(str(model).lower(), None) or MODEL_COLOR_MAP.get(model, "tab:blue")
-            plt.scatter(x, y, color=color)
-            plt.text(x, y, model, fontsize=8, color=color)
-        plt.xlabel("アウトオブサンプル MSE（資産別）")
-        plt.ylabel("シャープレシオ（年率換算）")
-        plt.title("予測誤差と意思決定品質の関係")
-        plt.tight_layout()
-        plt.savefig(bias_fig_dir / "mse_vs_sharpe_scatter.png")
-        plt.close()
+            color = palette.get(mstr, "tab:blue")
+            ax.scatter(x, y, color=color, s=46, edgecolors="white", linewidths=0.8, zorder=3)
+            dx, dy = label_offsets[len(labels) % len(label_offsets)]
+            labels.append(
+                ax.annotate(
+                    mstr,
+                    xy=(x, y),
+                    xytext=(dx, dy),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color=color,
+                )
+            )
+        _resolve_label_overlaps(fig, ax, labels)
+        ax.set_xlabel("アウトオブサンプル MSE（資産別）")
+        ax.set_ylabel("シャープレシオ（年率換算）")
+        ax.set_title("予測誤差と意思決定品質の関係")
+        fig.tight_layout()
+        fig.savefig(bias_fig_dir / "mse_vs_sharpe_scatter.png")
+        plt.close(fig)
 
     # Bias-related analyses
     df["bias"] = df["pred_ret"] - df["real_ret"]
@@ -2092,7 +2206,27 @@ def run_mse_and_bias_analysis(
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
             plt.ylabel("バイアス = 予測リターン - 実現リターン")
             plt.title("Up/Down別の予測バイアス")
-            plt.yscale("symlog", linthresh=1e-2)
+            # 0 近傍の差分を見やすくするため、軸を固定して拡大表示
+            y_min, y_max = -0.1, 0.1
+            plt.ylim(y_min, y_max)
+            if data:
+                # 各箱の中央値（線）の値を表示（混み合う場合があるので小さめに）
+                offset = (y_max - y_min) * 0.02
+                for med in box.get("medians", []):
+                    x = float(np.mean(med.get_xdata()))
+                    y = float(np.mean(med.get_ydata()))
+                    if not np.isfinite(y):
+                        continue
+                    plt.text(
+                        x,
+                        min(y + offset, y_max - offset),
+                        f"{y:.3f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=7,
+                        color="dimgray",
+                        rotation=90,
+                    )
             plt.tight_layout()
             plt.savefig(bias_fig_dir / "updown_bias_boxplot.png")
         except Exception as exc:  # pragma: no cover - 図生成失敗時も後続解析は続行
@@ -2164,7 +2298,26 @@ def run_mse_and_bias_analysis(
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
             plt.ylabel("バイアス = 予測リターン - 実現リターン")
             plt.title("IN/OUT（ウェイト大小別）の予測バイアス")
-            plt.yscale("symlog", linthresh=1e-2)
+            # 0 近傍の差分を見やすくするため、軸を固定して拡大表示
+            y_min, y_max = -0.1, 0.1
+            plt.ylim(y_min, y_max)
+            if data:
+                offset = (y_max - y_min) * 0.02
+                for med in box.get("medians", []):
+                    x = float(np.mean(med.get_xdata()))
+                    y = float(np.mean(med.get_ydata()))
+                    if not np.isfinite(y):
+                        continue
+                    plt.text(
+                        x,
+                        min(y + offset, y_max - offset),
+                        f"{y:.3f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=7,
+                        color="dimgray",
+                        rotation=90,
+                    )
             plt.tight_layout()
             plt.savefig(bias_fig_dir / "inout_bias_boxplot.png")
         except Exception as exc:  # pragma: no cover
@@ -2300,6 +2453,204 @@ def run_extended_analysis(
         run_mse_and_bias_analysis(analysis_csv_dir, analysis_fig_dir, asset_pred_dir)
     except Exception as exc:  # pragma: no cover
         print(f"[analysis] mse/bias analysis failed: {exc}")
+    try:
+        analysis_dir = Path(analysis_fig_dir).parent
+        export_analysis_csv_tables_as_png(analysis_csv_dir, analysis_dir)
+    except Exception as exc:  # pragma: no cover
+        print(f"[analysis] csv table png export failed: {exc}")
+
+
+def export_dataframe_table_png(
+    df: pd.DataFrame,
+    out_path: Path,
+    *,
+    title: str = "",
+    float_digits: int = 3,
+    max_rows: int | None = None,
+    max_cols: int | None = None,
+    highlight_top_k: int = 0,
+    lower_is_better_cols: Sequence[str] = (),
+    exclude_highlight_cols: Sequence[str] = (),
+) -> None:
+    """Render a DataFrame as a PNG table for quick visual inspection."""
+    if plt is None or df is None:
+        return
+    if df.empty:
+        return
+    df_disp = df.copy()
+    if max_cols is not None and df_disp.shape[1] > max_cols:
+        df_disp = df_disp.iloc[:, :max_cols]
+    if max_rows is not None and df_disp.shape[0] > max_rows:
+        df_disp = df_disp.iloc[:max_rows, :]
+
+    def _fmt(x: object) -> str:
+        if x is None or (isinstance(x, float) and not np.isfinite(x)):
+            return ""
+        if isinstance(x, (np.floating, float)):
+            return f"{float(x):.{int(float_digits)}f}"
+        if isinstance(x, (np.integer, int)):
+            return str(int(x))
+        return str(x)
+
+    # Keep numeric copy for highlighting before formatting to strings.
+    df_num = df_disp.copy()
+    df_str = df_disp.applymap(_fmt)
+    n_rows, n_cols = df_str.shape
+    # Heuristic sizing: aim for readable tables without excessive whitespace.
+    fig_w = max(8.0, 1.1 * n_cols + 1.5)
+    fig_h = max(2.5, 0.35 * (n_rows + 1) + 1.2)
+    font_size = 8 if n_rows <= 25 and n_cols <= 12 else 6
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    if title:
+        ax.set_title(title, fontsize=11, pad=10)
+
+    table = ax.table(
+        cellText=df_str.values.tolist(),
+        colLabels=list(df_str.columns),
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(font_size)
+
+    # Style header + zebra rows
+    header_color = "#40466e"
+    zebra = ["#f2f2f2", "white"]
+    for (r, c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor(header_color)
+            cell.set_text_props(color="white", weight="bold")
+        else:
+            cell.set_facecolor(zebra[(r - 1) % 2])
+        cell.set_edgecolor("#d0d0d0")
+        cell.set_linewidth(0.6)
+
+    # Optional highlighting: best-3 per column (direction-aware).
+    if int(highlight_top_k) > 0:
+        k = int(highlight_top_k)
+        lib_cols = {str(c) for c in lower_is_better_cols}
+        excl_cols = {str(c) for c in exclude_highlight_cols}
+        # best1/best2/best3
+        highlight_colors = ["#b7f7c1", "#fff3b0", "#ffd6a5"]
+
+        for col_i, col_name in enumerate(df_num.columns):
+            col_key = str(col_name)
+            if col_key in excl_cols:
+                continue
+            # Try numeric conversion.
+            series = pd.to_numeric(df_num[col_name], errors="coerce")
+            finite = series[np.isfinite(series.to_numpy(dtype=float))]
+            if finite.empty:
+                continue
+            if col_key in {"n_retrain", "n_invest_steps"}:
+                continue
+
+            # Direction:
+            # - default: larger is better
+            # - for lower_is_better_cols:
+            #     if typical values are negative (loss-like), closer to 0 is better => larger is better
+            #     else smaller is better
+            if col_key in lib_cols:
+                med = float(finite.median())
+                ascending = bool(med >= 0.0)
+            else:
+                ascending = False
+
+            best_idx = (
+                finite.sort_values(ascending=ascending)
+                .head(k)
+                .index.tolist()
+            )
+            for rank, row_idx in enumerate(best_idx, start=1):
+                if rank > len(highlight_colors):
+                    color = highlight_colors[-1]
+                else:
+                    color = highlight_colors[rank - 1]
+                r = int(row_idx) + 1  # table row offset (0 is header)
+                c = int(col_i)
+                cell = table.get_celld().get((r, c))
+                if cell is None:
+                    continue
+                cell.set_facecolor(color)
+                if rank == 1:
+                    cell.set_text_props(weight="bold")
+
+    table.scale(1.0, 1.25)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def export_csv_table_png(
+    csv_path: Path,
+    out_path: Path,
+    *,
+    title: str = "",
+    float_digits: int = 3,
+    max_rows: int | None = None,
+    max_cols: int | None = None,
+    highlight_top_k: int = 0,
+    lower_is_better_cols: Sequence[str] = (),
+    exclude_highlight_cols: Sequence[str] = (),
+) -> None:
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return
+    if title == "":
+        title = Path(csv_path).name
+    export_dataframe_table_png(
+        df,
+        out_path,
+        title=title,
+        float_digits=float_digits,
+        max_rows=max_rows,
+        max_cols=max_cols,
+        highlight_top_k=highlight_top_k,
+        lower_is_better_cols=lower_is_better_cols,
+        exclude_highlight_cols=exclude_highlight_cols,
+    )
+
+
+def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path) -> None:
+    """Export key analysis CSVs as PNG tables under `analysis/tables/`."""
+    analysis_csv_dir = Path(analysis_csv_dir)
+    analysis_dir = Path(analysis_dir)
+    out_dir = analysis_dir / "tables"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    targets = [
+        "1-summary.csv",
+        "1-summary_cost.csv",
+        "2-experiment_config.csv",
+        "3-performance_significance_dfl_summary.csv",
+    ]
+    # In these metrics, "smaller risk/cost is better".
+    lower_is_better = ["ann_volatility", "max_drawdown", "cvar_95", "avg_trading_cost"]
+    for name in targets:
+        src = analysis_csv_dir / name
+        if not src.exists():
+            continue
+        dst = out_dir / f"{Path(name).stem}.png"
+        # Config can be wide; allow more columns. Others are small.
+        if name == "2-experiment_config.csv":
+            export_csv_table_png(src, dst, title=name, float_digits=6, max_rows=200, max_cols=40)
+        else:
+            highlight = 3 if name in {"1-summary.csv", "1-summary_cost.csv"} else 0
+            export_csv_table_png(
+                src,
+                dst,
+                title=name,
+                float_digits=4,
+                max_rows=200,
+                max_cols=40,
+                highlight_top_k=highlight,
+                lower_is_better_cols=lower_is_better,
+            )
 
 
 def plot_asset_correlation(corr_df: pd.DataFrame, path: Path, stats: Optional[Dict[str, float]] = None) -> None:

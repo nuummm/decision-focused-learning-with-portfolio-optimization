@@ -46,6 +46,8 @@ from dfl_portfolio.real_data.reporting import (
     WEIGHT_THRESHOLD,
     WEIGHT_PLOT_MAX_POINTS,
     PERIOD_WINDOWS,
+    MODEL_COLOR_MAP,
+    ASSET_COLOR_SEQUENCE,
     compute_correlation_stats,
     compute_period_metrics,
     compute_pairwise_mean_return_tests,
@@ -115,8 +117,23 @@ PREFERRED_MODEL_ORDER = [
 ]
 
 
-def plot_weight_window_with_connections(weight_dict: Dict[str, pd.DataFrame], path: Path) -> None:
-    """Render stacked weights and effective connection counts per model."""
+def plot_weight_window_with_connections(
+    weight_dict: Dict[str, pd.DataFrame],
+    path: Path,
+    *,
+    returns_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Render stacked weights per model and output additional diagnostics.
+
+    Notes
+    -----
+    - This function saves the stacked weights figure to `path`.
+    - If `returns_df` is provided (index=date, columns=assets), it also adds a bottom
+      subplot that indicates, per week, which asset achieved the maximum return
+      (winner=1, others=0).
+    - It additionally saves a standalone effective number plot (N_eff = 1/sum(w^2))
+      to `path` with the suffix `_neff.png`.
+    """
 
     if plt is None or not weight_dict:
         return
@@ -137,20 +154,27 @@ def plot_weight_window_with_connections(weight_dict: Dict[str, pd.DataFrame], pa
         return
 
     n_models = len(entries)
-    fig_height = max(2.5 * n_models + 2, 4)
-    fig, axes = plt.subplots(n_models + 1, 1, figsize=(12, fig_height), sharex=True)
+    add_winner = returns_df is not None and isinstance(returns_df, pd.DataFrame) and not returns_df.empty
+    n_rows = n_models + (1 if add_winner else 0)
+    fig_height = max(2.5 * n_models + (1.8 if add_winner else 0.0), 4)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(12, fig_height), sharex=True)
     axes = np.atleast_1d(axes)
     axes_list = list(axes)
-    conn_ax = axes_list[-1]
-    model_axes = axes_list[:-1]
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+    winner_ax = axes_list[-1] if add_winner else None
+    model_axes = axes_list[:-1] if add_winner else axes_list
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
 
+    first_dates: Optional[pd.Series] = None
+    first_asset_cols: List[str] = []
     for idx, ((model_key, df_model), ax) in enumerate(zip(entries, model_axes)):
         asset_cols = [c for c in df_model.columns if c not in {"date", "portfolio_return_sq"}]
         if not asset_cols:
             continue
         values = df_model[asset_cols].astype(float)
         dates = pd.to_datetime(df_model["date"])
+        if first_dates is None:
+            first_dates = dates
+            first_asset_cols = list(asset_cols)
         bottom = np.zeros(len(values))
         for col_idx, col in enumerate(asset_cols):
             label = col if idx == 0 else None
@@ -161,24 +185,78 @@ def plot_weight_window_with_connections(weight_dict: Dict[str, pd.DataFrame], pa
         if idx == 0 and asset_cols:
             ax.legend(loc="upper right", fontsize=8)
 
-        weights = values
-        h_val = (weights.pow(2).sum(axis=1)).replace(0.0, np.nan)
-        neff = 1.0 / h_val
-        color = color_cycle[idx % len(color_cycle)] if color_cycle else None
-        conn_ax.plot(
-            dates,
-            neff,
-            label=display_model_name(model_key),
-            color=color,
-        )
+    if add_winner and winner_ax is not None and first_dates is not None and first_asset_cols:
+        try:
+            r = returns_df.copy()
+            if not isinstance(r.index, pd.DatetimeIndex):
+                r.index = pd.to_datetime(r.index)
+            # Align to the same date grid as the weights plot (weekly dates)
+            r = r.reindex(pd.to_datetime(first_dates))
+            r = r.replace([np.inf, -np.inf], np.nan)
+            # Keep only columns we can match to assets in the weights
+            asset_cols = [c for c in first_asset_cols if c in r.columns]
+            if asset_cols:
+                asset_color_map = {
+                    col: ASSET_COLOR_SEQUENCE[i % len(ASSET_COLOR_SEQUENCE)]
+                    for i, col in enumerate(asset_cols)
+                }
+                winners = r[asset_cols].idxmax(axis=1)
+                bottom = np.zeros(len(r.index), dtype=float)
+                for col in asset_cols:
+                    vals = (winners == col).astype(float).to_numpy()
+                    winner_ax.bar(
+                        r.index,
+                        vals,
+                        bottom=bottom,
+                        width=5,
+                        color=asset_color_map.get(col, None),
+                        alpha=0.85,
+                        edgecolor="black",
+                        linewidth=0.3,
+                    )
+                    bottom += vals
+                winner_ax.set_ylim(0.0, 1.0)
+                winner_ax.set_yticks([0.0, 1.0])
+                winner_ax.set_ylabel("勝者(1/0)")
+                winner_ax.set_title("週次：最大リターン資産（勝者=1）")
+                winner_ax.grid(axis="y", alpha=0.15)
+        except Exception:  # pragma: no cover
+            pass
 
-    conn_ax.set_ylabel("N_eff")
-    conn_ax.set_xlabel("日付")
-    conn_ax.set_title("有効接続数 (N_eff)")
-    conn_ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+    # Standalone N_eff plot (with crisis windows shaded)
+    neff_path = path.with_name(f"{path.stem}_neff.png")
+    fig2, ax2 = plt.subplots(figsize=(12, 3.6))
+    # Background event windows
+    for _, start_s, end_s in PERIOD_WINDOWS:
+        start_ts = pd.Timestamp(start_s)
+        end_ts = pd.Timestamp(end_s)
+        ax2.axvspan(start_ts, end_ts, color="grey", alpha=0.15, zorder=0)
+
+    for idx, (model_key, df_model) in enumerate(entries):
+        asset_cols = [c for c in df_model.columns if c not in {"date", "portfolio_return_sq"}]
+        if not asset_cols:
+            continue
+        values = df_model[asset_cols].astype(float)
+        dates = pd.to_datetime(df_model["date"])
+        h_val = (values.pow(2).sum(axis=1)).replace(0.0, np.nan)
+        neff = (1.0 / h_val).astype(float)
+        color = MODEL_COLOR_MAP.get(str(model_key), None)
+        if not color:
+            color = color_cycle[idx % len(color_cycle)] if color_cycle else None
+        ax2.plot(dates, neff, label=display_model_name(model_key), color=color, linewidth=1.8)
+
+    ax2.set_ylabel("N_eff")
+    ax2.set_xlabel("日付")
+    ax2.set_title("有効資産数 (N_eff)")
+    ax2.legend(loc="upper right", fontsize=8)
+    ax2.grid(axis="y", alpha=0.2)
+    fig2.tight_layout()
+    fig2.savefig(neff_path)
+    plt.close(fig2)
 
 
 def train_model_window(
@@ -938,7 +1016,13 @@ def main() -> None:
     config_records = []
     for key, value in sorted(vars(args).items()):
         config_records.append({"parameter": key, "value": value})
-    pd.DataFrame(config_records).to_csv(analysis_csv_dir / "2-experiment_config.csv", index=False)
+    config_csv_path = analysis_csv_dir / "2-experiment_config.csv"
+    pd.DataFrame(config_records).to_csv(config_csv_path, index=False)
+    # Quick access copy under analysis/
+    try:
+        shutil.copy2(config_csv_path, analysis_dir / "2-experiment_config.csv")
+    except Exception:
+        pass
 
     start_ts = pd.Timestamp(loader_cfg.start)
     data_fig_dir = analysis_fig_dir / "data_overview"
@@ -1239,9 +1323,7 @@ def main() -> None:
     for label, df in bench_wealth.items():
         wealth_dict[label] = df
 
-    summary_output_path = analysis_dir / "1-summary.csv"
     summary_csv_path = analysis_csv_dir / "1-summary.csv"
-    summary_cost_path = analysis_dir / "1-summary_cost.csv"
     summary_cost_csv_path = analysis_csv_dir / "1-summary_cost.csv"
     summary_raw_df = pd.DataFrame(stats_results)
     if not summary_raw_df.empty:
@@ -1251,7 +1333,7 @@ def main() -> None:
             errors="ignore",
         ).drop(columns=["trading_cost_bps"], errors="ignore")
         summary_df = format_summary_for_output(gross_df)
-        summary_df.to_csv(summary_output_path, index=False)
+        summary_df.to_csv(summary_csv_path, index=False)
 
         net_keep_cols = ["model"] + [c for c in summary_raw_df.columns if c.endswith("_net")]
         net_keep_cols += [
@@ -1266,12 +1348,19 @@ def main() -> None:
         ]
         summary_cost_base = summary_raw_df[[c for c in net_keep_cols if c in summary_raw_df.columns]].copy()
         summary_cost_df = format_summary_for_output(summary_cost_base)
-        summary_cost_df.to_csv(summary_cost_path, index=False)
+        summary_cost_df.to_csv(summary_cost_csv_path, index=False)
     else:
-        summary_output_path.write_text("")
-        summary_cost_path.write_text("")
-    shutil.copy2(summary_output_path, summary_csv_path)
-    shutil.copy2(summary_cost_path, summary_cost_csv_path)
+        summary_csv_path.write_text("")
+        summary_cost_csv_path.write_text("")
+
+    # Do not keep duplicate summary CSVs under analysis/ (legacy behavior).
+    for legacy_name in ("1-summary.csv", "1-summary_cost.csv"):
+        legacy_path = analysis_dir / legacy_name
+        try:
+            if legacy_path.exists():
+                legacy_path.unlink()
+        except Exception:
+            pass
 
     if period_rows:
         period_df = pd.DataFrame(period_rows)
@@ -1521,12 +1610,14 @@ def main() -> None:
                     plot_weight_window_with_connections(
                         sub_weights,
                         weights_all_dir / f"weights_window_2y_{window_label}.png",
+                        returns_df=bundle.dataset.returns,
                     )
                     flex_only = {k: v for k, v in sub_weights.items() if "flex" in str(k)}
                     if flex_only:
                         plot_weight_window_with_connections(
                             flex_only,
                             weights_dfl_dir / f"weights_window_2y_{window_label}.png",
+                            returns_df=bundle.dataset.returns,
                         )
                 start_win = start_win + pd.DateOffset(years=2)
         export_weight_variance_correlation(
