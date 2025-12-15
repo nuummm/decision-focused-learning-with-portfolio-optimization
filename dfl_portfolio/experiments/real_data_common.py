@@ -168,6 +168,9 @@ def prepare_flex_training_args(
         m = (mode or "none").lower()
         if m in {"", "none"}:
             return None
+        if m == "zero":
+            # Explicit zero anchor/init requested.
+            return np.zeros(int(X_train.shape[1]), dtype=float)
         if m == "ols":
             if "ols" not in theta_sources:
                 theta_sources["ols"] = np.asarray(train_ols(X_train, Y_train), dtype=float)

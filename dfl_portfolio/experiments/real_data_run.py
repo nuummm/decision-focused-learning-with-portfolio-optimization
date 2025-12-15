@@ -357,6 +357,8 @@ def train_model_window(
                 theta_init_override = np.zeros(bundle.dataset.X.shape[1], dtype=float)
     if model_key == "spo_plus" and spo_plus_options:
         init_mode = str(spo_plus_options.get("spo_plus_init_mode", "zero")).lower()
+        if init_mode == "none":
+            init_mode = "zero"
         if init_mode == "ipo":
             try:
                 theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
@@ -376,6 +378,33 @@ def train_model_window(
             except Exception as exc:  # pragma: no cover
                 if tee:
                     print(f"[SPO+] IPO warm-start failed; falling back to zero init. err={exc}")
+        # Anchor vector for SPO+ (L2 penalty)
+        lam_anchor = float(spo_plus_options.get("spo_plus_lambda_anchor", 0.0))
+        if lam_anchor > 0.0:
+            anchor_mode = str(spo_plus_options.get("spo_plus_theta_anchor_mode", "ipo")).lower()
+            if anchor_mode == "none":
+                anchor_mode = "zero"
+            if anchor_mode == "ipo":
+                try:
+                    theta_anchor, _, _, _, _, _ = fit_ipo_closed_form(
+                        bundle.dataset.X,
+                        bundle.dataset.Y,
+                        bundle.covariances,
+                        bundle.cov_indices.tolist(),
+                        start_index=train_start,
+                        end_index=train_end,
+                        delta=delta_for_theta_init,
+                        mode="budget",
+                        psd_eps=1e-12,
+                        ridge_theta=1e-10,
+                        tee=tee,
+                    )
+                    trainer_kwargs["spo_plus_theta_anchor"] = np.asarray(theta_anchor, dtype=float)
+                except Exception:
+                    trainer_kwargs["spo_plus_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+            else:
+                trainer_kwargs["spo_plus_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+            trainer_kwargs["spo_plus_lambda_anchor"] = lam_anchor
     if theta_init_override is not None:
         trainer_kwargs["theta_init"] = theta_init_override
     if model_key == "ipo_grad":
@@ -966,6 +995,31 @@ def run_rolling_experiment(
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    # ---------------------------------------------------------------------
+    # Shared theta CLI (applies to both flex and IPO-GRAD)
+    # ---------------------------------------------------------------------
+    # These flags provide a single knob for studies where we want both models
+    # to share the same theta init / anchor settings.
+    if getattr(args, "theta_init_mode", None) is not None:
+        shared_init = str(getattr(args, "theta_init_mode")).lower().strip()
+        args.flex_theta_init_mode = shared_init
+        args.ipo_grad_init_mode = shared_init
+        # SPO+ uses 'zero'/'ipo' init; accept 'none' as alias for 'zero'.
+        args.spo_plus_init_mode = "ipo" if shared_init == "ipo" else "zero"
+    if getattr(args, "lambda_theta_anchor", None) is not None:
+        shared_lam = float(getattr(args, "lambda_theta_anchor"))
+        args.flex_lambda_theta_anchor = shared_lam
+        args.ipo_grad_lambda_anchor = shared_lam
+        args.spo_plus_lambda_anchor = shared_lam
+    if getattr(args, "theta_anchor_mode", None) is not None:
+        shared_anchor = str(getattr(args, "theta_anchor_mode")).lower().strip()
+        args.flex_theta_anchor_mode = shared_anchor
+        # IPO-GRAD supports 'ipo'/'zero'; keep 'none' as an alias for 'zero'.
+        args.ipo_grad_theta_anchor_mode = shared_anchor if shared_anchor != "none" else "zero"
+        # SPO+ supports ipo/zero; keep 'none' as alias for 'zero'.
+        args.spo_plus_theta_anchor_mode = shared_anchor if shared_anchor != "none" else "zero"
+
     model_train_windows = parse_model_train_window_spec(getattr(args, "model_train_window", ""))
     benchmark_specs = parse_commalist(getattr(args, "benchmarks", ""))
     if not benchmark_specs:
@@ -1137,6 +1191,7 @@ def main() -> None:
         lambda_theta_iso=args.flex_lambda_theta_iso,
         theta_anchor_mode=args.flex_theta_anchor_mode,
         theta_init_mode=args.flex_theta_init_mode,
+        w_warmstart=bool(getattr(args, "w_warmstart", True)),
     )
 
     model_list = [m.strip().lower() for m in args.models.split(",") if m.strip()]
@@ -1152,6 +1207,8 @@ def main() -> None:
         "spo_plus_lr": getattr(args, "spo_plus_lr", 1e-3),
         "spo_plus_batch_size": getattr(args, "spo_plus_batch_size", 0),
         "spo_plus_lambda_reg": getattr(args, "spo_plus_lambda_reg", 0.0),
+        "spo_plus_lambda_anchor": getattr(args, "spo_plus_lambda_anchor", 0.0),
+        "spo_plus_theta_anchor_mode": getattr(args, "spo_plus_theta_anchor_mode", "ipo"),
         "spo_plus_risk_constraint": getattr(args, "spo_plus_risk_constraint", True),
         "spo_plus_risk_mult": getattr(args, "spo_plus_risk_mult", 2.0),
         "spo_plus_init_mode": getattr(args, "spo_plus_init_mode", "ipo"),
@@ -1760,12 +1817,9 @@ python -m dfl_portfolio.experiments.real_data_run \
   --models "ols,ipo,ipo_grad,spo_plus,flex" \
   --flex-solver knitro \
   --flex-formulation 'dual,kkt,dual&kkt' \
-  --flex-lambda-theta-anchor 0.0 \
-  --flex-theta-anchor-mode ipo \
-  --ipo-grad-lambda-anchor 0.0 \
-  --ipo-grad-theta-anchor-mode ipo \
-  --flex-theta-init-mode none \
-  --ipo-grad-init-mode none \
+  --lambda-theta-anchor 0.0 \
+  --theta-anchor-mode ipo \
+  --theta-init-mode none \
   --ipo-grad-seed 0 \
   --benchmarks "spy,1/n,tsmom_spy" \
   --trading-cost-bps 1 \
@@ -1807,15 +1861,19 @@ CLI options (defaults follow the parser definitions)
 - `--flex-solver` (str, default `knitro`).
 - `--flex-formulation` (str, default `dual,kkt,dual&kkt`): Flex の定式化。
 - `--flex-ensemble-weight-dual` (float ∈ [0,1], default `0.5`): dual/kkt ensemble の重み。
+- `--theta-init-mode` (str, default `None`): flex/IPO-GRAD 共通の θ 初期化（指定時のみ適用、個別フラグを上書き）。
+- `--lambda-theta-anchor` (float, default `None`): flex/IPO-GRAD 共通の θ アンカー強度（指定時のみ適用、個別フラグを上書き）。
+- `--theta-anchor-mode` (str, default `None`): flex/IPO-GRAD 共通の θ アンカー基準（`ipo|zero|none`、指定時のみ適用、個別フラグを上書き）。
+- `--w-warmstart` / `--no-w-warmstart` (bool, default `False`): w の warm-start 有効/無効（現在は flex の初期 w に適用）。
 - `--flex-lambda-theta-anchor` / `--flex-lambda-theta-iso` (float, default `0.0` / `0.0`): θ 罰則。
 - `--flex-theta-anchor-mode` (str, default `ipo`), `--flex-theta-init-mode` (str, default `none`): θ アンカー / 初期化モード。
 - `--flex-lambda-phi-anchor` (float, default `0.0`): V-learning の φ アンカー罰則。
 
 IPO-GRAD（IPO-NN）設定
-- `--ipo-grad-epochs` (int, default `500`): IPO-GRAD の学習エポック数。
+- `--ipo-grad-epochs` (int, default `250`): IPO-GRAD の学習エポック数。
 - `--ipo-grad-lr` (float, default `1e-3`): IPO-GRAD の学習率（Adam）。
 - `--ipo-grad-batch-size` (int, default `0`): IPO-GRAD のバッチサイズ（0 の場合はフルバッチ）。
-- `--ipo-grad-qp-max-iter` (int, default `5000`): IPO-GRAD 内部の QP ソルバの最大反復回数。
+- `--ipo-grad-qp-max-iter` (int, default `1500`): IPO-GRAD 内部の QP ソルバの最大反復回数。
 - `--ipo-grad-qp-tol` (float, default `1e-6`): IPO-GRAD 内部の QP ソルバの収束許容誤差。
 - `--ipo-grad-init-mode` (str, default `none`): `ipo` なら解析解ウォームスタート、`none` ならゼロ初期化。
 - `--ipo-grad-lambda-anchor` (float, default `0.0`): θ に対する L2 アンカー強度（0 で無効）。
@@ -1824,13 +1882,15 @@ IPO-GRAD（IPO-NN）設定
 - `--ipo-grad-seed` (int, default `None` → `--base-seed`): IPO-GRAD 用の seed 上書き（指定時のみ IPO-GRAD のみ別 seed 系列にする）。
 
 SPO+ 設定
-- `--spo-plus-epochs` (int, default `500`): SPO+ の学習エポック数。
+- `--spo-plus-epochs` (int, default `250`): SPO+ の学習エポック数。
 - `--spo-plus-lr` (float, default `1e-3`): SPO+ の学習率（Adam）。
 - `--spo-plus-batch-size` (int, default `0`): SPO+ のバッチサイズ（0 の場合はフルバッチ）。
 - `--spo-plus-lambda-reg` (float, default `0.0`): SPO+ の L2 正則化係数（θ）。
+- `--spo-plus-lambda-anchor` (float, default `0.0`): SPO+ の θ アンカー強度（L2、0で無効）。
+- `--spo-plus-theta-anchor-mode` (str, default `ipo`): SPO+ のアンカー基準（`ipo|zero|none`）。
 - `--spo-plus-risk-mult` (float, default `2.0`): リスク制約の強さ（κ = mult × min-var risk）。
 - `--spo-plus-risk-constraint` / `--spo-plus-no-risk-constraint`: リスク制約の有効/無効（デフォルト有効）。
-- `--spo-plus-init-mode` (str, default `ipo`): SPO+ の初期化モード（`zero|ipo`）。
+- `--spo-plus-init-mode` (str, default `ipo`): SPO+ の初期化モード（`zero|ipo|none`、`none` は `zero` 扱い）。
 
 取引コスト
 - `--trading-cost-bps` (float, default `1.0`): 正の値を指定すると、内蔵のティッカー別コスト表（bps）を有効化。

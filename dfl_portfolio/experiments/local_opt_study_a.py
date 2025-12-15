@@ -451,6 +451,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--outdir", type=Path, default=None)
 
+    p.add_argument(
+        "--w-warmstart",
+        "--w-warm-start",
+        dest="w_warmstart",
+        action="store_true",
+        default=False,
+        help="Enable warm-start for decision variables w when available (default: disabled).",
+    )
+    p.add_argument(
+        "--no-w-warmstart",
+        "--no-w-warm-start",
+        dest="w_warmstart",
+        action="store_false",
+        help="Disable warm-start for decision variables w (flex warm-start init). This is the default.",
+    )
+
     # Flex solver
     p.add_argument("--flex-solver", type=str, default="knitro")
     p.add_argument("--flex-maxtime", type=float, default=180.0)
@@ -468,10 +484,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # IPO-GRAD
-    p.add_argument("--ipo-grad-epochs", type=int, default=500)
+    p.add_argument("--ipo-grad-epochs", type=int, default=250)
     p.add_argument("--ipo-grad-lr", type=float, default=1e-3)
     p.add_argument("--ipo-grad-batch-size", type=int, default=32)
-    p.add_argument("--ipo-grad-qp-max-iter", type=int, default=5000)
+    p.add_argument("--ipo-grad-qp-max-iter", type=int, default=1500)
     p.add_argument("--ipo-grad-qp-tol", type=float, default=1e-6)
     p.add_argument("--tee", action="store_true")
     p.add_argument("--debug-roll", action="store_true", default=False)
@@ -549,6 +565,7 @@ def main() -> None:
         "theta_anchor_mode": str(base_cfg["flex_theta_anchor_mode"]),
         "lambda_theta_anchor": float(base_cfg["flex_lambda_theta_anchor"]),
         "lambda_theta_iso": float(base_cfg["flex_lambda_theta_iso"]),
+        "w_warmstart": bool(getattr(args, "w_warmstart", True)),
         "aux_init_mode": "random",
         "aux_init_sigma_w": float(args.flex_aux_init_sigma_w),
         "aux_init_sigma_lam": float(args.flex_aux_init_sigma_lam),

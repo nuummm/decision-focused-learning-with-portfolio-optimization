@@ -737,6 +737,7 @@ def main() -> None:
         lambda_theta_anchor=float(base_mode_cfg["flex_lambda_theta_anchor"]),
         lambda_theta_iso=float(base_mode_cfg["flex_lambda_theta_iso"]),
         theta_anchor_mode=str(base_mode_cfg["flex_theta_anchor_mode"]),
+        w_warmstart=bool(getattr(args, "w_warmstart", True)),
         # Keep auxiliary init deterministic in study B.
         aux_init_mode="none",
     )

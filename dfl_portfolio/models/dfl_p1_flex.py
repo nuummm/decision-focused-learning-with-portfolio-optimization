@@ -104,6 +104,7 @@ def fit_dfl_p1_flex(
     formulation: str = "dual",   # "dual" or "kkt"
     delta: float = 1.0,
     theta_init: Optional[Sequence[float]] = None,
+    w_warmstart: bool = True,
     # A-study: randomize auxiliary initial values while keeping theta fixed
     aux_init_mode: str = "none",  # "none" or "random"
     aux_init_seed: Optional[int] = None,
@@ -132,6 +133,9 @@ def fit_dfl_p1_flex(
         リスク回避パラメータ (MVO の δ)
     theta_init : array-like or None
         θ の初期値 (OLS 解など)。None の場合は 0 初期化。
+    w_warmstart : bool
+        True のとき、θ 初期値から計算した w_init_mat（系列 MVO 解）を
+        w の初期値（warm-start）として使う。False のときは常に一様初期化。
     solver, solver_options, tee :
         Pyomo のソルバー指定。既存の make_pyomo_solver に委譲。
 
@@ -290,7 +294,8 @@ def fit_dfl_p1_flex(
         return w / s
 
     w_init_mat: Optional[np.ndarray] = None
-    if theta_init_vec is not None:
+    w_warmstart = bool(w_warmstart)
+    if w_warmstart:
         try:
             yhat_all = predict_yhat(X, theta_init_vec)
             w_init_candidate = solve_series_mvo_gurobi(
@@ -439,6 +444,8 @@ def fit_dfl_p1_flex(
         meta["objective_value"] = None
     meta["aux_init_mode"] = str(aux_mode)
     meta["aux_init_keep"] = bool(aux_init_keep)
+    meta["w_warmstart"] = bool(w_warmstart)
+    meta["w_init_mat_available"] = bool(w_init_mat is not None)
     if bool(aux_init_keep):
         meta["aux_w_base_source"] = str(aux_w_base_source)
         if aux_w0_minus_base_l1:

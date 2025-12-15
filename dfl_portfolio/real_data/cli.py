@@ -156,6 +156,62 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--models", type=str, default="ols,ipo,ipo_grad,spo_plus,flex")
+
+    # Shared theta controls (apply to both flex and IPO-GRAD when provided).
+    # These options override the model-specific flags below.
+    parser.add_argument(
+        "--theta-init-mode",
+        type=str,
+        default=None,
+        choices=["none", "ipo"],
+        help=(
+            "Shared theta initialization mode applied to both flex and IPO-GRAD when set. "
+            "Overrides --flex-theta-init-mode and --ipo-grad-init-mode."
+        ),
+    )
+    parser.add_argument(
+        "--lambda-theta-anchor",
+        type=float,
+        default=None,
+        help=(
+            "Shared L2 anchor strength on theta applied to both flex and IPO-GRAD when set. "
+            "Overrides --flex-lambda-theta-anchor and --ipo-grad-lambda-anchor."
+        ),
+    )
+    parser.add_argument(
+        "--theta-anchor-mode",
+        type=str,
+        default=None,
+        choices=["ipo", "zero", "none"],
+        help=(
+            "Shared anchor reference for theta. 'ipo' uses IPO closed-form, 'zero' anchors to the zero vector. "
+            "Applied to both flex and IPO-GRAD when set. Overrides --flex-theta-anchor-mode and "
+            "--ipo-grad-theta-anchor-mode."
+        ),
+    )
+
+    parser.add_argument(
+        "--w-warmstart",
+        "--w-warm-start",
+        dest="w_warmstart",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable warm-start for decision variables w when available (default: disabled). "
+            "Currently affects flex warm-start initialization."
+        ),
+    )
+    parser.add_argument(
+        "--no-w-warmstart",
+        "--no-w-warm-start",
+        dest="w_warmstart",
+        action="store_false",
+        help=(
+            "Disable warm-start for decision variables w, even when theta is warm-started "
+            "(e.g., IPO init). This is the default."
+        ),
+    )
+
     parser.add_argument("--flex-solver", type=str, default="knitro")
     parser.add_argument(
         "--flex-formulation",
@@ -208,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ipo-grad-epochs",
         type=int,
-        default=500,
+        default=250,
         help="Number of training epochs for IPO-GRAD (IPO neural network).",
     )
     parser.add_argument(
@@ -226,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ipo-grad-qp-max-iter",
         type=int,
-        default=5000,
+        default=1500,
         help="Maximum number of iterations in the QP solver inside IPO-GRAD.",
     )
     parser.add_argument(
@@ -252,7 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ipo-grad-theta-anchor-mode",
         type=str,
         default="ipo",
-        choices=["ipo", "zero"],
+        choices=["ipo", "zero", "none"],
         help="Theta anchor for IPO-GRAD: ipo=use IPO closed-form, zero=use zero vector.",
     )
     parser.add_argument(
@@ -275,7 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--spo-plus-epochs",
         type=int,
-        default=500,
+        default=250,
         help="Number of training epochs for SPO+.",
     )
     parser.add_argument(
@@ -295,6 +351,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="L2 regularization strength on theta for SPO+.",
+    )
+    parser.add_argument(
+        "--spo-plus-lambda-anchor",
+        type=float,
+        default=0.0,
+        help="L2 anchor strength on theta for SPO+ (0 to disable).",
+    )
+    parser.add_argument(
+        "--spo-plus-theta-anchor-mode",
+        type=str,
+        default="ipo",
+        choices=["ipo", "zero", "none"],
+        help="Theta anchor reference for SPO+: ipo=IPO closed-form, zero/none=zero vector.",
     )
     parser.add_argument(
         "--spo-plus-risk-mult",
@@ -334,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--spo-plus-init-mode",
         type=str,
         default="ipo",
-        choices=["zero", "ipo"],
+        choices=["zero", "ipo", "none"],
         help="Initial theta for SPO+ (zero or IPO closed-form).",
     )
     parser.add_argument(

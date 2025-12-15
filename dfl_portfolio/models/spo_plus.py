@@ -147,6 +147,8 @@ def fit_spo_plus(
     lr: float = 1e-3,
     batch_size: int = 0,
     lambda_reg: float = 0.0,
+    lambda_anchor: float = 0.0,
+    theta_anchor: Optional[np.ndarray] = None,
     risk_constraint: bool = True,
     risk_mult: float = 2.0,
     psd_eps: float = 1e-9,
@@ -229,6 +231,13 @@ def fit_spo_plus(
     else:
         theta0 = torch.zeros(d, device=device, dtype=torch.float32)
     theta = torch.nn.Parameter(theta0)
+
+    theta_anchor_vec: Optional[np.ndarray] = None
+    if theta_anchor is not None:
+        theta_anchor_vec = np.asarray(theta_anchor, dtype=float).reshape(-1)
+    if theta_anchor_vec is None or theta_anchor_vec.shape[0] != d or not np.all(np.isfinite(theta_anchor_vec)):
+        theta_anchor_vec = np.zeros(d, dtype=float)
+    theta_anchor_t = torch.from_numpy(theta_anchor_vec).to(device=device, dtype=torch.float32)
     opt = torch.optim.Adam([theta], lr=float(lr))
 
     n_train = x_t.shape[0]
@@ -304,6 +313,8 @@ def fit_spo_plus(
             loss = loss_samples.mean()
             if float(lambda_reg) > 0:
                 loss = loss + float(lambda_reg) * (theta ** 2).sum()
+            if float(lambda_anchor) > 0:
+                loss = loss + float(lambda_anchor) * torch.sum((theta - theta_anchor_t) ** 2)
 
             loss.backward()
             opt.step()
@@ -341,6 +352,7 @@ def fit_spo_plus(
         "lr": float(lr),
         "batch_size": int(batch_size),
         "lambda_reg": float(lambda_reg),
+        "lambda_anchor": float(lambda_anchor),
         "risk_constraint": bool(risk_constraint),
         "risk_mult": float(risk_mult),
         "kappa": float(kappa) if np.isfinite(kappa) else None,

@@ -241,10 +241,13 @@ def _wrap_spo_plus(spec: SolverSpec) -> TrainerFn:
         lr = float(kw.pop("spo_plus_lr", 1e-3))
         batch_size = int(kw.pop("spo_plus_batch_size", 0))
         lambda_reg = float(kw.pop("spo_plus_lambda_reg", 0.0))
+        lambda_anchor = float(kw.pop("spo_plus_lambda_anchor", 0.0))
+        theta_anchor = kw.pop("spo_plus_theta_anchor", None)
         risk_constraint = bool(kw.pop("spo_plus_risk_constraint", True))
         risk_mult = float(kw.pop("spo_plus_risk_mult", 2.0))
         psd_eps = float(kw.pop("spo_plus_psd_eps", 1e-9))
         kw.pop("spo_plus_init_mode", None)  # consumed upstream; ignore if present
+        kw.pop("spo_plus_theta_anchor_mode", None)  # consumed upstream; ignore if present
         ret = fit_spo_plus(
             X,
             Y,
@@ -257,6 +260,8 @@ def _wrap_spo_plus(spec: SolverSpec) -> TrainerFn:
             lr=lr,
             batch_size=batch_size,
             lambda_reg=lambda_reg,
+            lambda_anchor=lambda_anchor,
+            theta_anchor=theta_anchor,
             risk_constraint=risk_constraint,
             risk_mult=risk_mult,
             psd_eps=psd_eps,
