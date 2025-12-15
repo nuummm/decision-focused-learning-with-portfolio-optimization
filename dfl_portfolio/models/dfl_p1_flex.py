@@ -289,30 +289,6 @@ def fit_dfl_p1_flex(
             return np.ones(n, dtype=float) / float(n)
         return w / s
 
-    # Randomize auxiliary starting values (A-study) while keeping theta fixed.
-    aux_mode = (aux_init_mode or "none").lower().strip()
-    if aux_mode not in {"none", "random"}:
-        raise ValueError("aux_init_mode must be 'none' or 'random'")
-    aux_randomized = aux_mode == "random" and aux_init_seed is not None
-    if aux_randomized:
-        rng = np.random.default_rng(int(aux_init_seed))
-        sigma_w = float(aux_init_sigma_w)
-        sigma_lam = float(aux_init_sigma_lam)
-        sigma_mu = float(aux_init_sigma_mu)
-        w_base = np.ones(d, dtype=float) / float(d)
-        for t in m.T:
-            noise_w = rng.normal(0.0, sigma_w, size=d)
-            w0 = _project_simplex(w_base + noise_w)
-            for j in m.J:
-                m.w[t, j].value = float(w0[int(j)])
-            lam0 = np.abs(rng.normal(0.0, sigma_lam, size=d))
-            for j in m.J:
-                m.lam[t, j].value = float(lam0[int(j)])
-            m.mu[t].value = float(rng.normal(0.0, sigma_mu))
-    else:
-        for j in m.J:
-            m.theta[j].value = 0.0
-
     w_init_mat: Optional[np.ndarray] = None
     if theta_init_vec is not None:
         try:
@@ -329,6 +305,57 @@ def fit_dfl_p1_flex(
                 w_init_mat = w_init_candidate
         except Exception:
             w_init_mat = None
+
+    # Randomize auxiliary starting values (A-study) while keeping theta fixed.
+    aux_mode = (aux_init_mode or "none").lower().strip()
+    if aux_mode not in {"none", "random"}:
+        raise ValueError("aux_init_mode must be 'none' or 'random'")
+    aux_randomized = aux_mode == "random" and aux_init_seed is not None
+    # Loggable diagnostics for Experiment A (aux_init_keep=True)
+    aux_w0_minus_base_l1: List[float] = []
+    aux_w0_minus_base_l2: List[float] = []
+    aux_w_base_source = "uniform"
+    if aux_randomized:
+        rng = np.random.default_rng(int(aux_init_seed))
+        sigma_w = float(aux_init_sigma_w)
+        sigma_lam = float(aux_init_sigma_lam)
+        sigma_mu = float(aux_init_sigma_mu)
+
+        # Experiment A: keep theta fixed and perturb ONLY w around a warm-start base.
+        # - base: w_init_mat[t] if available, else uniform 1/d
+        # - perturb: w_tilde = w_base + N(0, sigma_w^2 I)
+        # - project: simplex projection
+        # - duals: lam/mu fixed to 0 (avoid "dual init lottery")
+        if bool(aux_init_keep):
+            aux_w_base_source = "w_init_mat" if w_init_mat is not None else "uniform"
+            for t in m.T:
+                if w_init_mat is not None:
+                    w_base = np.asarray(w_init_mat[int(t), :], dtype=float).reshape(-1)
+                else:
+                    w_base = np.ones(d, dtype=float) / float(d)
+                noise_w = rng.normal(0.0, sigma_w, size=d)
+                w0 = _project_simplex(w_base + noise_w)
+                aux_w0_minus_base_l1.append(float(np.sum(np.abs(w0 - w_base))))
+                aux_w0_minus_base_l2.append(float(np.linalg.norm(w0 - w_base)))
+                for j in m.J:
+                    m.w[t, j].value = float(w0[int(j)])
+                    m.lam[t, j].value = 0.0
+                m.mu[t].value = 0.0
+        else:
+            # Generic random init (kept for backward compatibility)
+            w_base = np.ones(d, dtype=float) / float(d)
+            for t in m.T:
+                noise_w = rng.normal(0.0, sigma_w, size=d)
+                w0 = _project_simplex(w_base + noise_w)
+                for j in m.J:
+                    m.w[t, j].value = float(w0[int(j)])
+                lam0 = np.abs(rng.normal(0.0, sigma_lam, size=d))
+                for j in m.J:
+                    m.lam[t, j].value = float(lam0[int(j)])
+                m.mu[t].value = float(rng.normal(0.0, sigma_mu))
+    # NOTE:
+    # aux_init_mode は補助変数 (w/lam/mu) の初期化だけに影響させる。
+    # θ の初期値は theta_init (あるいはゼロ初期化) を必ず尊重する。
 
     # Note: Experiment A wants to preserve randomized auxiliary initial values to probe local optima.
     # Keep default behavior (warm-start w; zero lam/mu) unless explicitly requested.
@@ -410,6 +437,22 @@ def fit_dfl_p1_flex(
         meta["objective_value"] = float(pyo.value(m.obj))
     except Exception:
         meta["objective_value"] = None
+    meta["aux_init_mode"] = str(aux_mode)
+    meta["aux_init_keep"] = bool(aux_init_keep)
+    if bool(aux_init_keep):
+        meta["aux_w_base_source"] = str(aux_w_base_source)
+        if aux_w0_minus_base_l1:
+            meta["aux_w0_minus_base_l1_mean"] = float(np.mean(aux_w0_minus_base_l1))
+            meta["aux_w0_minus_base_l1_std"] = float(np.std(aux_w0_minus_base_l1, ddof=1)) if len(aux_w0_minus_base_l1) > 1 else 0.0
+        else:
+            meta["aux_w0_minus_base_l1_mean"] = float("nan")
+            meta["aux_w0_minus_base_l1_std"] = float("nan")
+        if aux_w0_minus_base_l2:
+            meta["aux_w0_minus_base_l2_mean"] = float(np.mean(aux_w0_minus_base_l2))
+            meta["aux_w0_minus_base_l2_std"] = float(np.std(aux_w0_minus_base_l2, ddof=1)) if len(aux_w0_minus_base_l2) > 1 else 0.0
+        else:
+            meta["aux_w0_minus_base_l2_mean"] = float("nan")
+            meta["aux_w0_minus_base_l2_std"] = float("nan")
 
     theta_hat = np.array([pyo.value(m.theta[j]) for j in m.J], dtype=float)
     W = np.array([[pyo.value(m.w[t, j]) for j in m.J] for t in m.T], dtype=float)

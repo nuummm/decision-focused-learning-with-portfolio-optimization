@@ -95,6 +95,53 @@ def _summary_stats(values: Sequence[float]) -> Dict[str, float]:
     return {"mean": float(np.mean(arr)), "std": float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0, "n": int(arr.size)}
 
 
+def _resolve_a_base_mode(value: str) -> Dict[str, Any]:
+    """
+    Map --a-base-mode to a consistent set of initialization + penalty settings.
+
+    Modes:
+      - none:      theta_init=none, theta penalties=0
+      - init-ipo:  theta_init=ipo,  theta penalties=0
+      - pen-10:    theta_init=none, lambda_theta_anchor=10 with anchor=ipo
+    """
+    mode = (value or "").strip().lower().replace("_", "-")
+    if mode not in {"none", "init-ipo", "pen-10"}:
+        raise ValueError("--a-base-mode must be one of: none, init-ipo, pen-10")
+    if mode == "none":
+        return {
+            "a_base_mode": "none",
+            "theta_init_mode": "none",
+            "flex_lambda_theta_anchor": 0.0,
+            "flex_lambda_theta_iso": 0.0,
+            "flex_theta_anchor_mode": "none",
+            "ipo_grad_init_mode": "none",
+            "ipo_grad_lambda_anchor": 0.0,
+            "ipo_grad_theta_anchor_mode": "ipo",
+        }
+    if mode == "init-ipo":
+        return {
+            "a_base_mode": "init-ipo",
+            "theta_init_mode": "ipo",
+            "flex_lambda_theta_anchor": 0.0,
+            "flex_lambda_theta_iso": 0.0,
+            "flex_theta_anchor_mode": "none",
+            "ipo_grad_init_mode": "ipo",
+            "ipo_grad_lambda_anchor": 0.0,
+            "ipo_grad_theta_anchor_mode": "ipo",
+        }
+    # pen-10
+    return {
+        "a_base_mode": "pen-10",
+        "theta_init_mode": "none",
+        "flex_lambda_theta_anchor": 10.0,
+        "flex_lambda_theta_iso": 0.0,
+        "flex_theta_anchor_mode": "ipo",
+        "ipo_grad_init_mode": "none",
+        "ipo_grad_lambda_anchor": 10.0,
+        "ipo_grad_theta_anchor_mode": "ipo",
+    }
+
+
 def _plot_cumret_overlay(curves: Dict[int, pd.DataFrame], out_path: Path, title: str) -> None:
     if not curves:
         return
@@ -411,6 +458,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flex-aux-init-sigma-lam", type=float, default=1e-2)
     p.add_argument("--flex-aux-init-sigma-mu", type=float, default=1e-2)
 
+    # A-base preset (theta init + theta penalty)
+    p.add_argument(
+        "--a-base-mode",
+        type=str,
+        default="init-ipo",
+        choices=["none", "init-ipo", "pen-10"],
+        help="Base preset: none (no init, no theta penalty), init-ipo (IPO init only), pen-10 (anchor penalty=10 with IPO anchor, init none).",
+    )
+
     # IPO-GRAD
     p.add_argument("--ipo-grad-epochs", type=int, default=500)
     p.add_argument("--ipo-grad-lr", type=float, default=1e-3)
@@ -482,12 +538,17 @@ def main() -> None:
     flex_solver_spec = SolverSpec(name=args.flex_solver, options=knitro_opts, tee=bool(args.tee))
     analytic_spec = SolverSpec(name="analytic", tee=bool(args.tee))
 
+    base_cfg = _resolve_a_base_mode(getattr(args, "a_base_mode", "init-ipo"))
+    if getattr(args, "tee", False):
+        print(f"[local-opt-A] a_base_mode={base_cfg['a_base_mode']}")
+
     # Options
     flex_base_options: Dict[str, Any] = {
-        "theta_init_mode": "ipo",  # keep theta fixed across seeds
-        "theta_anchor_mode": "ipo",
-        "lambda_theta_anchor": 0.0,
-        "lambda_theta_iso": 0.0,
+        # keep theta fixed across seeds; controlled by --a-base-mode
+        "theta_init_mode": str(base_cfg["theta_init_mode"]),
+        "theta_anchor_mode": str(base_cfg["flex_theta_anchor_mode"]),
+        "lambda_theta_anchor": float(base_cfg["flex_lambda_theta_anchor"]),
+        "lambda_theta_iso": float(base_cfg["flex_lambda_theta_iso"]),
         "aux_init_mode": "random",
         "aux_init_sigma_w": float(args.flex_aux_init_sigma_w),
         "aux_init_sigma_lam": float(args.flex_aux_init_sigma_lam),
@@ -502,6 +563,9 @@ def main() -> None:
         "ipo_grad_batch_size": int(args.ipo_grad_batch_size),
         "ipo_grad_qp_max_iter": int(args.ipo_grad_qp_max_iter),
         "ipo_grad_qp_tol": float(args.ipo_grad_qp_tol),
+        "ipo_grad_init_mode": str(base_cfg["ipo_grad_init_mode"]),
+        "ipo_grad_lambda_anchor": float(base_cfg["ipo_grad_lambda_anchor"]),
+        "ipo_grad_theta_anchor_mode": str(base_cfg["ipo_grad_theta_anchor_mode"]),
     }
 
     # Aggregate outputs
@@ -672,5 +736,6 @@ if __name__ == "__main__":  # pragma: no cover
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.local_opt_study_a \
+  --a-base-mode "init-ipo" \
   --seeds "0,1,2,3,4,5,6,7,8,9" \
 """

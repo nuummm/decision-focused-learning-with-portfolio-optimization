@@ -136,7 +136,7 @@ def prepare_flex_training_args(
     delta: float,
     tee: bool,
     flex_options: Dict[str, Any],
-) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+) -> Tuple[Optional[np.ndarray], Dict[str, Any], Dict[str, Any]]:
     """flex モデル共通の θ 初期値・アンカー準備ロジック。"""
     from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form  # 局所 import
 
@@ -205,6 +205,17 @@ def prepare_flex_training_args(
         raise ValueError(f"Unsupported theta source '{mode}' for {context}")
 
     theta_init = None
+    theta_init_meta: Dict[str, Any] = {
+        "theta_init_mode": str(theta_init_mode),
+        "theta_init_seed": int(theta_init_seed) if theta_init_seed is not None else None,
+        "theta_init_sigma": float(theta_init_sigma),
+        "theta_init_clip": float(theta_init_clip),
+        "theta_init_base_mode": str(theta_init_base_mode),
+        # Will be populated below where applicable
+        "theta_init_eta_l2": float("nan"),
+        "theta_init_l2": float("nan"),
+        "theta_base_l2": float("nan"),
+    }
     if theta_init_mode in {"rand_zero", "randn_zero", "random_zero"}:
         rng = np.random.default_rng(int(theta_init_seed) if theta_init_seed is not None else None)
         d = int(X_train.shape[1])
@@ -213,6 +224,8 @@ def prepare_flex_training_args(
         if theta_init_clip > 0.0:
             theta = np.clip(theta, -theta_init_clip, theta_init_clip)
         theta_init = np.asarray(theta, dtype=float)
+        theta_init_meta["theta_init_eta_l2"] = float(np.linalg.norm(theta_init))
+        theta_init_meta["theta_init_l2"] = float(np.linalg.norm(theta_init))
     elif theta_init_mode in {"rand_local", "randn_local", "random_local"}:
         base_theta = ensure_theta_source(theta_init_base_mode, fallback_to_ols=True, context="theta_init_base")
         if base_theta is None:
@@ -227,8 +240,23 @@ def prepare_flex_training_args(
         if theta_init_clip > 0.0:
             theta = np.clip(theta, -theta_init_clip, theta_init_clip)
         theta_init = np.asarray(theta, dtype=float)
+        base_theta_vec = np.asarray(base_theta, dtype=float).reshape(-1)
+        theta_init_meta["theta_base_l2"] = float(np.linalg.norm(base_theta_vec))
+        theta_init_meta["theta_init_eta_l2"] = float(np.linalg.norm(theta_init - base_theta_vec))
+        theta_init_meta["theta_init_l2"] = float(np.linalg.norm(theta_init))
     elif theta_init_mode not in {"", "none"}:
         theta_init = ensure_theta_source(theta_init_mode, fallback_to_ols=True, context="theta_init")
+        # Deterministic init (ipo/ols) has no random perturbation by definition.
+        if theta_init is None:
+            theta_init_meta["theta_init_eta_l2"] = 0.0
+            theta_init_meta["theta_init_l2"] = float("nan")
+        else:
+            theta_init = np.asarray(theta_init, dtype=float).reshape(-1)
+            theta_init_meta["theta_init_eta_l2"] = 0.0
+            theta_init_meta["theta_init_l2"] = float(np.linalg.norm(theta_init))
+    else:
+        # "none" init: treated as deterministic zero init -> no perturbation.
+        theta_init_meta["theta_init_eta_l2"] = 0.0
 
     lam_theta_anchor = float(flex_kwargs.get("lambda_theta_anchor", 0.0) or 0.0)
     lam_theta_anchor_l1 = float(flex_kwargs.get("lambda_theta_anchor_l1", 0.0) or 0.0)
@@ -244,7 +272,7 @@ def prepare_flex_training_args(
     flex_kwargs["lambda_theta_anchor"] = lam_theta_anchor
     flex_kwargs["lambda_theta_anchor_l1"] = float(flex_kwargs.get("lambda_theta_anchor_l1", 0.0) or 0.0)
     flex_kwargs["lambda_theta_iso"] = float(flex_kwargs.get("lambda_theta_iso", 0.0) or 0.0)
-    return theta_init, flex_kwargs
+    return theta_init, flex_kwargs, theta_init_meta
 
 
 __all__ = [

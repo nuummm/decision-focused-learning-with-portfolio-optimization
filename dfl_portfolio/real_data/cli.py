@@ -264,6 +264,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--ipo-grad-seed",
+        type=int,
+        default=None,
+        help=(
+            "Override the base seed used to derive IPO-GRAD's per-cycle RNG seed. "
+            "When omitted, IPO-GRAD uses --base-seed like other models."
+        ),
+    )
+    parser.add_argument(
         "--spo-plus-epochs",
         type=int,
         default=500,

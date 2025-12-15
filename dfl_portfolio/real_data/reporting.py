@@ -434,6 +434,9 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     # R^2 は高精度確認用に 6 桁
     if "r2" in df.columns:
         df["r2"] = df["r2"].astype(float).round(6)
+    # RMSE も小さい値になりがちなので 6 桁
+    if "rmse" in df.columns:
+        df["rmse"] = df["rmse"].astype(float).round(6)
     # CVaR は「損失期待値」なので負の値のまま % 表示
     if "cvar_95" in df.columns:
         df["cvar_95"] = (df["cvar_95"].astype(float) * 100.0).round(2)
@@ -470,6 +473,7 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         "avg_trading_cost",
         # サブ指標
         "r2",
+        "rmse",
         # カウント系
         "n_retrain",
         "n_invest_steps",
@@ -1401,28 +1405,47 @@ def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
         fig.savefig(out_dir / "solver_warning_counts.png")
         plt.close(fig)
 
-    # Mean elapsed time bar chart
-    elapsed_vals = [float(elapsed_mean.get(m, np.nan)) for m in models]
-    if any(np.isfinite(elapsed_vals)):
-        fig, ax = plt.subplots(figsize=(6, 4))
-        x = np.arange(len(models))
+    # Elapsed time distribution (boxplot)
+    elapsed_data: List[np.ndarray] = []
+    for m in models:
+        sub = pd.to_numeric(df.loc[df["model_base"] == m, "elapsed_sec"], errors="coerce").dropna()
+        # For log-scale, remove non-positive values.
+        sub = sub[sub > 0.0]
+        if sub.empty:
+            elapsed_data.append(np.asarray([np.nan], dtype=float))
+        else:
+            elapsed_data.append(sub.to_numpy(dtype=float))
+    if any(arr.size for arr in elapsed_data):
+        fig, ax = plt.subplots(figsize=(7.2, 4.2))
         colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
-        bars = ax.bar(x, elapsed_vals, color=colors, alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels([display_names[m] for m in models], rotation=30, ha="right")
-        ax.set_ylabel("1サイクルあたり平均解計算時間 (秒)")
-        ax.set_title("ソルバー平均計算時間（flex / IPO-GRAD / SPO+）")
-        for xi, bar, val in zip(x, bars, elapsed_vals):
-            if np.isfinite(val):
-                ax.text(
-                    xi,
-                    bar.get_height() + 0.01,
-                    f"{val:.3f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
+        box = ax.boxplot(
+            elapsed_data,
+            tick_labels=[display_names[m] for m in models],
+            patch_artist=True,
+            showfliers=True,
+            widths=0.55,
+        )
+        for patch, c in zip(box.get("boxes", []), colors):
+            patch.set_facecolor(c)
+            patch.set_alpha(0.75)
+        for whisker in box.get("whiskers", []):
+            whisker.set_color("#444444")
+        for cap in box.get("caps", []):
+            cap.set_color("#444444")
+        for median in box.get("medians", []):
+            median.set_color("#111111")
+            median.set_linewidth(1.6)
+        for flier in box.get("fliers", []):
+            flier.set_markeredgecolor("#666666")
+            flier.set_alpha(0.6)
+
+        ax.set_yscale("log")
+        ax.set_ylabel("1サイクルあたり解計算時間 (秒) [log]")
+        ax.set_title("ソルバー計算時間の分布（flex / IPO-GRAD / SPO+）")
+        ax.grid(axis="y", alpha=0.2)
+        plt.setp(ax.get_xticklabels(), rotation=25, ha="right")
         fig.tight_layout()
+        # Keep filename for backwards compatibility.
         fig.savefig(out_dir / "solver_elapsed_mean.png")
         plt.close(fig)
 
@@ -1826,6 +1849,30 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
             keep_cols.append(f"{k}_sig_1pct")
         keep_cols = [c for c in keep_cols if c in out_df.columns]
         out_df = out_df[keep_cols]
+
+        # 列名を日本語にして、CSV 単体でも解釈しやすくする
+        metric_name_ja = {
+            "mean": "平均",
+            "std": "標準偏差",
+            "sharpe": "シャープ",
+            "sortino": "ソルティノ",
+            "final_wealth": "最終資産",
+        }
+        rename_map: Dict[str, str] = {
+            "model_dfl": "DFLモデル",
+            "model_other": "比較モデル",
+            "n_obs": "観測数",
+        }
+        for k in metrics:
+            ja = metric_name_ja.get(k, k)
+            col_5 = f"{k}_sig_5pct"
+            col_1 = f"{k}_sig_1pct"
+            if col_5 in out_df.columns:
+                rename_map[col_5] = f"{ja} 有意差(5%)"
+            if col_1 in out_df.columns:
+                rename_map[col_1] = f"{ja} 有意差(1%)"
+        out_df = out_df.rename(columns=rename_map)
+
         out_df.to_csv(
             Path(analysis_csv_dir) / "3-performance_significance_dfl_summary.csv",
             index=False,
@@ -1959,7 +2006,6 @@ def run_mse_and_bias_analysis(
     # MSE by model
     df["err2"] = (df["pred_ret"] - df["real_ret"]) ** 2
     mse_df = df.groupby("model")["err2"].mean().to_frame("mse")
-
     # Sharpe from 1-summary.csv
     summary_path = Path(analysis_csv_dir) / "1-summary.csv"
     if not summary_path.exists():
@@ -1970,6 +2016,11 @@ def run_mse_and_bias_analysis(
     summary = summary.set_index("model")
     # left join にして、1/N など「MSE を持たない」ベンチマークも残す
     plot_df = summary.join(mse_df, how="left")
+    # RMSE: if not already present in 1-summary.csv, derive from MSE.
+    if "rmse" not in plot_df.columns and "mse" in plot_df.columns:
+        plot_df["rmse"] = pd.to_numeric(plot_df["mse"], errors="coerce").map(
+            lambda v: float(np.sqrt(v)) if np.isfinite(v) and v >= 0.0 else np.nan
+        )
     if plot_df.empty or plt is None:
         return
 
@@ -2102,21 +2153,21 @@ def run_mse_and_bias_analysis(
                 )
             )
         _resolve_label_overlaps(fig, ax, labels)
-        ax.set_xlabel("アウトオブサンプル $R^2$（資産別）")
+        ax.set_xlabel("アウトオブサンプル $R^2$（全観測: 資産×時点）")
         ax.set_ylabel("シャープレシオ（年率換算）")
         ax.set_title("予測精度と意思決定品質の関係")
         fig.tight_layout()
         fig.savefig(bias_fig_dir / "r2_vs_sharpe_scatter.png")
         plt.close(fig)
 
-        # MSE vs Sharpe scatter (asset_predictions 由来の MSE を使用)
+        # RMSE vs Sharpe scatter (asset_predictions 由来の MSE を sqrt して使用)
         fig, ax = plt.subplots(figsize=(7.2, 5.2))
         labels = []
         for model, row in plot_df.iterrows():
             mstr = str(model)
             if _should_skip_scatter(mstr):
                 continue
-            x = row.get("mse", np.nan)
+            x = row.get("rmse", np.nan)
             if not np.isfinite(x):
                 continue
             y = row.get("sharpe", np.nan)
@@ -2136,7 +2187,8 @@ def run_mse_and_bias_analysis(
                 )
             )
         _resolve_label_overlaps(fig, ax, labels)
-        ax.set_xlabel("アウトオブサンプル MSE（資産別）")
+        # NOTE: keep filename for backward compatibility, but the axis is RMSE.
+        ax.set_xlabel("アウトオブサンプル RMSE（全観測: 資産×時点）")
         ax.set_ylabel("シャープレシオ（年率換算）")
         ax.set_title("予測誤差と意思決定品質の関係")
         fig.tight_layout()
@@ -2206,8 +2258,10 @@ def run_mse_and_bias_analysis(
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
             plt.ylabel("バイアス = 予測リターン - 実現リターン")
             plt.title("Up/Down別の予測バイアス")
-            # 0 近傍の差分を見やすくするため、軸を固定して拡大表示
+            # 差分は正負を取り得るため symlog を使って対数スケール化（0 近傍は線形）
+            # 併せて表示範囲は固定して比較しやすくする。
             y_min, y_max = -0.1, 0.1
+            plt.yscale("symlog", linthresh=1e-2)
             plt.ylim(y_min, y_max)
             if data:
                 # 各箱の中央値（線）の値を表示（混み合う場合があるので小さめに）
@@ -2298,8 +2352,10 @@ def run_mse_and_bias_analysis(
             plt.axhline(0.0, linestyle="--", linewidth=1, color="black")
             plt.ylabel("バイアス = 予測リターン - 実現リターン")
             plt.title("IN/OUT（ウェイト大小別）の予測バイアス")
-            # 0 近傍の差分を見やすくするため、軸を固定して拡大表示
+            # 差分は正負を取り得るため symlog を使って対数スケール化（0 近傍は線形）
+            # 併せて表示範囲は固定して比較しやすくする。
             y_min, y_max = -0.1, 0.1
+            plt.yscale("symlog", linthresh=1e-2)
             plt.ylim(y_min, y_max)
             if data:
                 offset = (y_max - y_min) * 0.02
@@ -2466,35 +2522,45 @@ def export_dataframe_table_png(
     *,
     title: str = "",
     float_digits: int = 3,
+    float_digits_by_col: Optional[Dict[str, int]] = None,
     max_rows: int | None = None,
     max_cols: int | None = None,
     highlight_top_k: int = 0,
     lower_is_better_cols: Sequence[str] = (),
     exclude_highlight_cols: Sequence[str] = (),
+    highlight_truthy_cells: bool = False,
+    truthy_cell_color: str = "#b7f7c1",
 ) -> None:
     """Render a DataFrame as a PNG table for quick visual inspection."""
     if plt is None or df is None:
         return
     if df.empty:
         return
-    df_disp = df.copy()
+    # Important: reset index so that table row positions line up with numeric ranking indices
+    # (callers often filter rows without resetting the index).
+    df_disp = df.copy().reset_index(drop=True)
     if max_cols is not None and df_disp.shape[1] > max_cols:
         df_disp = df_disp.iloc[:, :max_cols]
     if max_rows is not None and df_disp.shape[0] > max_rows:
         df_disp = df_disp.iloc[:max_rows, :]
 
-    def _fmt(x: object) -> str:
+    digits_map = {str(k): int(v) for k, v in (float_digits_by_col or {}).items()}
+
+    def _fmt_cell(x: object, col: str) -> str:
+        use_digits = digits_map.get(str(col), int(float_digits))
         if x is None or (isinstance(x, float) and not np.isfinite(x)):
             return ""
         if isinstance(x, (np.floating, float)):
-            return f"{float(x):.{int(float_digits)}f}"
+            return f"{float(x):.{use_digits}f}"
         if isinstance(x, (np.integer, int)):
             return str(int(x))
         return str(x)
 
     # Keep numeric copy for highlighting before formatting to strings.
     df_num = df_disp.copy()
-    df_str = df_disp.applymap(_fmt)
+    df_str = df_disp.copy()
+    for col in df_str.columns:
+        df_str[col] = df_str[col].map(lambda v, c=col: _fmt_cell(v, c))
     n_rows, n_cols = df_str.shape
     # Heuristic sizing: aim for readable tables without excessive whitespace.
     fig_w = max(8.0, 1.1 * n_cols + 1.5)
@@ -2526,6 +2592,57 @@ def export_dataframe_table_png(
             cell.set_facecolor(zebra[(r - 1) % 2])
         cell.set_edgecolor("#d0d0d0")
         cell.set_linewidth(0.6)
+
+    # Optional highlighting: emphasize binary "True/1" cells (e.g., significance tables).
+    if bool(highlight_truthy_cells):
+        for col_i, col_name in enumerate(df_disp.columns):
+            series = df_disp[col_name]
+            values = series.dropna().to_numpy()
+            if values.size == 0:
+                continue
+
+            def _to_bin(v: object) -> Optional[int]:
+                if isinstance(v, (bool, np.bool_)):
+                    return 1 if bool(v) else 0
+                if isinstance(v, (np.integer, int)):
+                    return 1 if int(v) == 1 else 0
+                if isinstance(v, (np.floating, float)):
+                    if not np.isfinite(float(v)):
+                        return None
+                    return 1 if float(v) == 1.0 else 0 if float(v) == 0.0 else None
+                if isinstance(v, str):
+                    t = v.strip().lower()
+                    if t in {"true", "1"}:
+                        return 1
+                    if t in {"false", "0"}:
+                        return 0
+                return None
+
+            mapped: List[int] = []
+            for v in values.tolist():
+                b = _to_bin(v)
+                if b is None:
+                    mapped = []
+                    break
+                mapped.append(int(b))
+            if not mapped:
+                continue
+            uniq = set(mapped)
+            if not uniq.issubset({0, 1}) or (1 not in uniq):
+                continue
+
+            # Highlight the truthy cells.
+            for row_i, v in enumerate(series.tolist()):
+                b = _to_bin(v)
+                if b != 1:
+                    continue
+                r = int(row_i) + 1  # table row offset (0 is header)
+                c = int(col_i)
+                cell = table.get_celld().get((r, c))
+                if cell is None:
+                    continue
+                cell.set_facecolor(truthy_cell_color)
+                cell.set_text_props(weight="bold")
 
     # Optional highlighting: best-3 per column (direction-aware).
     if int(highlight_top_k) > 0:
@@ -2591,11 +2708,14 @@ def export_csv_table_png(
     *,
     title: str = "",
     float_digits: int = 3,
+    float_digits_by_col: Optional[Dict[str, int]] = None,
     max_rows: int | None = None,
     max_cols: int | None = None,
     highlight_top_k: int = 0,
     lower_is_better_cols: Sequence[str] = (),
     exclude_highlight_cols: Sequence[str] = (),
+    highlight_truthy_cells: bool = False,
+    truthy_cell_color: str = "#b7f7c1",
 ) -> None:
     try:
         df = pd.read_csv(csv_path)
@@ -2608,11 +2728,14 @@ def export_csv_table_png(
         out_path,
         title=title,
         float_digits=float_digits,
+        float_digits_by_col=float_digits_by_col,
         max_rows=max_rows,
         max_cols=max_cols,
         highlight_top_k=highlight_top_k,
         lower_is_better_cols=lower_is_better_cols,
         exclude_highlight_cols=exclude_highlight_cols,
+        highlight_truthy_cells=highlight_truthy_cells,
+        truthy_cell_color=truthy_cell_color,
     )
 
 
@@ -2630,7 +2753,19 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
         "3-performance_significance_dfl_summary.csv",
     ]
     # In these metrics, "smaller risk/cost is better".
-    lower_is_better = ["ann_volatility", "max_drawdown", "cvar_95", "avg_trading_cost"]
+    lower_is_better = [
+        # risk metrics
+        "ann_volatility",
+        "ann_volatility_net",
+        "max_drawdown",
+        "cvar_95",
+        # cost / trading intensity
+        "avg_turnover",
+        "avg_trading_cost",
+        # prediction loss
+        "mse",
+        "rmse",
+    ]
     for name in targets:
         src = analysis_csv_dir / name
         if not src.exists():
@@ -2641,15 +2776,53 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
             export_csv_table_png(src, dst, title=name, float_digits=6, max_rows=200, max_cols=40)
         else:
             highlight = 3 if name in {"1-summary.csv", "1-summary_cost.csv"} else 0
+            truthy = bool(name == "3-performance_significance_dfl_summary.csv")
+            # Default: 2 decimals. Some columns need higher precision.
+            digits_by_col = {
+                "r2": 6,
+                "rmse": 6,
+                "avg_trading_cost": 6,
+            }
+            # Hide columns that are not helpful for quick visual inspection.
+            drop_cols = {"n_retrain", "n_invest_steps", "trading_cost_bps"}
+            try:
+                df = pd.read_csv(src)
+            except Exception:
+                df = None
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                # For table PNGs, omit the ensemble row to keep figures compact.
+                if "model" in df.columns:
+                    df = df[df["model"].astype(str) != "DFL-QCQP-ens"]
+                if "model_dfl" in df.columns:
+                    df = df[df["model_dfl"].astype(str) != "DFL-QCQP-ens"]
+                if "DFLモデル" in df.columns:
+                    df = df[df["DFLモデル"].astype(str) != "DFL-QCQP-ens"]
+                keep = [c for c in df.columns if str(c) not in drop_cols]
+                df = df[keep]
+                export_dataframe_table_png(
+                    df,
+                    dst,
+                    title=name,
+                    float_digits=2,
+                    float_digits_by_col=digits_by_col,
+                    max_rows=200,
+                    max_cols=40,
+                    highlight_top_k=highlight,
+                    lower_is_better_cols=lower_is_better,
+                    highlight_truthy_cells=truthy,
+                )
+                continue
             export_csv_table_png(
                 src,
                 dst,
                 title=name,
-                float_digits=4,
+                float_digits=2,
+                float_digits_by_col=digits_by_col,
                 max_rows=200,
                 max_cols=40,
                 highlight_top_k=highlight,
                 lower_is_better_cols=lower_is_better,
+                highlight_truthy_cells=truthy,
             )
 
 

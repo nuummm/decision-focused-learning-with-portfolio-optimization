@@ -124,7 +124,7 @@ def train_model_window(
     )
     theta_init_override: Optional[np.ndarray] = None
     if model_key == "flex" and flex_options:
-        theta_init_override, resolved_flex = prepare_flex_training_args(
+        theta_init_override, resolved_flex, _ = prepare_flex_training_args(
             bundle, train_start, train_end, delta_for_training, tee, flex_options
         )
         base_kwargs.update(resolved_flex)

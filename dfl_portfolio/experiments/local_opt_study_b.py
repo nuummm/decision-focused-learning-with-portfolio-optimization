@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -161,6 +163,23 @@ def _get_plt():  # type: ignore
         return None
 
 
+def _quiet_gurobi() -> None:
+    """Best-effort suppression of Gurobi banner/log output for study scripts."""
+    try:  # pragma: no cover
+        with open(os.devnull, "w") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
+            import gurobipy as gp
+
+            # Suppress solver logs (works only if set before any Model/Env is created).
+            gp.setParam("OutputFlag", 0)
+            # Newer versions also respect this.
+            try:
+                gp.setParam("LogToConsole", 0)
+            except Exception:
+                pass
+    except Exception:
+        return
+
+
 def _classify_solver_outcome(solver_term: object, solver_status: object) -> str:
     term = str(solver_term or "").strip().lower()
     status = str(solver_status or "").strip().lower()
@@ -197,16 +216,19 @@ def _plot_solver_status_by_seed(
     seeds = sorted({int(s) for s in df["init_seed"].astype(int).tolist()})
     forms = list(targets)
 
-    non_success = (
-        df[df["outcome"] != "success"]
-        .groupby(["formulation", "init_seed"])
-        .size()
-        .unstack(fill_value=0)
-    )
-    for form in forms:
-        if form not in non_success.index:
-            non_success.loc[form] = 0
-    non_success = non_success.reindex(index=forms, columns=seeds, fill_value=0)
+    sub = df[df["outcome"] != "success"]
+    # If every retrain event is a success, the groupby/unstack result is an empty
+    # frame with no columns, and later assignments will error. In that case,
+    # explicitly create a zero table.
+    if sub.empty:
+        non_success = pd.DataFrame(0, index=forms, columns=seeds, dtype=int)
+    else:
+        non_success = (
+            sub.groupby(["formulation", "init_seed"])
+            .size()
+            .unstack(fill_value=0)
+            .reindex(index=forms, columns=seeds, fill_value=0)
+        )
 
     # mean across init seeds (counts per run; cycles are fixed so comparable)
     means = non_success.mean(axis=1)
@@ -263,7 +285,7 @@ def _plot_elapsed_time_boxplot(runs_df: pd.DataFrame, out_dir: Path) -> None:
             continue
         labels = sorted(part["model_label"].unique().tolist())
         data = [part.loc[part["model_label"] == lab, "elapsed_total_run_sec"].astype(float).to_numpy() for lab in labels]
-        ax.boxplot(data, labels=labels, showfliers=False)
+        ax.boxplot(data, tick_labels=labels, showfliers=False)
         # base points (single runs) as markers
         base = runs_df[runs_df["init_family"] == "base"]
         for i, lab in enumerate(labels, start=1):
@@ -281,42 +303,6 @@ def _plot_elapsed_time_boxplot(runs_df: pd.DataFrame, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_dir / "elapsed_total_run_sec_boxplot.png")
     plt.close(fig)
-
-
-def _plot_metric_boxplots(runs_df: pd.DataFrame, out_dir: Path, metrics: Sequence[str]) -> None:
-    plt = _get_plt()
-    if plt is None:
-        return
-    if runs_df.empty:
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    base = runs_df[runs_df["init_family"] == "base"]
-    for metric in metrics:
-        if metric not in runs_df.columns:
-            continue
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=False)
-        for ax, fam in zip(axes, ["local", "global"]):
-            part = runs_df[runs_df["init_family"] == fam]
-            if part.empty:
-                ax.axis("off")
-                continue
-            labels = sorted(part["model_label"].unique().tolist())
-            data = [part.loc[part["model_label"] == lab, metric].astype(float).to_numpy() for lab in labels]
-            ax.boxplot(data, labels=labels, showfliers=False)
-            for i, lab in enumerate(labels, start=1):
-                b = base.loc[base["model_label"] == lab, metric]
-                if not b.empty and np.isfinite(float(b.iloc[0])):
-                    ax.scatter([i], [float(b.iloc[0])], color="black", marker="D", s=24, zorder=3, label="base" if i == 1 else None)
-            ax.set_title(f"{metric} ({fam})")
-            ax.set_xlabel("model")
-            ax.tick_params(axis="x", rotation=15)
-        handles, labels_leg = axes[0].get_legend_handles_labels()
-        if handles:
-            fig.legend(handles, labels_leg, loc="upper right", fontsize=9)
-        fig.tight_layout()
-        fig.savefig(out_dir / f"boxplot_{metric}.png")
-        plt.close(fig)
 
 
 def _plot_family_plus_base(
@@ -531,10 +517,15 @@ def _plot_metric_boxplot(
     plt.close(fig)
 
 
-def _plot_metric_boxplots(runs_df: pd.DataFrame, out_dir: Path) -> None:
+def _plot_metric_boxplots(
+    runs_df: pd.DataFrame,
+    out_dir: Path,
+    metrics: Optional[Sequence[str]] = None,
+) -> None:
     if runs_df.empty:
         return
-    metrics = [
+    if metrics is None:
+        metrics = [
         # core performance
         "ann_return",
         "ann_return_net",
@@ -559,7 +550,7 @@ def _plot_metric_boxplots(runs_df: pd.DataFrame, out_dir: Path) -> None:
         "elapsed_fit_time_mean",
         "elapsed_total_fit_time",
         "elapsed_total_run_sec",
-    ]
+        ]
     model_order = ["flex_dual", "flex_kkt", "ipo_grad"]
     box_dir = out_dir / "metric_boxplots"
     for metric in metrics:
@@ -585,6 +576,8 @@ class _RunSpec:
 def main() -> None:
     parser = build_parser()
     parser.description = "Experiment B: initialization sensitivity"
+    # In local-opt studies we default to *no* rolling progress logs; users can enable with --debug-roll.
+    parser.set_defaults(debug_roll=False)
     # B-specific options
     parser.add_argument(
         "--b-target",
@@ -593,6 +586,12 @@ def main() -> None:
         help='Comma-separated targets to run (e.g., "dual,kkt,ipo-grad"). Back-compat: "both" = dual,kkt.',
     )
     parser.add_argument("--b-process-seed", type=int, default=0)
+    parser.add_argument(
+        "--flex-maxtime",
+        type=float,
+        default=180.0,
+        help="Flex solver time limit per retrain (seconds). Passed to Knitro as maxtime_real.",
+    )
     parser.add_argument("--b-init-seeds", type=str, default="0,1,2,3,4,5,6,7,8,9")
     parser.add_argument(
         "--b-base-mode",
@@ -604,7 +603,37 @@ def main() -> None:
     parser.add_argument("--b-theta-init-clip", type=float, default=5.0)
     parser.add_argument("--b-theta-init-sigma-local", type=float, default=0.1)
     parser.add_argument("--b-theta-init-sigma-global", type=float, default=0.3)
+    parser.add_argument(
+        "--b-theta-init-radius-local",
+        type=float,
+        default=None,
+        help=(
+            "Override local init noise scale by specifying an approximate L2 radius r, "
+            "where ||eta||_2 ≈ r. Internally converted to sigma=r/sqrt(d). "
+            "When set, overrides --b-theta-init-sigma-local."
+        ),
+    )
+    parser.add_argument(
+        "--b-theta-init-radius-global",
+        type=float,
+        default=None,
+        help=(
+            "Override global init noise scale by specifying an approximate L2 radius r, "
+            "where ||eta||_2 ≈ r. Internally converted to sigma=r/sqrt(d). "
+            "When set, overrides --b-theta-init-sigma-global."
+        ),
+    )
+    parser.add_argument(
+        "--b-theta-init-clip-auto",
+        action="store_true",
+        help="If set, use clip = 4*sigma_global (intended to make clipping almost inactive).",
+    )
     parser.add_argument("--b-init-families", type=str, default="local,global")
+    parser.add_argument(
+        "--b-verbose-solvers",
+        action="store_true",
+        help="Show external solver output (Gurobi banner/logs). Default hides these to keep study logs readable.",
+    )
 
     args = parser.parse_args()
     tickers = parse_tickers(args.tickers)
@@ -658,6 +687,9 @@ def main() -> None:
     )
     bundle = build_data_bundle(PipelineConfig(loader=loader_cfg, debug=False))
 
+    # Suppress noisy Gurobi output by default (license banners/logs), so study logs stay readable.
+    _quiet_gurobi()
+
     # Heavy imports (matplotlib, reporting, etc.) after parsing so `--help` stays lightweight.
     from dfl_portfolio.experiments.real_data_run import run_rolling_experiment
     from dfl_portfolio.registry import KNITRO_DEFAULTS, SolverSpec
@@ -686,6 +718,17 @@ def main() -> None:
     clip = float(getattr(args, "b_theta_init_clip", 5.0))
     sigma_local = float(getattr(args, "b_theta_init_sigma_local", 0.1))
     sigma_global = float(getattr(args, "b_theta_init_sigma_global", 0.3))
+    # Optional: radius-based specification (r ≈ ||eta||_2) -> sigma = r/sqrt(d).
+    d_theta = int(bundle.dataset.X.shape[1])
+    sqrt_d = math.sqrt(max(d_theta, 1))
+    r_local = getattr(args, "b_theta_init_radius_local", None)
+    r_global = getattr(args, "b_theta_init_radius_global", None)
+    if r_local is not None:
+        sigma_local = float(r_local) / sqrt_d
+    if r_global is not None:
+        sigma_global = float(r_global) / sqrt_d
+    if bool(getattr(args, "b_theta_init_clip_auto", False)):
+        clip = 4.0 * float(sigma_global)
     process_seed = int(getattr(args, "b_process_seed", 0))
 
     # Base flex options (same granularity as real_data_run)
@@ -731,6 +774,14 @@ def main() -> None:
         f"[local-opt-B] start: targets={targets_str} "
         f"base_mode={base_mode} init_seeds={len(init_seeds)} jobs={total_jobs}"
     )
+    r_local_eff = float(sigma_local * sqrt_d)
+    r_global_eff = float(sigma_global * sqrt_d)
+    print(
+        f"[local-opt-B] theta-init scale: d={d_theta} "
+        f"sigma_local={sigma_local:.6g} (r≈{r_local_eff:.6g}), "
+        f"sigma_global={sigma_global:.6g} (r≈{r_global_eff:.6g}), "
+        f"clip={clip:.6g}"
+    )
     print(f"[local-opt-B] outdir={outdir}")
 
     run_rows: List[Dict[str, Any]] = []
@@ -772,38 +823,82 @@ def main() -> None:
 
         # Keep model_label stable across families; encode family in our own CSV columns.
         model_label = "ipo_grad" if is_ipo_grad else f"flex_{spec.formulation}"
+        # Avoid overwriting outputs when multiple init_seeds are used.
         results_model_dir = outdir / "models" / model_label / spec.init_family
         debug_dir = outdir / "debug" / model_label / spec.init_family
+        if spec.init_seed is not None:
+            results_model_dir = results_model_dir / f"seed_{int(spec.init_seed)}"
+            debug_dir = debug_dir / f"seed_{int(spec.init_seed)}"
         results_model_dir.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
 
+        # Match real_data_run behavior: always provide an init_seed (default=1) so that
+        # any internal seeding derived from (base_seed, init_seed) is consistent.
+        # For non-base families we keep spec.init_seed (the point of study B).
+        effective_init_seed: Optional[int]
+        if spec.init_seed is not None:
+            effective_init_seed = int(spec.init_seed)
+        else:
+            effective_init_seed = int(getattr(args, "init_seed", 1))
+
         start_time = time.perf_counter()
-        run_result = run_rolling_experiment(
-            model_key="ipo_grad" if is_ipo_grad else "flex",
-            model_label=model_label,
-            bundle=bundle,
-            delta_up=delta_up,
-            delta_down_candidates=[delta_down],
-            trading_cost_enabled=trading_costs_enabled,
-            asset_cost_overrides=asset_cost_overrides_dec,
-            solver_spec=ipo_grad_solver_spec if is_ipo_grad else solver_spec,
-            flex_options=flex_options,
-            spo_plus_options=None,
-            ipo_grad_options=ipo_grad_options if is_ipo_grad else None,
-            train_window=int(args.train_window),
-            rebal_interval=int(args.rebal_interval),
-            debug_roll=bool(getattr(args, "debug_roll", True)),
-            debug_dir=debug_dir,
-            results_model_dir=results_model_dir,
-            tee=bool(args.tee),
-            asset_pred_dir=None,
-            eval_start=pd.Timestamp(args.start),
-            ipo_grad_debug_kkt=False,
-            base_seed=process_seed,
-            init_seed=spec.init_seed,
-            theta_init_spec=theta_init_spec if is_ipo_grad else None,
-            theta_init_delta=float(delta_down),
-        )
+        debug_roll = bool(getattr(args, "debug_roll", False))
+        suppress_solver_output = (not debug_roll) and (not bool(getattr(args, "b_verbose_solvers", False)))
+        if suppress_solver_output:
+            with open(os.devnull, "w") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
+                run_result = run_rolling_experiment(
+                    model_key="ipo_grad" if is_ipo_grad else "flex",
+                    model_label=model_label,
+                    bundle=bundle,
+                    delta_up=delta_up,
+                    delta_down_candidates=[delta_down],
+                    trading_cost_enabled=trading_costs_enabled,
+                    asset_cost_overrides=asset_cost_overrides_dec,
+                    solver_spec=ipo_grad_solver_spec if is_ipo_grad else solver_spec,
+                    flex_options=flex_options,
+                    spo_plus_options=None,
+                    ipo_grad_options=ipo_grad_options if is_ipo_grad else None,
+                    train_window=int(args.train_window),
+                    rebal_interval=int(args.rebal_interval),
+                    debug_roll=debug_roll,
+                    debug_dir=debug_dir,
+                    results_model_dir=results_model_dir,
+                    tee=bool(args.tee),
+                    asset_pred_dir=None,
+                    eval_start=pd.Timestamp(args.start),
+                    ipo_grad_debug_kkt=False,
+                    base_seed=process_seed,
+                    init_seed=effective_init_seed,
+                    theta_init_spec=theta_init_spec if is_ipo_grad else None,
+                    theta_init_delta=float(delta_down),
+                )
+        else:
+            run_result = run_rolling_experiment(
+                model_key="ipo_grad" if is_ipo_grad else "flex",
+                model_label=model_label,
+                bundle=bundle,
+                delta_up=delta_up,
+                delta_down_candidates=[delta_down],
+                trading_cost_enabled=trading_costs_enabled,
+                asset_cost_overrides=asset_cost_overrides_dec,
+                solver_spec=ipo_grad_solver_spec if is_ipo_grad else solver_spec,
+                flex_options=flex_options,
+                spo_plus_options=None,
+                ipo_grad_options=ipo_grad_options if is_ipo_grad else None,
+                train_window=int(args.train_window),
+                rebal_interval=int(args.rebal_interval),
+                debug_roll=debug_roll,
+                debug_dir=debug_dir,
+                results_model_dir=results_model_dir,
+                tee=bool(args.tee),
+                asset_pred_dir=None,
+                eval_start=pd.Timestamp(args.start),
+                ipo_grad_debug_kkt=False,
+                base_seed=process_seed,
+                init_seed=effective_init_seed,
+                theta_init_spec=theta_init_spec if is_ipo_grad else None,
+                theta_init_delta=float(delta_down),
+            )
         elapsed_total = time.perf_counter() - start_time
         job_times.append(float(elapsed_total))
 
@@ -821,6 +916,8 @@ def main() -> None:
         stats["ipo_grad_theta_anchor_mode"] = str(ipo_grad_options.get("ipo_grad_theta_anchor_mode", ""))
         stats["theta_init_sigma_local"] = sigma_local
         stats["theta_init_sigma_global"] = sigma_global
+        stats["theta_init_radius_local"] = float(sigma_local * sqrt_d)
+        stats["theta_init_radius_global"] = float(sigma_global * sqrt_d)
         stats["theta_init_clip"] = clip
         stats["process_seed"] = process_seed
         stats["elapsed_total_run_sec"] = float(elapsed_total)
@@ -836,6 +933,24 @@ def main() -> None:
             reb_df["model_key"] = "ipo_grad" if is_ipo_grad else "flex"
             reb_df["model_label"] = model_label
             retrain_frames.append(reb_df)
+            # Empirical perturbation size: mean±std of ||eta||_2 across retrain events.
+            eta = pd.to_numeric(reb_df.get("theta_init_eta_l2", np.nan), errors="coerce")
+            eta = eta[np.isfinite(eta.to_numpy())]
+            if not eta.empty:
+                eta_mean = float(eta.mean())
+                eta_std = float(eta.std(ddof=1)) if eta.shape[0] > 1 else 0.0
+                stats["eta_l2_mean"] = eta_mean
+                stats["eta_l2_std"] = eta_std
+                stats["eta_l2_n"] = int(eta.shape[0])
+                print(f"[local-opt-B] ||eta||_2 mean±std = {eta_mean:.6g} ± {eta_std:.6g} (n={eta.shape[0]})")
+            else:
+                stats["eta_l2_mean"] = float("nan")
+                stats["eta_l2_std"] = float("nan")
+                stats["eta_l2_n"] = 0
+        else:
+            stats["eta_l2_mean"] = float("nan")
+            stats["eta_l2_std"] = float("nan")
+            stats["eta_l2_n"] = 0
 
         wealth_df = run_result["wealth_df"][["date", "wealth"]].copy()
         if spec.init_family == "base":
@@ -907,7 +1022,7 @@ def main() -> None:
         "avg_trading_cost",
         "r2",
     ]
-    _plot_metric_boxplots(runs_df, box_fig_dir, metric_list)
+    _plot_metric_boxplots(runs_df, box_fig_dir, metrics=metric_list)
 
     # Plots: three figures per model (local+base, global+base, all)
     for form in plot_forms:
@@ -970,9 +1085,14 @@ python -m dfl_portfolio.experiments.local_opt_study_b \
   --b-base-mode init-ipo \
   --b-init-seeds "0,1,2,3,4,5,6,7,8,9" \
   --b-init-families "local,global" \
-  --b-theta-init-sigma-local 0.1 \
-  --b-theta-init-sigma-global 1 \
-  --b-theta-init-clip 5.0
+  --b-theta-init-radius-local 0.2 \
+  --b-theta-init-radius-global 2.0 \
+  --b-theta-init-clip-auto
+
+※ radius を指定した場合、内部では sigma = radius / sqrt(d) に変換されます。
+  （d=4 なら sqrt(d)=2 なので、radius=0.2 → sigma=0.1 と等価）
+※ radius を使わず従来どおり sigma を直接指定する場合は、
+  --b-theta-init-sigma-local / --b-theta-init-sigma-global を使ってください。
 
 
 概要（何を変えて何を固定するか）
@@ -992,6 +1112,7 @@ python -m dfl_portfolio.experiments.local_opt_study_b \
   - local:  theta_init = theta_base + sigma_local * N(0,I)（base近傍ノイズ）
   - global: theta_init = sigma_global * N(0,I)（ゼロ近傍ランダム）
   - ipo_grad も同じ初期θ（base/local/global + init_seed）を与えて学習・評価（指定時）
+  - （radius指定時）||eta||_2 ≈ radius として扱い、sigma = radius/sqrt(d) に変換する
 
 
 sigma / clip の見方（各要素 θ_j の範囲感）
@@ -999,6 +1120,9 @@ sigma / clip の見方（各要素 θ_j の範囲感）
 - クリップ前:
   - global: θ_j ~ N(0, sigma_global^2)
   - local:  (θ_j - θ_base,j) ~ N(0, sigma_local^2)
+- radius との関係（目安）:
+  - ||eta||_2 ≈ sigma * sqrt(d)
+  - よって sigma ≈ radius / sqrt(d)
 - 典型レンジ: 約95%が ±1.96*sigma、約99.7%が ±3*sigma
 - clip: 各要素を [-clip,+clip] に制限（発散防止）
 - 目安: clip >= 4*sigma だと clip はほぼ効かず「sigma 主導」で広がる

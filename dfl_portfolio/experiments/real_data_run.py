@@ -153,6 +153,21 @@ def plot_weight_window_with_connections(
     if not entries:
         return
 
+    # Window range (used to clamp x-axis; important because background spans can
+    # otherwise expand the axis to the full dataset horizon).
+    window_start: Optional[pd.Timestamp] = None
+    window_end: Optional[pd.Timestamp] = None
+    for _, df_model in entries:
+        if df_model.empty:
+            continue
+        d = pd.to_datetime(df_model["date"])
+        if d.empty:
+            continue
+        d_min = pd.Timestamp(d.min())
+        d_max = pd.Timestamp(d.max())
+        window_start = d_min if window_start is None else min(window_start, d_min)
+        window_end = d_max if window_end is None else max(window_end, d_max)
+
     n_models = len(entries)
     add_winner = returns_df is not None and isinstance(returns_df, pd.DataFrame) and not returns_df.empty
     n_rows = n_models + (1 if add_winner else 0)
@@ -223,6 +238,10 @@ def plot_weight_window_with_connections(
         except Exception:  # pragma: no cover
             pass
 
+    if window_start is not None and window_end is not None:
+        for ax in axes_list:
+            ax.set_xlim(window_start, window_end)
+
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -248,6 +267,9 @@ def plot_weight_window_with_connections(
         if not color:
             color = color_cycle[idx % len(color_cycle)] if color_cycle else None
         ax2.plot(dates, neff, label=display_model_name(model_key), color=color, linewidth=1.8)
+
+    if window_start is not None and window_end is not None:
+        ax2.set_xlim(window_start, window_end)
 
     ax2.set_ylabel("N_eff")
     ax2.set_xlabel("日付")
@@ -291,11 +313,12 @@ def train_model_window(
         tee=tee,
     )
     theta_init_override: Optional[np.ndarray] = None
+    theta_init_meta: Dict[str, object] = {}
     if model_key == "flex" and flex_options:
         flex_options_local = dict(flex_options)
         if seed_theta_init is not None:
             flex_options_local["theta_init_seed"] = int(seed_theta_init)
-        theta_init_override, resolved_flex = prepare_flex_training_args(
+        theta_init_override, resolved_flex, theta_init_meta = prepare_flex_training_args(
             bundle, train_start, train_end, delta_for_theta_init, tee, flex_options_local
         )
         trainer_kwargs.update(resolved_flex)
@@ -304,7 +327,7 @@ def train_model_window(
         spec_local = dict(theta_init_spec)
         if seed_theta_init is not None:
             spec_local["theta_init_seed"] = int(seed_theta_init)
-        theta_init_override, _ = prepare_flex_training_args(
+        theta_init_override, _, theta_init_meta = prepare_flex_training_args(
             bundle, train_start, train_end, delta_for_theta_init, tee, spec_local
         )
     if model_key == "ipo_grad":
@@ -398,7 +421,14 @@ def train_model_window(
         raise RuntimeError(f"Trainer {model_key} returned unexpected output")
 
     theta_hat = trainer_ret[0]
-    info = trainer_ret[5] if len(trainer_ret) >= 6 else {}
+    info_raw = trainer_ret[5] if len(trainer_ret) >= 6 else {}
+    info: Dict[str, object] = dict(info_raw) if isinstance(info_raw, dict) else {}
+    # Attach theta-init metadata for downstream logging/analysis (e.g., local-opt studies).
+    if theta_init_meta:
+        for k, v in theta_init_meta.items():
+            # Do not overwrite solver-provided keys if they already exist.
+            if k not in info:
+                info[k] = v
     return theta_hat, info, elapsed
 
 
@@ -596,6 +626,15 @@ def run_rolling_experiment(
                 "elapsed_sec": elapsed,
                 "train_eq_viol_max": (info or {}).get("eq_viol_max", float("nan")),
                 "train_ineq_viol_max": (info or {}).get("ineq_viol_max", float("nan")),
+                # Theta-init diagnostics (useful for local-opt studies)
+                "theta_init_mode": (info or {}).get("theta_init_mode", ""),
+                "theta_init_eta_l2": (info or {}).get("theta_init_eta_l2", float("nan")),
+                # Aux-init diagnostics (used by local-opt study A for flex)
+                "aux_w_base_source": (info or {}).get("aux_w_base_source", ""),
+                "aux_w0_minus_base_l1_mean": (info or {}).get("aux_w0_minus_base_l1_mean", float("nan")),
+                "aux_w0_minus_base_l1_std": (info or {}).get("aux_w0_minus_base_l1_std", float("nan")),
+                "aux_w0_minus_base_l2_mean": (info or {}).get("aux_w0_minus_base_l2_mean", float("nan")),
+                "aux_w0_minus_base_l2_std": (info or {}).get("aux_w0_minus_base_l2_std", float("nan")),
                 # SPO+ oracle diagnostics (present only for spo_plus)
                 "spo_oracle_fail_true": (info or {}).get("oracle_fail_true", float("nan")),
                 "spo_oracle_fail_tilde": (info or {}).get("oracle_fail_tilde", float("nan")),
@@ -720,8 +759,15 @@ def run_rolling_experiment(
     avg_turnover = (
         float(step_df["turnover"].mean()) if "turnover" in step_df.columns and not step_df.empty else float("nan")
     )
-    avg_trading_cost = (
+    # NOTE: avg_trading_cost は「合計取引コスト（ステップごとのコストの総和）」として扱う。
+    # 旧「平均」は avg_trading_cost_mean として残す（後方互換/診断用）。
+    avg_trading_cost_mean = (
         float(step_df["trading_cost"].mean())
+        if "trading_cost" in step_df.columns and not step_df.empty
+        else 0.0
+    )
+    avg_trading_cost = (
+        float(step_df["trading_cost"].sum())
         if "trading_cost" in step_df.columns and not step_df.empty
         else 0.0
     )
@@ -826,6 +872,7 @@ def run_rolling_experiment(
 
     # 決定係数 R^2（資産リターン予測の当てはまり）
     r2: float = float("nan")
+    rmse: float = float("nan")
     try:
         if asset_rows:
             asset_df_r2 = pd.DataFrame(asset_rows)
@@ -836,9 +883,13 @@ def run_rolling_experiment(
                     corr = float(np.corrcoef(y, yhat)[0, 1])
                     if np.isfinite(corr):
                         r2 = corr * corr
+                    mse_val = float(np.mean((yhat - y) ** 2))
+                    if np.isfinite(mse_val) and mse_val >= 0.0:
+                        rmse = float(np.sqrt(mse_val))
     except Exception:
         # R^2 は診断用なので、例外時は NaN のままにして続行する
         r2 = float("nan")
+        rmse = float("nan")
 
     terminal_wealth = float(wealth_values[-1]) if wealth_values else 1.0
     terminal_wealth_net = float(wealth_net_values[-1]) if wealth_net_values else 1.0
@@ -859,6 +910,7 @@ def run_rolling_experiment(
         "sortino_net": sortino_net,
         "cvar_95": cvar_95,
         "r2": r2,
+        "rmse": rmse,
         "max_drawdown": max_drawdown(wealth_values),
         "terminal_wealth": terminal_wealth,
         "terminal_wealth_net": terminal_wealth_net,
@@ -868,6 +920,7 @@ def run_rolling_experiment(
         "rebal_interval": rebal_interval,
         "avg_turnover": avg_turnover,
         "avg_trading_cost": avg_trading_cost,
+        "avg_trading_cost_mean": avg_trading_cost_mean,
         "trading_cost_bps": trading_cost_label,
         "avg_condition_number": avg_condition,
     }
@@ -1189,6 +1242,8 @@ def main() -> None:
 
     base_seed = int(getattr(args, "base_seed", 0))
     init_seed = int(getattr(args, "init_seed", 1))
+    ipo_grad_seed_override = getattr(args, "ipo_grad_seed", None)
+    ipo_grad_seed_override = int(ipo_grad_seed_override) if ipo_grad_seed_override is not None else None
 
     if auto_workers > 1:
         print(f"[real-data] running model jobs in parallel: {auto_workers} groups, max_workers={max_workers}")
@@ -1230,7 +1285,7 @@ def main() -> None:
                 asset_pred_dir=asset_pred_dir,
                 eval_start=eval_start_ts,
                 ipo_grad_debug_kkt=getattr(args, "ipo_grad_debug_kkt", False),
-                base_seed=base_seed,
+                base_seed=ipo_grad_seed_override if (spec.model_key == "ipo_grad" and ipo_grad_seed_override is not None) else base_seed,
                 init_seed=init_seed,
             )
             # condition_numbers を analysis/figures 配下にもコピー
@@ -1341,6 +1396,7 @@ def main() -> None:
             "avg_trading_cost",
             "trading_cost_bps",
             "r2",
+            "rmse",
             "n_retrain",
             "n_invest_steps",
             "max_drawdown",
@@ -1710,6 +1766,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --ipo-grad-theta-anchor-mode ipo \
   --flex-theta-init-mode none \
   --ipo-grad-init-mode none \
+  --ipo-grad-seed 0 \
   --benchmarks "spy,1/n,tsmom_spy" \
   --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
@@ -1764,6 +1821,7 @@ IPO-GRAD（IPO-NN）設定
 - `--ipo-grad-lambda-anchor` (float, default `0.0`): θ に対する L2 アンカー強度（0 で無効）。
 - `--ipo-grad-theta-anchor-mode` (str, default `ipo`): アンカー基準 (`ipo` 解析解 or `zero`)。
 - `--ipo-grad-debug-kkt`: IPO-GRAD の各リバランスで KKT 条件のデバッグチェックを有効化。
+- `--ipo-grad-seed` (int, default `None` → `--base-seed`): IPO-GRAD 用の seed 上書き（指定時のみ IPO-GRAD のみ別 seed 系列にする）。
 
 SPO+ 設定
 - `--spo-plus-epochs` (int, default `500`): SPO+ の学習エポック数。
