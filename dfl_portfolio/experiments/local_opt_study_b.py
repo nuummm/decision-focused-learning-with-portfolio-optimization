@@ -600,6 +600,17 @@ def main() -> None:
         choices=["none", "init-ipo", "pen-10"],
         help="Base preset: none (no init, no theta penalty), init-ipo (IPO init only), pen-10 (anchor penalty=10 with IPO anchor, init none).",
     )
+    parser.add_argument(
+        "--b-theta-init-base-mode-local",
+        type=str,
+        default=None,
+        choices=["none", "ipo"],
+        help=(
+            "Base theta used for local init perturbations (rand_local). "
+            "When omitted, defaults to the base-mode's theta initialization setting. "
+            "Set to 'none' to perturb around zeros, or 'ipo' to perturb around the IPO closed-form."
+        ),
+    )
     parser.add_argument("--b-theta-init-clip", type=float, default=5.0)
     parser.add_argument("--b-theta-init-sigma-local", type=float, default=0.1)
     parser.add_argument("--b-theta-init-sigma-global", type=float, default=0.3)
@@ -715,6 +726,10 @@ def main() -> None:
     base_mode_cfg = _resolve_b_base_mode(getattr(args, "b_base_mode", "init-ipo"))
     base_mode = str(base_mode_cfg["b_base_mode"])
     theta_base_init_mode = str(base_mode_cfg["theta_base_init_mode"])
+    theta_base_local_mode = getattr(args, "b_theta_init_base_mode_local", None)
+    theta_base_local_mode = str(theta_base_local_mode).strip().lower() if theta_base_local_mode is not None else None
+    if theta_base_local_mode is None:
+        theta_base_local_mode = str(theta_base_init_mode)
     clip = float(getattr(args, "b_theta_init_clip", 5.0))
     sigma_local = float(getattr(args, "b_theta_init_sigma_local", 0.1))
     sigma_global = float(getattr(args, "b_theta_init_sigma_global", 0.3))
@@ -810,7 +825,7 @@ def main() -> None:
             theta_init_spec["theta_init_mode"] = theta_base_init_mode
         elif spec.init_family == "local":
             theta_init_spec["theta_init_mode"] = "rand_local"
-            theta_init_spec["theta_init_base_mode"] = theta_base_init_mode
+            theta_init_spec["theta_init_base_mode"] = theta_base_local_mode
             theta_init_spec["theta_init_sigma"] = sigma_local
             theta_init_spec["theta_init_clip"] = clip
         elif spec.init_family == "global":
@@ -1084,8 +1099,9 @@ python -m dfl_portfolio.experiments.local_opt_study_b \
   --b-target "dual,kkt,ipo-grad" \
   --b-process-seed 0 \
   --b-base-mode init-ipo \
+  -b-theta-init-base-mode-local ipo \
   --b-init-seeds "0,1,2,3,4,5,6,7,8,9" \
-  --b-init-families "local,global" \
+  --b-init-families "local" \
   --b-theta-init-radius-local 0.2 \
   --b-theta-init-radius-global 2.0 \
   --b-theta-init-clip-auto

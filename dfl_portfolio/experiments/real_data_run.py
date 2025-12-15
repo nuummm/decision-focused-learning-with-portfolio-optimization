@@ -58,6 +58,7 @@ from dfl_portfolio.real_data.reporting import (
     export_weight_threshold_frequency,
     export_weight_variance_correlation,
     export_max_return_winner_counts,
+    export_winner_capture_frequency,
     max_drawdown,
     plot_asset_correlation,
     plot_flex_solver_debug,
@@ -1345,12 +1346,11 @@ def main() -> None:
                 base_seed=ipo_grad_seed_override if (spec.model_key == "ipo_grad" and ipo_grad_seed_override is not None) else base_seed,
                 init_seed=init_seed,
             )
-            # condition_numbers を analysis/figures 配下にもコピー
+            # condition_numbers はデータ依存でモデル間で共通なので、analysis/figures に 1 枚だけ保存する
             cond_src = results_dir / "condition_numbers.png"
-            if cond_src.exists():
-                cond_dest_dir = analysis_fig_dir / "condition_numbers"
-                cond_dest_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(cond_src, cond_dest_dir / f"condition_numbers_{spec.label}.png")
+            cond_dst = analysis_fig_dir / "condition_numbers.png"
+            if cond_src.exists() and not cond_dst.exists():
+                shutil.copy2(cond_src, cond_dst)
             outputs.append((spec, run_result))
         return outputs
 
@@ -1750,6 +1750,33 @@ def main() -> None:
             analysis_csv_dir / "weight_threshold_freq.csv",
             analysis_fig_dir / "weight_threshold_freq.png",
         )
+        # Winner capture analysis: whether each model allocates >=5% weight to the weekly winner asset.
+        try:
+            winner_dir = analysis_fig_dir / "winner_capture"
+            winner_dir.mkdir(parents=True, exist_ok=True)
+            export_winner_capture_frequency(
+                returns_df=bundle.dataset.returns,
+                weight_dict=weight_dict,
+                threshold=0.05,
+                csv_path=analysis_csv_dir / "winner_capture_rate.csv",
+                fig_path=winner_dir / "winner_capture_rate.png",
+                by_asset_csv_path=analysis_csv_dir / "winner_capture_by_asset.csv",
+                by_asset_fig_path=winner_dir / "winner_capture_by_asset_heatmap.png",
+            )
+            flex_only = {k: v for k, v in weight_dict.items() if "flex" in str(k)}
+            if flex_only:
+                export_winner_capture_frequency(
+                    returns_df=bundle.dataset.returns,
+                    weight_dict=flex_only,
+                    threshold=0.05,
+                    csv_path=analysis_csv_dir / "winner_capture_rate_dfl_only.csv",
+                    fig_path=winner_dir / "winner_capture_rate_dfl_only.png",
+                    by_asset_csv_path=analysis_csv_dir / "winner_capture_by_asset_dfl_only.csv",
+                    by_asset_fig_path=winner_dir / "winner_capture_by_asset_heatmap_dfl_only.png",
+                    title="週次最大リターン資産の捕捉率（DFLのみ, w>=閾値）",
+                )
+        except Exception as exc:  # pragma: no cover
+            print(f"[analysis] winner capture analysis failed: {exc}")
     if train_window_records:
         pd.DataFrame(train_window_records).to_csv(
             analysis_csv_dir / "model_train_windows.csv", index=False

@@ -929,6 +929,197 @@ def export_weight_threshold_frequency(
     freq_df.to_csv(csv_path, index=False)
 
 
+def export_winner_capture_frequency(
+    *,
+    returns_df: pd.DataFrame,
+    weight_dict: Dict[str, pd.DataFrame],
+    threshold: float,
+    csv_path: Path,
+    fig_path: Path,
+    by_asset_csv_path: Path | None = None,
+    by_asset_fig_path: Path | None = None,
+    title: str = "週次最大リターン資産の捕捉率（w>=閾値）",
+) -> None:
+    """Compute how often each model allocates >=threshold weight to the period winner asset.
+
+    Winner asset is defined by realized returns (argmax across assets) at each date.
+    A "capture" occurs if the model's portfolio weight for that winner asset is >= threshold.
+    """
+    if returns_df is None or returns_df.empty or not weight_dict:
+        return
+    df_ret = returns_df.copy()
+    df_ret = df_ret.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+    if df_ret.empty:
+        return
+    df_ret.index = pd.to_datetime(df_ret.index)
+
+    # Winner ticker per date
+    winner = df_ret.idxmax(axis=1)
+    winner_df = pd.DataFrame({"date": df_ret.index, "winner": winner.astype(str).to_numpy()}).dropna()
+    if winner_df.empty:
+        return
+    tickers = [c for c in df_ret.columns]
+    ticker_set = set(map(str, tickers))
+
+    def _model_label(model_key: str) -> str:
+        try:
+            return display_model_name(model_key)
+        except Exception:
+            return str(model_key)
+
+    rows: List[Dict[str, object]] = []
+    by_asset_rows: List[Dict[str, object]] = []
+    # For plotting: store (captured_by_ticker, missed_count, n_total) per model
+    plot_cache: Dict[str, Tuple[Dict[str, int], int, int]] = {}
+
+    for model_key, wdf in weight_dict.items():
+        if wdf is None or wdf.empty or "date" not in wdf.columns:
+            continue
+        df_w = wdf.copy()
+        df_w["date"] = pd.to_datetime(df_w["date"])
+        df_w = df_w.dropna(subset=["date"])
+        df_w = df_w.set_index("date").sort_index()
+        # keep only tickers present in returns (robust to extra columns)
+        keep_cols = [c for c in df_w.columns if str(c) in ticker_set]
+        if not keep_cols:
+            continue
+        df_w = df_w[keep_cols].astype(float)
+
+        merged = winner_df.merge(
+            df_w.reset_index(),
+            on="date",
+            how="inner",
+        )
+        if merged.empty:
+            continue
+
+        captured_total = 0
+        captured_by_ticker: Dict[str, int] = {t: 0 for t in tickers}
+        missed_total = 0
+
+        # Per-date capture decision
+        for _, r in merged.iterrows():
+            w_ticker = str(r["winner"])
+            if w_ticker not in df_w.columns:
+                missed_total += 1
+                continue
+            w_val = float(r.get(w_ticker, np.nan))
+            if np.isfinite(w_val) and (w_val >= float(threshold)):
+                captured_total += 1
+                captured_by_ticker[w_ticker] = captured_by_ticker.get(w_ticker, 0) + 1
+            else:
+                missed_total += 1
+
+        n_total = int(merged.shape[0])
+        capture_rate = float(captured_total) / float(n_total) if n_total > 0 else float("nan")
+        rows.append(
+            {
+                "model": str(_model_label(str(model_key))),
+                "model_key": str(model_key),
+                "threshold": float(threshold),
+                "n_dates": n_total,
+                "n_captured": int(captured_total),
+                "n_missed": int(missed_total),
+                "capture_rate": float(capture_rate),
+            }
+        )
+        plot_cache[str(model_key)] = (captured_by_ticker, missed_total, n_total)
+
+        # By-asset conditional capture: P(captured | ticker is winner)
+        for t in tickers:
+            win_mask = merged["winner"].astype(str) == str(t)
+            n_win = int(win_mask.sum())
+            n_cap = int(captured_by_ticker.get(str(t), 0))
+            rate_t = float(n_cap) / float(n_win) if n_win > 0 else float("nan")
+            by_asset_rows.append(
+                {
+                    "model": str(_model_label(str(model_key))),
+                    "model_key": str(model_key),
+                    "ticker": str(t),
+                    "threshold": float(threshold),
+                    "n_wins": n_win,
+                    "n_captured": n_cap,
+                    "capture_rate_when_wins": rate_t,
+                }
+            )
+
+    if not rows:
+        return
+    out_df = pd.DataFrame(rows).sort_values("capture_rate", ascending=False)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(csv_path, index=False)
+
+    if by_asset_csv_path is not None and by_asset_rows:
+        by_asset_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(by_asset_rows).to_csv(by_asset_csv_path, index=False)
+
+    if plt is None:
+        return
+
+    # Plot 1: stacked bar (captured-by-asset + missed)
+    labels = [str(_model_label(k)) for k in plot_cache.keys()]
+    model_keys = list(plot_cache.keys())
+    x = np.arange(len(model_keys), dtype=float)
+    fig, ax = plt.subplots(figsize=(max(7.5, 1.4 * len(model_keys)), 4.2))
+    bottom = np.zeros(len(model_keys), dtype=float)
+    # Asset colors
+    asset_colors = {t: ASSET_COLOR_SEQUENCE[i % len(ASSET_COLOR_SEQUENCE)] for i, t in enumerate(tickers)}
+    for t in tickers:
+        vals = []
+        for k in model_keys:
+            captured_by_t, _, n_total = plot_cache[k]
+            vals.append(float(captured_by_t.get(str(t), 0)) / float(n_total) if n_total > 0 else 0.0)
+        ax.bar(x, vals, bottom=bottom, label=str(t), color=asset_colors.get(str(t), None), alpha=0.85)
+        bottom += np.asarray(vals, dtype=float)
+    missed_vals = []
+    for k in model_keys:
+        _, missed, n_total = plot_cache[k]
+        missed_vals.append(float(missed) / float(n_total) if n_total > 0 else 0.0)
+    ax.bar(x, missed_vals, bottom=bottom, label="miss", color="#b0b0b0", alpha=0.7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("頻度")
+    ax.set_title(f"{title}（threshold={float(threshold):.2f}）")
+    ax.legend(loc="upper right", fontsize=8, ncol=2, frameon=True)
+    ax.grid(axis="y", alpha=0.2)
+    fig.tight_layout()
+    fig_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(fig_path)
+    plt.close(fig)
+
+    # Plot 2 (optional): conditional capture by asset (heatmap-like table)
+    if by_asset_fig_path is not None and by_asset_rows:
+        try:
+            df_ba = pd.DataFrame(by_asset_rows)
+            pivot = df_ba.pivot_table(
+                index="model",
+                columns="ticker",
+                values="capture_rate_when_wins",
+                aggfunc="mean",
+            )
+            fig2, ax2 = plt.subplots(figsize=(max(7.5, 1.4 * len(pivot.index)), 3.5))
+            im = ax2.imshow(pivot.to_numpy(dtype=float), aspect="auto", vmin=0.0, vmax=1.0, cmap="YlGn")
+            ax2.set_yticks(np.arange(pivot.shape[0]))
+            ax2.set_yticklabels(list(pivot.index))
+            ax2.set_xticks(np.arange(pivot.shape[1]))
+            ax2.set_xticklabels(list(pivot.columns))
+            ax2.set_title(f"勝者資産ごとの捕捉率（w>=閾値, threshold={float(threshold):.2f}）")
+            fig2.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+            for i in range(pivot.shape[0]):
+                for j in range(pivot.shape[1]):
+                    v = pivot.iat[i, j]
+                    if not np.isfinite(v):
+                        continue
+                    ax2.text(j, i, f"{float(v):.2f}", ha="center", va="center", fontsize=8, color="black")
+            fig2.tight_layout()
+            by_asset_fig_path.parent.mkdir(parents=True, exist_ok=True)
+            fig2.savefig(by_asset_fig_path)
+            plt.close(fig2)
+        except Exception:
+            pass
+
 def export_average_weights(weight_dict: Dict[str, pd.DataFrame], csv_path: Path, fig_path: Path) -> None:
     rows: List[Dict[str, object]] = []
     for model, df in weight_dict.items():
@@ -1056,7 +1247,7 @@ def plot_weight_histograms(weight_dict: Dict[str, pd.DataFrame], path: Path) -> 
     plt.close(fig)
 
 
-def plot_condition_numbers(step_df: pd.DataFrame, path: Path, *, max_points: int = 400) -> None:
+def plot_condition_numbers(step_df: pd.DataFrame, path: Path, *, max_points: int | None = None) -> None:
     """Plot covariance condition numbers over time as a bar chart."""
     if plt is None or step_df.empty:
         return
@@ -1069,15 +1260,16 @@ def plot_condition_numbers(step_df: pd.DataFrame, path: Path, *, max_points: int
         return
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date")
-    if max_points and len(df) > max_points:
-        df = df.iloc[-max_points:]
+    if max_points is not None and int(max_points) > 0 and len(df) > int(max_points):
+        df = df.iloc[-int(max_points):]
     dates = df["date"]
     values = df["condition_number"].astype(float)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar(dates, values, width=3, color="tab:blue", alpha=0.8)
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(dates, values, width=3, color="tab:blue", alpha=0.75)
     ax.set_xlabel("日付")
     ax.set_ylabel("条件数")
     ax.set_title("共分散行列の条件数推移")
+    ax.set_yscale("log")
     ax.grid(axis="y", alpha=0.3)
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -1720,12 +1912,15 @@ def compute_pairwise_performance_tests(
         std = float(np.std(r, ddof=1)) if r.size > 1 else float("nan")
         sharpe = mean / std if std > 1e-12 else float("nan")
         sortino = compute_sortino_ratio(r)
+        # CVaR (Expected Shortfall) at 95% (lower 5% mean return; higher is better).
+        cvar_95 = compute_cvar(r, alpha=0.05)
         final_wealth = float(np.prod(1.0 + r))
         return {
             "mean": mean,
             "std": std,
             "sharpe": sharpe,
             "sortino": sortino,
+            "cvar_95": cvar_95,
             "final_wealth": final_wealth,
         }
 
@@ -1758,7 +1953,7 @@ def compute_pairwise_performance_tests(
                 "model_b": b,
                 "n_obs": n,
             }
-            for k in ["mean", "std", "sharpe", "sortino", "final_wealth"]:
+            for k in ["mean", "std", "sharpe", "sortino", "cvar_95", "final_wealth"]:
                 obs = diff_obs.get(k, float("nan"))
                 boot_arr = np.asarray(diff_boot.get(k, []), dtype=float)
                 boot_arr = boot_arr[np.isfinite(boot_arr)]
@@ -1800,7 +1995,7 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
         return
 
     # 比較対象とする指標
-    metrics = ["mean", "std", "sharpe", "sortino", "final_wealth"]
+    metrics = ["mean", "std", "sharpe", "sortino", "cvar_95", "final_wealth"]
 
     rows_out: list[dict[str, object]] = []
     for dfl in dfl_models:
@@ -1819,7 +2014,6 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
             row: dict[str, object] = {
                 "model_dfl": dfl,
                 "model_other": other,
-                "n_obs": int(rec.get("n_obs", 0)),
             }
             for k in metrics:
                 diff_col = f"{k}_diff"
@@ -1843,7 +2037,7 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
     if rows_out:
         out_df = pd.DataFrame(rows_out)
         # 出力は True/False の有意フラグのみ（値や p 値は不要）
-        keep_cols: list[str] = ["model_dfl", "model_other", "n_obs"]
+        keep_cols: list[str] = ["model_dfl", "model_other"]
         for k in metrics:
             keep_cols.append(f"{k}_sig_5pct")
             keep_cols.append(f"{k}_sig_1pct")
@@ -1852,16 +2046,16 @@ def summarize_dfl_performance_significance(analysis_csv_dir: Path) -> None:
 
         # 列名を日本語にして、CSV 単体でも解釈しやすくする
         metric_name_ja = {
-            "mean": "平均",
-            "std": "標準偏差",
+            "mean": "年率リターン",
+            "std": "年率ボラティリティ",
             "sharpe": "シャープ",
             "sortino": "ソルティノ",
+            "cvar_95": "CVaR(95%)",
             "final_wealth": "最終資産",
         }
         rename_map: Dict[str, str] = {
             "model_dfl": "DFLモデル",
             "model_other": "比較モデル",
-            "n_obs": "観測数",
         }
         for k in metrics:
             ja = metric_name_ja.get(k, k)
@@ -2187,13 +2381,173 @@ def run_mse_and_bias_analysis(
                 )
             )
         _resolve_label_overlaps(fig, ax, labels)
-        # NOTE: keep filename for backward compatibility, but the axis is RMSE.
         ax.set_xlabel("アウトオブサンプル RMSE（全観測: 資産×時点）")
         ax.set_ylabel("シャープレシオ（年率換算）")
         ax.set_title("予測誤差と意思決定品質の関係")
         fig.tight_layout()
-        fig.savefig(bias_fig_dir / "mse_vs_sharpe_scatter.png")
+        fig.savefig(bias_fig_dir / "rmse_vs_sharpe_scatter.png")
         plt.close(fig)
+
+        # Turnover vs Sharpe/CVaR scatter (decision quality vs trading intensity)
+        def _maybe_float(x: object) -> float:
+            try:
+                v = float(x)
+                return v
+            except Exception:
+                return float("nan")
+
+        if "avg_turnover" in plot_df.columns:
+            # 1-summary.csv の avg_turnover は format_summary_for_output で % 表示（100倍）済み。
+            fig, ax = plt.subplots(figsize=(7.2, 5.2))
+            labels = []
+            for model, row in plot_df.iterrows():
+                mstr = str(model)
+                if _should_skip_scatter(mstr):
+                    continue
+                x = _maybe_float(row.get("avg_turnover", np.nan))
+                y = _maybe_float(row.get("sharpe", np.nan))
+                if not (np.isfinite(x) and np.isfinite(y)):
+                    continue
+                color = palette.get(mstr, "tab:blue")
+                ax.scatter(x, y, color=color, s=46, edgecolors="white", linewidths=0.8, zorder=3)
+                dx, dy = label_offsets[len(labels) % len(label_offsets)]
+                labels.append(
+                    ax.annotate(
+                        mstr,
+                        xy=(x, y),
+                        xytext=(dx, dy),
+                        textcoords="offset points",
+                        fontsize=8,
+                        color=color,
+                    )
+                )
+            _resolve_label_overlaps(fig, ax, labels)
+            ax.set_xlabel("平均ターンオーバー（%）")
+            ax.set_ylabel("シャープレシオ（年率換算）")
+            ax.set_title("売買量とリスク調整後リターンの関係")
+            fig.tight_layout()
+            fig.savefig(bias_fig_dir / "turnover_vs_sharpe_scatter.png")
+            plt.close(fig)
+
+            if "cvar_95" in plot_df.columns:
+                fig, ax = plt.subplots(figsize=(7.2, 5.2))
+                labels = []
+                for model, row in plot_df.iterrows():
+                    mstr = str(model)
+                    if _should_skip_scatter(mstr):
+                        continue
+                    x = _maybe_float(row.get("avg_turnover", np.nan))
+                    y = _maybe_float(row.get("cvar_95", np.nan))
+                    if not (np.isfinite(x) and np.isfinite(y)):
+                        continue
+                    color = palette.get(mstr, "tab:blue")
+                    ax.scatter(x, y, color=color, s=46, edgecolors="white", linewidths=0.8, zorder=3)
+                    dx, dy = label_offsets[len(labels) % len(label_offsets)]
+                    labels.append(
+                        ax.annotate(
+                            mstr,
+                            xy=(x, y),
+                            xytext=(dx, dy),
+                            textcoords="offset points",
+                            fontsize=8,
+                            color=color,
+                        )
+                    )
+                _resolve_label_overlaps(fig, ax, labels)
+                ax.set_xlabel("平均ターンオーバー（%）")
+                ax.set_ylabel("CVaR(95%)（%）")
+                ax.set_title("売買量と下方リスク（CVaR）の関係")
+                fig.tight_layout()
+                fig.savefig(bias_fig_dir / "turnover_vs_cvar_scatter.png")
+                plt.close(fig)
+
+        # RMSE vs CVaR scatter (predictive fit ≠ decision quality)
+        if "rmse" in plot_df.columns and "cvar_95" in plot_df.columns:
+            fig, ax = plt.subplots(figsize=(7.2, 5.2))
+            labels = []
+            for model, row in plot_df.iterrows():
+                mstr = str(model)
+                if _should_skip_scatter(mstr):
+                    continue
+                x = _maybe_float(row.get("rmse", np.nan))
+                y = _maybe_float(row.get("cvar_95", np.nan))
+                if not (np.isfinite(x) and np.isfinite(y)):
+                    continue
+                color = palette.get(mstr, "tab:blue")
+                ax.scatter(x, y, color=color, s=46, edgecolors="white", linewidths=0.8, zorder=3)
+                dx, dy = label_offsets[len(labels) % len(label_offsets)]
+                labels.append(
+                    ax.annotate(
+                        mstr,
+                        xy=(x, y),
+                        xytext=(dx, dy),
+                        textcoords="offset points",
+                        fontsize=8,
+                        color=color,
+                    )
+                )
+            _resolve_label_overlaps(fig, ax, labels)
+            ax.set_xlabel("アウトオブサンプル RMSE（全観測: 資産×時点）")
+            ax.set_ylabel("CVaR(95%)（%）")
+            ax.set_title("予測誤差と下方リスク（CVaR）の関係")
+            fig.tight_layout()
+            fig.savefig(bias_fig_dir / "rmse_vs_cvar_scatter.png")
+            plt.close(fig)
+
+        # Decision Sensitivity Plot:
+        # x = |predicted return|, y = |portfolio contribution| = |w * realized return|
+        # This is per-(model,ticker,date) point cloud.
+        try:
+            needed = {"pred_ret", "real_ret", "weight", "model"}
+            if needed.issubset(df.columns):
+                dd = df.copy()
+                dd["pred_ret"] = pd.to_numeric(dd["pred_ret"], errors="coerce")
+                dd["real_ret"] = pd.to_numeric(dd["real_ret"], errors="coerce")
+                dd["weight"] = pd.to_numeric(dd["weight"], errors="coerce")
+                dd = dd.dropna(subset=["pred_ret", "real_ret", "weight", "model"])
+                if not dd.empty:
+                    dd["abs_pred"] = dd["pred_ret"].abs()
+                    dd["abs_contrib"] = (dd["weight"] * dd["real_ret"]).abs()
+
+                    fig, ax = plt.subplots(figsize=(7.6, 5.4))
+                    # Cap points per model for readability.
+                    max_points_per_model = 8000
+                    for model_name, sub in dd.groupby("model"):
+                        mstr = str(model_name)
+                        if _should_skip_scatter(mstr):
+                            continue
+                        if len(sub) > max_points_per_model:
+                            sub = sub.sample(n=max_points_per_model, random_state=0)
+                        color = palette.get(mstr, "tab:blue")
+                        ax.scatter(
+                            sub["abs_pred"].to_numpy(),
+                            sub["abs_contrib"].to_numpy(),
+                            s=8,
+                            alpha=0.18,
+                            color=color,
+                            edgecolors="none",
+                            label=mstr,
+                        )
+                    ax.set_xlabel(r"$|\\hat r|$（予測リターンの絶対値）")
+                    ax.set_ylabel(r"$|w\\times r|$（寄与の絶対値）")
+                    ax.set_title("意思決定感度プロット（予測の強さに対する反応）")
+                    ax.grid(alpha=0.2)
+                    # Keep legend compact: sort and limit columns
+                    handles, labels = ax.get_legend_handles_labels()
+                    if handles:
+                        ax.legend(
+                            handles,
+                            labels,
+                            loc="upper right",
+                            frameon=True,
+                            fontsize=8,
+                            ncol=1,
+                        )
+                    fig.tight_layout()
+                    fig.savefig(bias_fig_dir / "decision_sensitivity_scatter.png")
+                    plt.close(fig)
+        except Exception:
+            pass
 
     # Bias-related analyses
     df["bias"] = df["pred_ret"] - df["real_ret"]
@@ -2523,11 +2877,14 @@ def export_dataframe_table_png(
     title: str = "",
     float_digits: int = 3,
     float_digits_by_col: Optional[Dict[str, int]] = None,
+    formatters_by_col: Optional[Dict[str, Any]] = None,
     max_rows: int | None = None,
     max_cols: int | None = None,
     highlight_top_k: int = 0,
     lower_is_better_cols: Sequence[str] = (),
     exclude_highlight_cols: Sequence[str] = (),
+    exclude_highlight_rows_by_col: Optional[Dict[str, Sequence[str]]] = None,
+    row_id_col: str = "model",
     highlight_truthy_cells: bool = False,
     truthy_cell_color: str = "#b7f7c1",
 ) -> None:
@@ -2545,8 +2902,16 @@ def export_dataframe_table_png(
         df_disp = df_disp.iloc[:max_rows, :]
 
     digits_map = {str(k): int(v) for k, v in (float_digits_by_col or {}).items()}
+    fmt_map = {str(k): v for k, v in (formatters_by_col or {}).items()}
 
     def _fmt_cell(x: object, col: str) -> str:
+        custom = fmt_map.get(str(col))
+        if custom is not None:
+            try:
+                return str(custom(x))
+            except Exception:
+                # Fallback to default formatting
+                pass
         use_digits = digits_map.get(str(col), int(float_digits))
         if x is None or (isinstance(x, float) and not np.isfinite(x)):
             return ""
@@ -2649,6 +3014,10 @@ def export_dataframe_table_png(
         k = int(highlight_top_k)
         lib_cols = {str(c) for c in lower_is_better_cols}
         excl_cols = {str(c) for c in exclude_highlight_cols}
+        excl_rows_map: Dict[str, set[str]] = {
+            str(col): {str(v) for v in vals}
+            for col, vals in (exclude_highlight_rows_by_col or {}).items()
+        }
         # best1/best2/best3
         highlight_colors = ["#b7f7c1", "#fff3b0", "#ffd6a5"]
 
@@ -2659,6 +3028,16 @@ def export_dataframe_table_png(
             # Try numeric conversion.
             series = pd.to_numeric(df_num[col_name], errors="coerce")
             finite = series[np.isfinite(series.to_numpy(dtype=float))]
+            if finite.empty:
+                continue
+            # Optional: exclude certain rows (by row_id_col) from the ranking for this column.
+            excluded_rows = excl_rows_map.get(col_key)
+            if excluded_rows and row_id_col in df_disp.columns:
+                try:
+                    mask_excl = df_disp[row_id_col].astype(str).isin(excluded_rows)
+                    finite = finite[~mask_excl]
+                except Exception:
+                    pass
             if finite.empty:
                 continue
             if col_key in {"n_retrain", "n_invest_steps"}:
@@ -2709,11 +3088,14 @@ def export_csv_table_png(
     title: str = "",
     float_digits: int = 3,
     float_digits_by_col: Optional[Dict[str, int]] = None,
+    formatters_by_col: Optional[Dict[str, Any]] = None,
     max_rows: int | None = None,
     max_cols: int | None = None,
     highlight_top_k: int = 0,
     lower_is_better_cols: Sequence[str] = (),
     exclude_highlight_cols: Sequence[str] = (),
+    exclude_highlight_rows_by_col: Optional[Dict[str, Sequence[str]]] = None,
+    row_id_col: str = "model",
     highlight_truthy_cells: bool = False,
     truthy_cell_color: str = "#b7f7c1",
 ) -> None:
@@ -2729,11 +3111,14 @@ def export_csv_table_png(
         title=title,
         float_digits=float_digits,
         float_digits_by_col=float_digits_by_col,
+        formatters_by_col=formatters_by_col,
         max_rows=max_rows,
         max_cols=max_cols,
         highlight_top_k=highlight_top_k,
         lower_is_better_cols=lower_is_better_cols,
         exclude_highlight_cols=exclude_highlight_cols,
+        exclude_highlight_rows_by_col=exclude_highlight_rows_by_col,
+        row_id_col=row_id_col,
         highlight_truthy_cells=highlight_truthy_cells,
         truthy_cell_color=truthy_cell_color,
     )
@@ -2762,6 +3147,7 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
         # cost / trading intensity
         "avg_turnover",
         "avg_trading_cost",
+        "total_trading_cost",
         # prediction loss
         "mse",
         "rmse",
@@ -2782,9 +3168,26 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
                 "r2": 6,
                 "rmse": 6,
                 "avg_trading_cost": 6,
+                "total_trading_cost": 6,
             }
+            import math
+
+            def _fmt_sci_scaled(x: object) -> str:
+                try:
+                    v = float(x)
+                except Exception:
+                    return ""
+                if not np.isfinite(v):
+                    return ""
+                if v == 0.0:
+                    return "0"
+                exp = int(math.floor(math.log10(abs(v))))
+                mant = v / (10.0 ** exp)
+                return f"{mant:.2f}×10^{exp}"
+
+            formatters_by_col = {"r2": _fmt_sci_scaled}
             # Hide columns that are not helpful for quick visual inspection.
-            drop_cols = {"n_retrain", "n_invest_steps", "trading_cost_bps"}
+            drop_cols = {"n_retrain", "n_invest_steps", "trading_cost_bps", "avg_trading_cost_mean", "avg_trading_cost_means"}
             try:
                 df = pd.read_csv(src)
             except Exception:
@@ -2795,21 +3198,43 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
                     df = df[df["model"].astype(str) != "DFL-QCQP-ens"]
                 if "model_dfl" in df.columns:
                     df = df[df["model_dfl"].astype(str) != "DFL-QCQP-ens"]
+                # For significance summaries, also omit comparisons *against* the ensemble
+                # (e.g., DFL-QCQP-dual/kkt vs DFL-QCQP-ens) to avoid redundant rows in PNGs.
+                if "model_other" in df.columns:
+                    df = df[df["model_other"].astype(str) != "DFL-QCQP-ens"]
                 if "DFLモデル" in df.columns:
                     df = df[df["DFLモデル"].astype(str) != "DFL-QCQP-ens"]
+                if "比較モデル" in df.columns:
+                    df = df[df["比較モデル"].astype(str) != "DFL-QCQP-ens"]
                 keep = [c for c in df.columns if str(c) not in drop_cols]
                 df = df[keep]
+                # For 1-summary.csv, hide cost-related columns (use 1-summary_cost.csv for those).
+                if name == "1-summary.csv":
+                    cost_cols = {"avg_turnover", "avg_trading_cost", "avg_trading_cost_mean", "avg_trading_cost_means"}
+                    keep2 = [c for c in df.columns if str(c) not in cost_cols]
+                    df = df[keep2]
+                # Rename for clarity: avg_trading_cost is total trading cost over the full period.
+                if "avg_trading_cost" in df.columns:
+                    df = df.rename(columns={"avg_trading_cost": "total_trading_cost"})
+
+                bench_models = {"1/N", "TSMOM (SPY)", "TSMOM(SPY)", "Buy&Hold(SPY)", "Buy&Hold SPY"}
+                exclude_rows_by_col = {
+                    "avg_turnover": bench_models,
+                    "total_trading_cost": bench_models,
+                }
                 export_dataframe_table_png(
                     df,
                     dst,
                     title=name,
                     float_digits=2,
                     float_digits_by_col=digits_by_col,
+                    formatters_by_col=formatters_by_col,
                     max_rows=200,
                     max_cols=40,
                     highlight_top_k=highlight,
                     lower_is_better_cols=lower_is_better,
                     highlight_truthy_cells=truthy,
+                    exclude_highlight_rows_by_col=exclude_rows_by_col,
                 )
                 continue
             export_csv_table_png(
@@ -2818,11 +3243,13 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
                 title=name,
                 float_digits=2,
                 float_digits_by_col=digits_by_col,
+                formatters_by_col=formatters_by_col,
                 max_rows=200,
                 max_cols=40,
                 highlight_top_k=highlight,
                 lower_is_better_cols=lower_is_better,
                 highlight_truthy_cells=truthy,
+                exclude_highlight_rows_by_col={"avg_turnover": {"1/N", "TSMOM (SPY)", "TSMOM(SPY)", "Buy&Hold(SPY)", "Buy&Hold SPY"}, "avg_trading_cost": {"1/N", "TSMOM (SPY)", "TSMOM(SPY)", "Buy&Hold(SPY)", "Buy&Hold SPY"}},
             )
 
 
