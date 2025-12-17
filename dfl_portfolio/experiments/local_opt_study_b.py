@@ -1098,10 +1098,10 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 python -m dfl_portfolio.experiments.local_opt_study_b \
   --b-target "dual,kkt,ipo-grad" \
   --b-process-seed 0 \
-  --b-base-mode init-ipo \
-  -b-theta-init-base-mode-local ipo \
+  --b-base-mode none \
+  --b-theta-init-base-mode-local none \
   --b-init-seeds "0,1,2,3,4,5,6,7,8,9" \
-  --b-init-families "local" \
+  --b-init-families "global" \
   --b-theta-init-radius-local 0.2 \
   --b-theta-init-radius-global 2.0 \
   --b-theta-init-clip-auto

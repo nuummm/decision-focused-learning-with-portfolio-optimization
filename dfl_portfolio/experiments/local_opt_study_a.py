@@ -470,6 +470,17 @@ def build_parser() -> argparse.ArgumentParser:
     # Flex solver
     p.add_argument("--flex-solver", type=str, default="knitro")
     p.add_argument("--flex-maxtime", type=float, default=180.0)
+    p.add_argument(
+        "--flex-aux-init-radius-w",
+        type=float,
+        default=None,
+        help=(
+            "Experiment A (flex only): L2 'radius' for w initialization noise. "
+            "If set, overrides --flex-aux-init-sigma-w via sigma_w = radius_w / sqrt(d), "
+            "where d is the number of assets (simplex dimension). "
+            "Note: actual ||w0-w_base|| depends on simplex projection; diagnostics are logged."
+        ),
+    )
     p.add_argument("--flex-aux-init-sigma-w", type=float, default=0.05)
     p.add_argument("--flex-aux-init-sigma-lam", type=float, default=1e-2)
     p.add_argument("--flex-aux-init-sigma-mu", type=float, default=1e-2)
@@ -558,6 +569,20 @@ def main() -> None:
     if getattr(args, "tee", False):
         print(f"[local-opt-A] a_base_mode={base_cfg['a_base_mode']}")
 
+    # Resolve aux init noise scale for w in a more interpretable way (radius overrides sigma).
+    # radius_w is defined on the *pre-projection* Gaussian noise:
+    #   eta ~ N(0, sigma_w^2 I_d)  =>  E||eta||_2 ≈ sigma_w * sqrt(d)
+    # so we map: sigma_w := radius_w / sqrt(d).
+    n_assets = int(getattr(bundle.dataset.Y, "shape", (0, 0))[1] or 0)
+    sigma_w = float(args.flex_aux_init_sigma_w)
+    if args.flex_aux_init_radius_w is not None:
+        radius = float(args.flex_aux_init_radius_w)
+        if not np.isfinite(radius) or radius < 0.0:
+            raise ValueError("--flex-aux-init-radius-w must be a finite non-negative float.")
+        if n_assets <= 0:
+            raise ValueError("Cannot resolve --flex-aux-init-radius-w: n_assets is unknown/invalid.")
+        sigma_w = radius / float(np.sqrt(n_assets))
+
     # Options
     flex_base_options: Dict[str, Any] = {
         # keep theta fixed across seeds; controlled by --a-base-mode
@@ -567,7 +592,7 @@ def main() -> None:
         "lambda_theta_iso": float(base_cfg["flex_lambda_theta_iso"]),
         "w_warmstart": bool(getattr(args, "w_warmstart", True)),
         "aux_init_mode": "random",
-        "aux_init_sigma_w": float(args.flex_aux_init_sigma_w),
+        "aux_init_sigma_w": float(sigma_w),
         "aux_init_sigma_lam": float(args.flex_aux_init_sigma_lam),
         "aux_init_sigma_mu": float(args.flex_aux_init_sigma_mu),
         # Preserve randomized (w/lam/mu) initial values to probe local optima in Experiment A.
@@ -737,9 +762,11 @@ def main() -> None:
         _plot_flex_solver_status_bars(runs_df, analysis_fig / "flex_solver_status_counts.png")
         _plot_flex_elapsed_bars(runs_df, analysis_fig / "flex_elapsed_fit_time_mean.png")
 
-    # Save config
+    # Save config (include derived sigma used for w-aux init)
     cfg = vars(args).copy()
     cfg["seeds"] = seeds
+    cfg["flex_aux_init_sigma_w_used"] = float(sigma_w)
+    cfg["n_assets"] = int(n_assets)
     (analysis_csv / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"[local-opt-A] finished. outputs -> {outdir}")
@@ -754,5 +781,13 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.local_opt_study_a \
   --a-base-mode "init-ipo" \
+  --flex-aux-init-radius-w 0.1 \
   --seeds "0,1,2,3,4,5,6,7,8,9" \
+
+# 補助変数（w）の揺らぎ強度は、次のどちらでも指定できます（radius が優先）：
+# - --flex-aux-init-radius-w R : 事前（射影前）ガウスノイズの「目安半径」R（L2）
+# - --flex-aux-init-sigma-w σ : 各成分の標準偏差 σ
+# 変換は R ≈ σ * sqrt(d)（d=資産数）を用います。
+# ※ 実際の ||w0-w_base|| は simplex 射影の影響で変わるため、
+#    run のメタ情報（aux_w0_minus_base_l1/l2_mean/std）で実測値を保存しています。
 """

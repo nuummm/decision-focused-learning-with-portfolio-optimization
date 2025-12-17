@@ -899,6 +899,7 @@ def run_rolling_experiment(
     from dfl_portfolio.real_data.reporting import compute_cvar
 
     cvar_95 = compute_cvar(returns, alpha=0.05)
+    cvar_95_net = compute_cvar(returns_net, alpha=0.05)
 
     # 決定係数 R^2（資産リターン予測の当てはまり）
     r2: float = float("nan")
@@ -939,9 +940,11 @@ def run_rolling_experiment(
         "sharpe_net": sharpe_net,
         "sortino_net": sortino_net,
         "cvar_95": cvar_95,
+        "cvar_95_net": cvar_95_net,
         "r2": r2,
         "rmse": rmse,
         "max_drawdown": max_drawdown(wealth_values),
+        "max_drawdown_net": max_drawdown(wealth_net_values),
         "terminal_wealth": terminal_wealth,
         "terminal_wealth_net": terminal_wealth_net,
         "total_return": total_return,
@@ -1844,7 +1847,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --models "ols,ipo,ipo_grad,spo_plus,flex" \
   --flex-solver knitro \
   --flex-formulation 'dual,kkt,dual&kkt' \
-  --lambda-theta-anchor 0.0 \
+  --lambda-theta-anchor 10.0 \
   --theta-anchor-mode ipo \
   --theta-init-mode none \
   --ipo-grad-seed 0 \

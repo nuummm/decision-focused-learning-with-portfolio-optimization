@@ -2200,16 +2200,30 @@ def run_mse_and_bias_analysis(
     # MSE by model
     df["err2"] = (df["pred_ret"] - df["real_ret"]) ** 2
     mse_df = df.groupby("model")["err2"].mean().to_frame("mse")
-    # Sharpe from 1-summary.csv
+    # Sharpe from 1-summary.csv (gross) and 1-summary_cost.csv (net, if available)
     summary_path = Path(analysis_csv_dir) / "1-summary.csv"
+    summary_cost_path = Path(analysis_csv_dir) / "1-summary_cost.csv"
     if not summary_path.exists():
         return
     summary = pd.read_csv(summary_path)
     if "model" not in summary.columns:
         return
     summary = summary.set_index("model")
+    summary_cost: Optional[pd.DataFrame] = None
+    if summary_cost_path.exists():
+        try:
+            tmp = pd.read_csv(summary_cost_path)
+            if "model" in tmp.columns:
+                summary_cost = tmp.set_index("model")
+        except Exception:
+            summary_cost = None
     # left join にして、1/N など「MSE を持たない」ベンチマークも残す
     plot_df = summary.join(mse_df, how="left")
+    plot_df_cost = (
+        summary_cost.join(mse_df, how="left")
+        if isinstance(summary_cost, pd.DataFrame)
+        else None
+    )
     # RMSE: if not already present in 1-summary.csv, derive from MSE.
     if "rmse" not in plot_df.columns and "mse" in plot_df.columns:
         plot_df["rmse"] = pd.to_numeric(plot_df["mse"], errors="coerce").map(
@@ -2398,14 +2412,19 @@ def run_mse_and_bias_analysis(
 
         if "avg_turnover" in plot_df.columns:
             # 1-summary.csv の avg_turnover は format_summary_for_output で % 表示（100倍）済み。
+            use_cost_view = isinstance(plot_df_cost, pd.DataFrame)
+            use_df = plot_df_cost if use_cost_view else plot_df
+            sharpe_col = "sharpe_net" if "sharpe_net" in use_df.columns else "sharpe"
+            cvar_col = "cvar_95_net" if "cvar_95_net" in use_df.columns else "cvar_95"
+
             fig, ax = plt.subplots(figsize=(7.2, 5.2))
             labels = []
-            for model, row in plot_df.iterrows():
+            for model, row in use_df.iterrows():
                 mstr = str(model)
                 if _should_skip_scatter(mstr):
                     continue
                 x = _maybe_float(row.get("avg_turnover", np.nan))
-                y = _maybe_float(row.get("sharpe", np.nan))
+                y = _maybe_float(row.get(sharpe_col, np.nan))
                 if not (np.isfinite(x) and np.isfinite(y)):
                     continue
                 color = palette.get(mstr, "tab:blue")
@@ -2423,21 +2442,29 @@ def run_mse_and_bias_analysis(
                 )
             _resolve_label_overlaps(fig, ax, labels)
             ax.set_xlabel("平均ターンオーバー（%）")
-            ax.set_ylabel("シャープレシオ（年率換算）")
-            ax.set_title("売買量とリスク調整後リターンの関係")
+            ax.set_ylabel(
+                "シャープレシオ（取引コスト控除後, 年率換算）"
+                if use_cost_view
+                else "シャープレシオ（年率換算）"
+            )
+            ax.set_title(
+                "売買量とリスク調整後リターンの関係（取引コスト控除後）"
+                if use_cost_view
+                else "売買量とリスク調整後リターンの関係"
+            )
             fig.tight_layout()
             fig.savefig(bias_fig_dir / "turnover_vs_sharpe_scatter.png")
             plt.close(fig)
 
-            if "cvar_95" in plot_df.columns:
+            if cvar_col in use_df.columns:
                 fig, ax = plt.subplots(figsize=(7.2, 5.2))
                 labels = []
-                for model, row in plot_df.iterrows():
+                for model, row in use_df.iterrows():
                     mstr = str(model)
                     if _should_skip_scatter(mstr):
                         continue
                     x = _maybe_float(row.get("avg_turnover", np.nan))
-                    y = _maybe_float(row.get("cvar_95", np.nan))
+                    y = _maybe_float(row.get(cvar_col, np.nan))
                     if not (np.isfinite(x) and np.isfinite(y)):
                         continue
                     color = palette.get(mstr, "tab:blue")
@@ -2455,8 +2482,16 @@ def run_mse_and_bias_analysis(
                     )
                 _resolve_label_overlaps(fig, ax, labels)
                 ax.set_xlabel("平均ターンオーバー（%）")
-                ax.set_ylabel("CVaR(95%)（%）")
-                ax.set_title("売買量と下方リスク（CVaR）の関係")
+                ax.set_ylabel(
+                    "CVaR(95%)（取引コスト控除後, %）"
+                    if use_cost_view
+                    else "CVaR(95%)（%）"
+                )
+                ax.set_title(
+                    "売買量と下方リスク（CVaR）の関係（取引コスト控除後）"
+                    if use_cost_view
+                    else "売買量と下方リスク（CVaR）の関係"
+                )
                 fig.tight_layout()
                 fig.savefig(bias_fig_dir / "turnover_vs_cvar_scatter.png")
                 plt.close(fig)
