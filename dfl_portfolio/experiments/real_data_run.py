@@ -111,7 +111,7 @@ PREFERRED_MODEL_ORDER = [
     "DFL-QCQP-ens",
     "SPO+",
     "IPO-GRAD",
-    "IPO-analytic",
+    "DFL-CF",
     "OLS",
     "Buy&Hold SPY",
     "1/N",
@@ -652,13 +652,8 @@ def run_rolling_experiment(
                 "rebalance_date": bundle.dataset.timestamps[item.rebalance_idx].isoformat(),
                 "train_start": item.train_start,
                 "train_end": item.train_end,
-                # Pyomo solver info (flex): keep both raw and string forms for post-hoc analysis
                 "solver_status": (info or {}).get("status", ""),
-                "solver_status_str": (info or {}).get("status_str", ""),
-                # Keep legacy column name `solver_term` but store the string form
-                "solver_term": (info or {}).get("termination_condition_str", ""),
-                "solver_message": (info or {}).get("message", ""),
-                "solver_time": (info or {}).get("solver_time", float("nan")),
+                "solver_term": (info or {}).get("termination_condition", ""),
                 "elapsed_sec": elapsed,
                 "train_eq_viol_max": (info or {}).get("eq_viol_max", float("nan")),
                 "train_ineq_viol_max": (info or {}).get("ineq_viol_max", float("nan")),
@@ -1864,7 +1859,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --benchmarks "spy,1/n,tsmom_spy" \
   --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
-  --jobs 1 \
+  --jobs 4 \
   --debug-roll
 
 

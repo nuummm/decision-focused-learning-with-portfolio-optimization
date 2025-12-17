@@ -41,7 +41,7 @@ WEIGHT_PLOT_MAX_POINTS = 60
 # 表示用のモデル名マッピング
 _MODEL_DISPLAY_MAP = {
     "ols": "OLS",
-    "ipo": "IPO-analytic",
+    "ipo": "DFL-CF",
     "ipo_grad": "IPO-GRAD",
     "spo_plus": "SPO+",
     "flex": "DFL-QCQP",
@@ -113,7 +113,7 @@ PREFERRED_MODEL_ORDER = [
     "DFL-QCQP-ens",
     "SPO+",
     "IPO-GRAD",
-    "IPO-analytic",
+    "DFL-CF",
     "OLS",
     "Buy&Hold SPY",
     "1/N",
@@ -491,7 +491,7 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         "DFL-QCQP-ens",
         "SPO+",
         "IPO-GRAD",
-        "IPO-analytic",
+        "DFL-CF",
         "OLS",
         "Buy&Hold SPY",
         "1/N",
@@ -2304,6 +2304,8 @@ def run_mse_and_bias_analysis(
             out.setdefault(display_model_name(internal_key), color)
             out.setdefault(str(internal_key), color)
         # Common display-name aliases
+        out.setdefault("DFL-CF", MODEL_COLOR_MAP.get("ipo", "tab:orange"))
+        # Backward-compatible alias (older outputs)
         out.setdefault("IPO-analytic", MODEL_COLOR_MAP.get("ipo", "tab:orange"))
         out.setdefault("IPO-GRAD", MODEL_COLOR_MAP.get("ipo_grad", "tab:brown"))
         out.setdefault("SPO+", MODEL_COLOR_MAP.get("spo_plus", "tab:cyan"))
