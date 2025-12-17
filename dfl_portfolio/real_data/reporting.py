@@ -1277,6 +1277,66 @@ def plot_condition_numbers(step_df: pd.DataFrame, path: Path, *, max_points: int
     plt.close(fig)
 
 
+def plot_drawdown_curves(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
+    """Plot drawdown curves (wealth / cummax(wealth) - 1) for multiple models."""
+    if plt is None or not wealth_dict:
+        return
+    series_by_model: Dict[str, pd.DataFrame] = {}
+    for model_key, wdf in wealth_dict.items():
+        if wdf is None or wdf.empty:
+            continue
+        df = wdf.copy()
+        if not {"date", "wealth"}.issubset(df.columns):
+            continue
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["wealth"] = pd.to_numeric(df["wealth"], errors="coerce")
+        df = df.dropna(subset=["date", "wealth"]).sort_values("date")
+        if df.empty:
+            continue
+        # If multiple rows per date exist, keep the last (after-step).
+        df = df.groupby("date", as_index=False).last()
+        w = df["wealth"].to_numpy(dtype=float)
+        peak = np.maximum.accumulate(w)
+        peak = np.maximum(peak, 1e-12)
+        dd = (w / peak) - 1.0
+        disp = display_model_name(model_key)
+        series_by_model[disp] = pd.DataFrame({"date": df["date"], "drawdown": dd})
+
+    if not series_by_model:
+        return
+
+    # Palette keyed by display name for consistency.
+    palette: Dict[str, str] = {}
+    for internal_key, color in MODEL_COLOR_MAP.items():
+        palette.setdefault(display_model_name(internal_key), color)
+        palette.setdefault(str(internal_key), color)
+
+    fig, ax = plt.subplots(figsize=(10.5, 4.2))
+    for model, df in series_by_model.items():
+        sub = df.dropna(subset=["date", "drawdown"])
+        if sub.empty:
+            continue
+        color = palette.get(str(model), "tab:blue")
+        linestyle = ":" if "ens" in str(model).lower() else "-"
+        ax.plot(sub["date"], sub["drawdown"] * 100.0, label=str(model), color=color, lw=1.3, linestyle=linestyle)
+
+    # Crisis windows background (reuse PERIOD_WINDOWS)
+    for _, start, end in PERIOD_WINDOWS:
+        ax.axvspan(pd.Timestamp(start), pd.Timestamp(end), color="grey", alpha=0.12)
+
+    ax.set_xlabel("日付")
+    ax.set_ylabel("ドローダウン（%）")
+    ax.set_title("ドローダウン推移（モデル別）")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="lower left", frameon=True, fontsize=8)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+
+
 def plot_flex_solver_debug(df: pd.DataFrame, path: Path) -> None:
     """Visualize flex solver behavior over time (per rebalance).
 
@@ -3243,9 +3303,10 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
                     df = df[df["比較モデル"].astype(str) != "DFL-QCQP-ens"]
                 keep = [c for c in df.columns if str(c) not in drop_cols]
                 df = df[keep]
-                # For 1-summary.csv, hide cost-related columns (use 1-summary_cost.csv for those).
+                # For 1-summary.csv, hide *trading cost* columns (use 1-summary_cost.csv for those),
+                # but keep turnover so we can discuss trading intensity vs performance.
                 if name == "1-summary.csv":
-                    cost_cols = {"avg_turnover", "avg_trading_cost", "avg_trading_cost_mean", "avg_trading_cost_means"}
+                    cost_cols = {"avg_trading_cost", "avg_trading_cost_mean", "avg_trading_cost_means"}
                     keep2 = [c for c in df.columns if str(c) not in cost_cols]
                     df = df[keep2]
                 # Rename for clarity: avg_trading_cost is total trading cost over the full period.
@@ -3253,10 +3314,7 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
                     df = df.rename(columns={"avg_trading_cost": "total_trading_cost"})
 
                 bench_models = {"1/N", "TSMOM (SPY)", "TSMOM(SPY)", "Buy&Hold(SPY)", "Buy&Hold SPY"}
-                exclude_rows_by_col = {
-                    "avg_turnover": bench_models,
-                    "total_trading_cost": bench_models,
-                }
+                exclude_rows_by_col = {"avg_turnover": bench_models, "total_trading_cost": bench_models}
                 export_dataframe_table_png(
                     df,
                     dst,

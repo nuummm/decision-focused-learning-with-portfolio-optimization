@@ -64,6 +64,7 @@ from dfl_portfolio.real_data.reporting import (
     plot_flex_solver_debug,
     plot_solver_summary_bars,
     plot_multi_wealth,
+    plot_drawdown_curves,
     plot_time_series,
     plot_wealth_correlation_heatmap,
     plot_wealth_curve,
@@ -651,8 +652,13 @@ def run_rolling_experiment(
                 "rebalance_date": bundle.dataset.timestamps[item.rebalance_idx].isoformat(),
                 "train_start": item.train_start,
                 "train_end": item.train_end,
+                # Pyomo solver info (flex): keep both raw and string forms for post-hoc analysis
                 "solver_status": (info or {}).get("status", ""),
-                "solver_term": (info or {}).get("termination_condition", ""),
+                "solver_status_str": (info or {}).get("status_str", ""),
+                # Keep legacy column name `solver_term` but store the string form
+                "solver_term": (info or {}).get("termination_condition_str", ""),
+                "solver_message": (info or {}).get("message", ""),
+                "solver_time": (info or {}).get("solver_time", float("nan")),
                 "elapsed_sec": elapsed,
                 "train_eq_viol_max": (info or {}).get("eq_viol_max", float("nan")),
                 "train_ineq_viol_max": (info or {}).get("ineq_viol_max", float("nan")),
@@ -1525,6 +1531,10 @@ def main() -> None:
                 {m: df for m, df in wealth_dict.items()},
                 analysis_fig_dir / "wealth_comparison.png",
             )
+            plot_drawdown_curves(
+                {m: df for m, df in wealth_dict.items()},
+                analysis_fig_dir / "drawdown_curves.png",
+            )
             wealth_events_base_path = analysis_dir / "wealth_events.png"
             wealth_events_primary_path = analysis_dir / "2-wealth_events.png"
             # 1) 全モデル版（従来どおり）
@@ -1846,8 +1856,8 @@ python -m dfl_portfolio.experiments.real_data_run \
   --delta 0.5 \
   --models "ols,ipo,ipo_grad,spo_plus,flex" \
   --flex-solver knitro \
-  --flex-formulation 'dual,kkt,dual&kkt' \
-  --lambda-theta-anchor 10.0 \
+  --flex-formulation 'dual,kkt' \
+  --lambda-theta-anchor 0.0 \
   --theta-anchor-mode ipo \
   --theta-init-mode none \
   --ipo-grad-seed 0 \
