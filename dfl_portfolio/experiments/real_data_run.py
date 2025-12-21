@@ -1851,12 +1851,12 @@ python -m dfl_portfolio.experiments.real_data_run \
   --delta 0.5 \
   --models "ols,ipo,ipo_grad,spo_plus,flex" \
   --flex-solver knitro \
-  --flex-formulation 'dual,kkt' \
+  --flex-formulation 'kkt' \
   --lambda-theta-anchor 0.0 \
   --theta-anchor-mode ipo \
-  --theta-init-mode none \
+  --theta-init-mode ipo \
   --ipo-grad-seed 0 \
-  --benchmarks "spy,1/n,tsmom_spy" \
+  --benchmarks "spy" \
   --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
   --jobs 4 \

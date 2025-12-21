@@ -103,10 +103,11 @@ def _resolve_a_base_mode(value: str) -> Dict[str, Any]:
       - none:      theta_init=none, theta penalties=0
       - init-ipo:  theta_init=ipo,  theta penalties=0
       - pen-10:    theta_init=none, lambda_theta_anchor=10 with anchor=ipo
+      - pen-10-init-ipo: theta_init=ipo, lambda_theta_anchor=10 with anchor=ipo
     """
     mode = (value or "").strip().lower().replace("_", "-")
-    if mode not in {"none", "init-ipo", "pen-10"}:
-        raise ValueError("--a-base-mode must be one of: none, init-ipo, pen-10")
+    if mode not in {"none", "init-ipo", "pen-10", "pen-10-init-ipo"}:
+        raise ValueError("--a-base-mode must be one of: none, init-ipo, pen-10, pen-10-init-ipo")
     if mode == "none":
         return {
             "a_base_mode": "none",
@@ -127,6 +128,17 @@ def _resolve_a_base_mode(value: str) -> Dict[str, Any]:
             "flex_theta_anchor_mode": "none",
             "ipo_grad_init_mode": "ipo",
             "ipo_grad_lambda_anchor": 0.0,
+            "ipo_grad_theta_anchor_mode": "ipo",
+        }
+    if mode == "pen-10-init-ipo":
+        return {
+            "a_base_mode": "pen-10-init-ipo",
+            "theta_init_mode": "ipo",
+            "flex_lambda_theta_anchor": 10.0,
+            "flex_lambda_theta_iso": 0.0,
+            "flex_theta_anchor_mode": "ipo",
+            "ipo_grad_init_mode": "ipo",
+            "ipo_grad_lambda_anchor": 10.0,
             "ipo_grad_theta_anchor_mode": "ipo",
         }
     # pen-10
@@ -490,8 +502,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--a-base-mode",
         type=str,
         default="init-ipo",
-        choices=["none", "init-ipo", "pen-10"],
-        help="Base preset: none (no init, no theta penalty), init-ipo (IPO init only), pen-10 (anchor penalty=10 with IPO anchor, init none).",
+        choices=["none", "init-ipo", "pen-10", "pen-10-init-ipo"],
+        help=(
+            "Base preset: none (no init, no theta penalty), init-ipo (IPO init only), "
+            "pen-10 (anchor penalty=10 with IPO anchor, init none), "
+            "pen-10-init-ipo (anchor penalty=10 with IPO anchor, init IPO)."
+        ),
+    )
+
+    # Per-model theta init override (takes precedence over --a-base-mode).
+    p.add_argument(
+        "--flex-theta-init-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "ipo", "none"],
+        help=(
+            "Override theta init mode for flex in Experiment A (takes precedence over --a-base-mode). "
+            "'ipo' uses analytic IPO/DFL-CF init, 'none' disables init, 'auto' uses the base preset."
+        ),
+    )
+    p.add_argument(
+        "--ipo-grad-theta-init-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "ipo", "none"],
+        help=(
+            "Override theta init mode for IPO-GRAD in Experiment A (takes precedence over --a-base-mode). "
+            "'ipo' uses analytic IPO/DFL-CF init, 'none' disables init, 'auto' uses the base preset."
+        ),
     )
 
     # IPO-GRAD
@@ -554,7 +592,7 @@ def main() -> None:
 
     # Model specs for A
     models = [
-        ModelSpec(key="flex", label="flex_dual", formulation="dual"),
+        #ModelSpec(key="flex", label="flex_dual", formulation="dual"),
         ModelSpec(key="flex", label="flex_kkt", formulation="kkt"),
         ModelSpec(key="ipo_grad", label="ipo_grad"),
     ]
@@ -568,6 +606,20 @@ def main() -> None:
     base_cfg = _resolve_a_base_mode(getattr(args, "a_base_mode", "init-ipo"))
     if getattr(args, "tee", False):
         print(f"[local-opt-A] a_base_mode={base_cfg['a_base_mode']}")
+
+    flex_theta_init_mode_used = str(base_cfg["theta_init_mode"])
+    if str(getattr(args, "flex_theta_init_mode", "auto")).lower() != "auto":
+        flex_theta_init_mode_used = str(args.flex_theta_init_mode).lower()
+
+    ipo_grad_theta_init_mode_used = str(base_cfg["ipo_grad_init_mode"])
+    if str(getattr(args, "ipo_grad_theta_init_mode", "auto")).lower() != "auto":
+        ipo_grad_theta_init_mode_used = str(args.ipo_grad_theta_init_mode).lower()
+    if getattr(args, "tee", False):
+        print(
+            "[local-opt-A] theta init modes used: "
+            f"flex={flex_theta_init_mode_used} "
+            f"ipo_grad={ipo_grad_theta_init_mode_used}"
+        )
 
     # Resolve aux init noise scale for w in a more interpretable way (radius overrides sigma).
     # radius_w is defined on the *pre-projection* Gaussian noise:
@@ -586,7 +638,7 @@ def main() -> None:
     # Options
     flex_base_options: Dict[str, Any] = {
         # keep theta fixed across seeds; controlled by --a-base-mode
-        "theta_init_mode": str(base_cfg["theta_init_mode"]),
+        "theta_init_mode": str(flex_theta_init_mode_used),
         "theta_anchor_mode": str(base_cfg["flex_theta_anchor_mode"]),
         "lambda_theta_anchor": float(base_cfg["flex_lambda_theta_anchor"]),
         "lambda_theta_iso": float(base_cfg["flex_lambda_theta_iso"]),
@@ -605,7 +657,7 @@ def main() -> None:
         "ipo_grad_batch_size": int(args.ipo_grad_batch_size),
         "ipo_grad_qp_max_iter": int(args.ipo_grad_qp_max_iter),
         "ipo_grad_qp_tol": float(args.ipo_grad_qp_tol),
-        "ipo_grad_init_mode": str(base_cfg["ipo_grad_init_mode"]),
+        "ipo_grad_init_mode": str(ipo_grad_theta_init_mode_used),
         "ipo_grad_lambda_anchor": float(base_cfg["ipo_grad_lambda_anchor"]),
         "ipo_grad_theta_anchor_mode": str(base_cfg["ipo_grad_theta_anchor_mode"]),
     }
@@ -767,6 +819,8 @@ def main() -> None:
     cfg["seeds"] = seeds
     cfg["flex_aux_init_sigma_w_used"] = float(sigma_w)
     cfg["n_assets"] = int(n_assets)
+    cfg["flex_theta_init_mode_used"] = flex_theta_init_mode_used
+    cfg["ipo_grad_theta_init_mode_used"] = ipo_grad_theta_init_mode_used
     (analysis_csv / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"[local-opt-A] finished. outputs -> {outdir}")

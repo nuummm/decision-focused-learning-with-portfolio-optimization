@@ -94,10 +94,11 @@ def _resolve_b_base_mode(value: str) -> Dict[str, Any]:
       - none:      theta_init=none, theta penalties=0
       - init-ipo:  theta_init=ipo,  theta penalties=0
       - pen-10:    theta_init=none, lambda_theta_anchor=10 with anchor=ipo
+      - pen-10-init-ipo: theta_init=ipo, lambda_theta_anchor=10 with anchor=ipo
     """
     mode = (value or "").strip().lower().replace("_", "-")
-    if mode not in {"none", "init-ipo", "pen-10"}:
-        raise ValueError("--b-base-mode must be one of: none, init-ipo, pen-10")
+    if mode not in {"none", "init-ipo", "pen-10", "pen-10-init-ipo"}:
+        raise ValueError("--b-base-mode must be one of: none, init-ipo, pen-10, pen-10-init-ipo")
 
     if mode == "none":
         return {
@@ -117,6 +118,16 @@ def _resolve_b_base_mode(value: str) -> Dict[str, Any]:
             "flex_lambda_theta_iso": 0.0,
             "flex_theta_anchor_mode": "none",
             "ipo_grad_lambda_anchor": 0.0,
+            "ipo_grad_theta_anchor_mode": "ipo",
+        }
+    if mode == "pen-10-init-ipo":
+        return {
+            "b_base_mode": "pen-10-init-ipo",
+            "theta_base_init_mode": "ipo",
+            "flex_lambda_theta_anchor": 10.0,
+            "flex_lambda_theta_iso": 0.0,
+            "flex_theta_anchor_mode": "ipo",
+            "ipo_grad_lambda_anchor": 10.0,
             "ipo_grad_theta_anchor_mode": "ipo",
         }
     # pen-10
@@ -597,8 +608,12 @@ def main() -> None:
         "--b-base-mode",
         type=str,
         default="init-ipo",
-        choices=["none", "init-ipo", "pen-10"],
-        help="Base preset: none (no init, no theta penalty), init-ipo (IPO init only), pen-10 (anchor penalty=10 with IPO anchor, init none).",
+        choices=["none", "init-ipo", "pen-10", "pen-10-init-ipo"],
+        help=(
+            "Base preset: none (no init, no theta penalty), init-ipo (IPO init only), "
+            "pen-10 (anchor penalty=10 with IPO anchor, init none), "
+            "pen-10-init-ipo (anchor penalty=10 with IPO anchor, init IPO)."
+        ),
     )
     parser.add_argument(
         "--b-theta-init-base-mode-local",
@@ -1096,12 +1111,12 @@ if __name__ == "__main__":  # pragma: no cover
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.local_opt_study_b \
-  --b-target "dual,kkt,ipo-grad" \
+  --b-target "kkt,ipo-grad" \
   --b-process-seed 0 \
-  --b-base-mode none \
-  --b-theta-init-base-mode-local none \
+  --b-base-mode pen-10 \
+  --b-theta-init-base-mode-local ipo \
   --b-init-seeds "0,1,2,3,4,5,6,7,8,9" \
-  --b-init-families "global" \
+  --b-init-families "local" \
   --b-theta-init-radius-local 0.2 \
   --b-theta-init-radius-global 2.0 \
   --b-theta-init-clip-auto

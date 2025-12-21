@@ -1670,13 +1670,24 @@ def plot_solver_summary_bars(rebalance_df: pd.DataFrame, out_dir: Path) -> None:
     if any(arr.size for arr in elapsed_data):
         fig, ax = plt.subplots(figsize=(7.2, 4.2))
         colors = [MODEL_COLOR_MAP.get(m, "tab:gray") for m in models]
-        box = ax.boxplot(
-            elapsed_data,
-            tick_labels=[display_names[m] for m in models],
-            patch_artist=True,
-            showfliers=True,
-            widths=0.55,
-        )
+        tick_text = [display_names[m] for m in models]
+        # Matplotlib<3.9 uses 'labels'; Matplotlib>=3.9 uses 'tick_labels'.
+        try:
+            box = ax.boxplot(
+                elapsed_data,
+                tick_labels=tick_text,
+                patch_artist=True,
+                showfliers=True,
+                widths=0.55,
+            )
+        except TypeError:  # pragma: no cover
+            box = ax.boxplot(
+                elapsed_data,
+                labels=tick_text,
+                patch_artist=True,
+                showfliers=True,
+                widths=0.55,
+            )
         for patch, c in zip(box.get("boxes", []), colors):
             patch.set_facecolor(c)
             patch.set_alpha(0.75)
@@ -2193,7 +2204,7 @@ def run_concentration_analysis(
     if plt is None:
         return
 
-    # 一枚の図に 3 つの指標を並べて表示
+    # 一枚の図に 3 つの指標を並べて表示（平均を棒グラフで表示）
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharex=True)
     if len(axes.shape) == 0:  # pragma: no cover - defensive
         axes = [axes]
@@ -2216,7 +2227,7 @@ def run_concentration_analysis(
     # cap frequency
     ax = axes[2]
     ax.bar(x, conc_df["cap_hit_freq"], color=bar_colors)
-    ax.set_ylabel("最大ウェイトが0.95以上となる頻度")
+    ax.set_ylabel(f"最大ウェイトが{CAP_THRESH:.2f}以上となる頻度")
     ax.set_title("ウェイト集中度の頻度")
 
     for ax in axes:
