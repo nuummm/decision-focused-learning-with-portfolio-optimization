@@ -1111,13 +1111,13 @@ if __name__ == "__main__":  # pragma: no cover
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.local_opt_study_b \
-  --b-target "kkt,ipo-grad" \
+  --b-target "kkt" \
   --b-process-seed 0 \
-  --b-base-mode pen-10 \
+  --b-base-mode ipo-none \
   --b-theta-init-base-mode-local ipo \
   --b-init-seeds "0,1,2,3,4,5,6,7,8,9" \
   --b-init-families "local" \
-  --b-theta-init-radius-local 0.2 \
+  --b-theta-init-radius-local 0.15 \
   --b-theta-init-radius-global 2.0 \
   --b-theta-init-clip-auto
 

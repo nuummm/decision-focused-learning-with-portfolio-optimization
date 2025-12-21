@@ -40,14 +40,16 @@ WEIGHT_PLOT_MAX_POINTS = 60
 
 # 表示用のモデル名マッピング
 _MODEL_DISPLAY_MAP = {
-    "ols": "OLS",
+    # Prediction-focused learning (PFL)
+    "ols": "PFL",
     "ipo": "DFL-CF",
     "ipo_grad": "IPO-GRAD",
     "spo_plus": "SPO+",
     "flex": "DFL-QCQP",
-    "flex_dual": "DFL-QCQP-dual",
-    "flex_kkt": "DFL-QCQP-kkt",
-    "flex_dual_kkt_ens": "DFL-QCQP-ens",
+    # 提案手法（定式化）
+    "flex_dual": "DFL-OPT-D",
+    "flex_kkt": "DFL-OPT-K",
+    "flex_dual_kkt_ens": "DFL-OPT-ENS",
     "benchmark_equal_weight": "1/N",
     "benchmark_tsmom_spy": "TSMOM (SPY)",
 }
@@ -108,16 +110,16 @@ ASSET_COLOR_SEQUENCE = [
 
 # 表示用の並び順（summary と統一）
 PREFERRED_MODEL_ORDER = [
-    "DFL-QCQP-dual",
-    "DFL-QCQP-kkt",
-    "DFL-QCQP-ens",
-    "SPO+",
-    "IPO-GRAD",
+    "DFL-OPT-K",
+    "DFL-OPT-D",
     "DFL-CF",
-    "OLS",
-    "Buy&Hold SPY",
+    "IPO-GRAD",
+    "SPO+",
+    "PFL",
+    "Buy&Hold",
     "1/N",
     "TSMOM (SPY)",
+    "DFL-OPT-ENS",
 ]
 
 
@@ -167,8 +169,24 @@ def display_model_name(model: str) -> str:
     # ベンチマークティッカー系: benchmark_SPY → Buy&Hold SPY
     if name.startswith("benchmark_") and name != "benchmark_equal_weight":
         ticker = name[len("benchmark_") :]
+        if ticker == "SPY":
+            return "Buy&Hold"
         return f"Buy&Hold {ticker}"
     return name
+
+
+def _apply_sorted_legend(ax) -> None:
+    """PREFERRED_MODEL_ORDER に従って凡例を並べ替える（表示名ベース）。"""
+    handles, labels = ax.get_legend_handles_labels()
+    seen: Dict[str, Any] = {}
+    for h, l in zip(handles, labels):
+        if l not in seen:
+            seen[l] = h
+    order_map = {name: idx for idx, name in enumerate(PREFERRED_MODEL_ORDER)}
+    sorted_items = sorted(seen.items(), key=lambda kv: order_map.get(kv[0], len(order_map)))
+    uniq_labels = [k for k, _ in sorted_items]
+    uniq_handles = [v for _, v in sorted_items]
+    ax.legend(uniq_handles, uniq_labels, loc="upper left")
 
 
 def _compute_steps_per_year(dates: Sequence[pd.Timestamp], n_steps: int) -> float:
@@ -726,7 +744,7 @@ def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
     if not all_dates.empty:
         ax = plt.gca()
         _add_range_markers(ax, all_dates.min(), all_dates.max())
-    plt.legend()
+    _apply_sorted_legend(plt.gca())
     plt.tight_layout()
     fig_path = path
     if path.name == "wealth_comparison.png":
@@ -758,17 +776,7 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
     plt.xlabel("日付")
     plt.ylabel("累積リターン")
     plt.title(f"累積リターン {title_range}".strip())
-    # 凡例をモデル順で並べ替え
-    handles, labels = plt.gca().get_legend_handles_labels()
-    seen = {}
-    for h, l in zip(handles, labels):
-        if l not in seen:
-            seen[l] = h
-    order_map = {name: idx for idx, name in enumerate(PREFERRED_MODEL_ORDER)}
-    sorted_items = sorted(seen.items(), key=lambda kv: order_map.get(kv[0], len(order_map)))
-    uniq_labels = [k for k, _ in sorted_items]
-    uniq_handles = [v for _, v in sorted_items]
-    plt.legend(uniq_handles, uniq_labels, loc="upper left")
+    _apply_sorted_legend(plt.gca())
     plt.tight_layout()
     fig_path = path
     if path.name == "wealth_events.png":
@@ -2675,7 +2683,12 @@ def run_mse_and_bias_analysis(
         try:
             plt.figure(figsize=(8, 5))
             # 各モデルごとに Down（赤）/Up（緑）の箱ひげを並べる
-            models_order = sorted(df["model"].unique(), key=lambda m: PREFERRED_MODEL_ORDER.index(m) if m in PREFERRED_MODEL_ORDER else len(PREFERRED_MODEL_ORDER))
+            models_order = sorted(
+                df["model"].unique(),
+                key=lambda m: PREFERRED_MODEL_ORDER.index(display_model_name(m))
+                if display_model_name(m) in PREFERRED_MODEL_ORDER
+                else len(PREFERRED_MODEL_ORDER),
+            )
             positions: List[float] = []
             data: List[np.ndarray] = []
             colors: List[str] = []
@@ -2768,8 +2781,8 @@ def run_mse_and_bias_analysis(
             # 各モデルごとに OUT/IN の箱ひげを並べる（summary と同じモデル順）
             models_order = sorted(
                 df["model"].unique(),
-                key=lambda m: PREFERRED_MODEL_ORDER.index(m)
-                if m in PREFERRED_MODEL_ORDER
+                key=lambda m: PREFERRED_MODEL_ORDER.index(display_model_name(m))
+                if display_model_name(m) in PREFERRED_MODEL_ORDER
                 else len(PREFERRED_MODEL_ORDER),
             )
             positions: List[float] = []

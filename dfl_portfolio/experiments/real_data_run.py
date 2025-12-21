@@ -1842,7 +1842,7 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.real_data_run \
   --tickers "SPY,GLD,EEM,TLT" \
-  --start 2006-01-01 --end 2025-12-01 \
+  --start 2006-01-01 --end 2025-12-31 \
   --momentum-window 26 \
   --cov-window 13 \
   --cov-method oas \
@@ -1856,7 +1856,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --theta-anchor-mode ipo \
   --theta-init-mode ipo \
   --ipo-grad-seed 0 \
-  --benchmarks "spy" \
+  --benchmarks "spy,1/n" \
   --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
   --jobs 4 \
