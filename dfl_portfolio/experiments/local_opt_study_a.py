@@ -433,7 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seeds", type=str, default="0,1,2,3,4,5,6,7,8,9")
     p.add_argument("--tickers", type=str, default="SPY,GLD,EEM,TLT")
     p.add_argument("--start", type=str, default="2006-01-01")
-    p.add_argument("--end", type=str, default="2025-12-01")
+    p.add_argument("--end", type=str, default="2025-12-31")
     p.add_argument("--interval", type=str, default="1d")
     p.add_argument("--price-field", type=str, default="Close")
     p.add_argument("--return-kind", type=str, default="log", choices=["simple", "log"])
@@ -835,7 +835,8 @@ cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio 
 
 python -m dfl_portfolio.experiments.local_opt_study_a \
   --a-base-mode "init-ipo" \
-  --flex-aux-init-radius-w 0.1 \
+  --flex-aux-init-radius-w 0.15 \
+  --flex-theta-init-mode "ipo" \
   --seeds "0,1,2,3,4,5,6,7,8,9" \
 
 # 補助変数（w）の揺らぎ強度は、次のどちらでも指定できます（radius が優先）：

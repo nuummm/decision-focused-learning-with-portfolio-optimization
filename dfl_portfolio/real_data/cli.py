@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Real-data rolling experiment runner")
     parser.add_argument("--tickers", type=str, default="SPY,GLD,EEM,TLT")
     parser.add_argument("--start", type=str, default="2006-01-01")
-    parser.add_argument("--end", type=str, default="2025-12-01")
+    parser.add_argument("--end", type=str, default="2025-12-31")
     parser.add_argument("--interval", type=str, default="1d")
     parser.add_argument("--price-field", type=str, default="Close")
     parser.add_argument("--return-kind", type=str, default="log", choices=["simple", "log"])
@@ -216,7 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--flex-formulation",
         type=str,
-        default="dual,kkt,dual&kkt",
+        default="kkt",
         help=(
             "Comma-separated flex base models to run "
             "(e.g., 'dual', 'dual,kkt', or 'dual,kkt,dual&kkt' for dual/kkt+ensemble)."
@@ -225,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flex-lambda-theta-anchor", type=float, default=0.0)
     parser.add_argument("--flex-lambda-theta-iso", type=float, default=0.0)
     parser.add_argument("--flex-theta-anchor-mode", type=str, default="ipo")
-    parser.add_argument("--flex-theta-init-mode", type=str, default="none")
+    parser.add_argument("--flex-theta-init-mode", type=str, default="ipo")
     parser.add_argument(
         "--flex-ensemble-weight-dual",
         type=parse_delta_0_1,
@@ -294,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ipo-grad-init-mode",
         type=str,
-        default="none",
+        default="ipo",
         choices=["none", "ipo"],
         help="Initial theta for IPO-GRAD (none=zero init, ipo=closed-form IPO warm start).",
     )
@@ -322,7 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ipo-grad-seed",
         type=int,
-        default=None,
+        default=0,
         help=(
             "Override the base seed used to derive IPO-GRAD's per-cycle RNG seed. "
             "When omitted, IPO-GRAD uses --base-seed like other models."
@@ -409,7 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--benchmarks",
         type=str,
-        default="",
+        default="spy,1/n",
         help=(
             "Comma-separated benchmark list (spy,equal_weight,1/n,tsmom_spy). "
             "Empty string falls back to legacy flags."
@@ -419,7 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--jobs",
         type=int,
-        default=0,
+        default=4,
         help=(
             "Number of parallel jobs for model groups (0 = auto based on selected models). "
             "Groups are: (ols+ipo), (ipo_grad), (spo_plus), (flex: dual/kkt)."

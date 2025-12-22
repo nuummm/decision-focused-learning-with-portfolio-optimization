@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import argparse
 import math
 import os
+import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -11,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Avoid GUI backends and OpenMP SHM issues; must be set before importing numpy/scipy.
 os.environ.setdefault("MPLBACKEND", "Agg")
-os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.getenv("TMPDIR", "/tmp"), "mplconfig"))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.getenv("TMPDIR", "/tmp"), f"mplconfig_{os.getpid()}"))
 os.environ.setdefault("KMP_USE_SHM", "0")
 
 import numpy as np
@@ -29,6 +31,17 @@ RESULTS_BASE = PROJECT_ROOT / "results"
 RESULTS_ROOT = RESULTS_BASE / "exp_localopt_B"
 
 
+def _json_default(obj: object) -> object:
+    """Make best-effort JSON for config dumps (Path/NumPy/etc)."""
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
+
 def _parse_int_list(value: str) -> List[int]:
     text = (value or "").strip()
     if not text:
@@ -40,6 +53,44 @@ def _parse_int_list(value: str) -> List[int]:
             continue
         out.append(int(tok))
     return out
+
+
+def _parse_str_list(value: str) -> List[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    return [t for t in (s.strip() for s in parse_commalist(raw)) if t]
+
+
+def _parse_float_list(value: str) -> List[float]:
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    out: List[float] = []
+    for tok in (s.strip() for s in parse_commalist(raw)):
+        if not tok:
+            continue
+        out.append(float(tok))
+    return out
+
+
+def _slugify_token(text: str) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return "none"
+    s = s.replace(" ", "")
+    s = s.replace("/", "-").replace("\\", "-")
+    s = s.replace(",", "_")
+    s = s.replace("=", "-")
+    s = s.replace(":", "-")
+    return s
+
+
+def _format_radius_token(value: Optional[float]) -> str:
+    if value is None:
+        return "none"
+    s = f"{float(value):.6g}"
+    return s.replace(".", "p").replace("-", "m")
 
 
 def _parse_b_targets(value: str) -> Tuple[List[str], bool]:
@@ -93,12 +144,16 @@ def _resolve_b_base_mode(value: str) -> Dict[str, Any]:
     Modes:
       - none:      theta_init=none, theta penalties=0
       - init-ipo:  theta_init=ipo,  theta penalties=0
+      - pen-5:     theta_init=none, lambda_theta_anchor=5 with anchor=ipo
+      - pen-5-init-ipo: theta_init=ipo, lambda_theta_anchor=5 with anchor=ipo
       - pen-10:    theta_init=none, lambda_theta_anchor=10 with anchor=ipo
       - pen-10-init-ipo: theta_init=ipo, lambda_theta_anchor=10 with anchor=ipo
     """
     mode = (value or "").strip().lower().replace("_", "-")
-    if mode not in {"none", "init-ipo", "pen-10", "pen-10-init-ipo"}:
-        raise ValueError("--b-base-mode must be one of: none, init-ipo, pen-10, pen-10-init-ipo")
+    if mode not in {"none", "init-ipo", "pen-5", "pen-5-init-ipo", "pen-10", "pen-10-init-ipo"}:
+        raise ValueError(
+            "--b-base-mode must be one of: none, init-ipo, pen-5, pen-5-init-ipo, pen-10, pen-10-init-ipo"
+        )
 
     if mode == "none":
         return {
@@ -128,6 +183,26 @@ def _resolve_b_base_mode(value: str) -> Dict[str, Any]:
             "flex_lambda_theta_iso": 0.0,
             "flex_theta_anchor_mode": "ipo",
             "ipo_grad_lambda_anchor": 10.0,
+            "ipo_grad_theta_anchor_mode": "ipo",
+        }
+    if mode == "pen-5-init-ipo":
+        return {
+            "b_base_mode": "pen-5-init-ipo",
+            "theta_base_init_mode": "ipo",
+            "flex_lambda_theta_anchor": 5.0,
+            "flex_lambda_theta_iso": 0.0,
+            "flex_theta_anchor_mode": "ipo",
+            "ipo_grad_lambda_anchor": 5.0,
+            "ipo_grad_theta_anchor_mode": "ipo",
+        }
+    if mode == "pen-5":
+        return {
+            "b_base_mode": "pen-5",
+            "theta_base_init_mode": "none",
+            "flex_lambda_theta_anchor": 5.0,
+            "flex_lambda_theta_iso": 0.0,
+            "flex_theta_anchor_mode": "ipo",
+            "ipo_grad_lambda_anchor": 5.0,
             "ipo_grad_theta_anchor_mode": "ipo",
         }
     # pen-10
@@ -296,7 +371,11 @@ def _plot_elapsed_time_boxplot(runs_df: pd.DataFrame, out_dir: Path) -> None:
             continue
         labels = sorted(part["model_label"].unique().tolist())
         data = [part.loc[part["model_label"] == lab, "elapsed_total_run_sec"].astype(float).to_numpy() for lab in labels]
-        ax.boxplot(data, tick_labels=labels, showfliers=False)
+        # Matplotlib<3.9 uses 'labels'; Matplotlib>=3.9 uses 'tick_labels'.
+        try:
+            ax.boxplot(data, tick_labels=labels, showfliers=False)
+        except TypeError:  # pragma: no cover
+            ax.boxplot(data, labels=labels, showfliers=False)
         # base points (single runs) as markers
         base = runs_df[runs_df["init_family"] == "base"]
         for i, lab in enumerate(labels, start=1):
@@ -608,9 +687,11 @@ def main() -> None:
         "--b-base-mode",
         type=str,
         default="init-ipo",
-        choices=["none", "init-ipo", "pen-10", "pen-10-init-ipo"],
         help=(
-            "Base preset: none (no init, no theta penalty), init-ipo (IPO init only), "
+            "Base preset (single token) OR comma-separated list. Allowed: "
+            "none (no init, no theta penalty), init-ipo (IPO init only), "
+            "pen-5 (anchor penalty=5 with IPO anchor, init none), "
+            "pen-5-init-ipo (anchor penalty=5 with IPO anchor, init IPO), "
             "pen-10 (anchor penalty=10 with IPO anchor, init none), "
             "pen-10-init-ipo (anchor penalty=10 with IPO anchor, init IPO)."
         ),
@@ -631,21 +712,23 @@ def main() -> None:
     parser.add_argument("--b-theta-init-sigma-global", type=float, default=0.3)
     parser.add_argument(
         "--b-theta-init-radius-local",
-        type=float,
+        type=str,
         default=None,
         help=(
             "Override local init noise scale by specifying an approximate L2 radius r, "
-            "where ||eta||_2 ≈ r. Internally converted to sigma=r/sqrt(d). "
+            "where ||eta||_2 ≈ r. You can pass a single value OR a comma-separated list. "
+            "Internally converted to sigma=r/sqrt(d). "
             "When set, overrides --b-theta-init-sigma-local."
         ),
     )
     parser.add_argument(
         "--b-theta-init-radius-global",
-        type=float,
+        type=str,
         default=None,
         help=(
             "Override global init noise scale by specifying an approximate L2 radius r, "
-            "where ||eta||_2 ≈ r. Internally converted to sigma=r/sqrt(d). "
+            "where ||eta||_2 ≈ r. You can pass a single value OR a comma-separated list. "
+            "Internally converted to sigma=r/sqrt(d). "
             "When set, overrides --b-theta-init-sigma-global."
         ),
     )
@@ -660,8 +743,197 @@ def main() -> None:
         action="store_true",
         help="Show external solver output (Gurobi banner/logs). Default hides these to keep study logs readable.",
     )
+    parser.add_argument(
+        "--n-job",
+        type=int,
+        default=1,
+        help="Number of parallel workers for running base-mode x radius combinations (default: 1).",
+    )
+    parser.add_argument("--b-grid-child", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    # Grid runner: allow running all combinations of base-modes x radius-lists from one command.
+    if not bool(getattr(args, "b_grid_child", False)):
+        base_modes = _parse_str_list(str(getattr(args, "b_base_mode", "") or ""))
+        if not base_modes:
+            base_modes = [str(getattr(args, "b_base_mode", "init-ipo") or "init-ipo").strip().lower()]
+
+        raw_rloc = getattr(args, "b_theta_init_radius_local", None)
+        raw_rglob = getattr(args, "b_theta_init_radius_global", None)
+        r_locals: List[Optional[float]]
+        r_globals: List[Optional[float]]
+        if raw_rloc is None or str(raw_rloc).strip() == "":
+            r_locals = [None]
+        else:
+            r_locals = [float(x) for x in _parse_float_list(str(raw_rloc))]
+        if raw_rglob is None or str(raw_rglob).strip() == "":
+            r_globals = [None]
+        else:
+            r_globals = [float(x) for x in _parse_float_list(str(raw_rglob))]
+
+        is_grid = (len(base_modes) > 1) or (len(r_locals) > 1) or (len(r_globals) > 1)
+        if is_grid:
+            # Validate requested base modes before starting long runs.
+            base_modes = [str(m).strip().lower().replace("_", "-") for m in base_modes if str(m).strip()]
+            for m in base_modes:
+                _resolve_b_base_mode(m)
+
+            max_workers = max(int(getattr(args, "n_job", 1) or 1), 1)
+            umbrella_outdir = make_output_dir(RESULTS_ROOT, args.outdir)
+            umbrella_outdir.mkdir(parents=True, exist_ok=True)
+
+            combos: List[Dict[str, Any]] = []
+            for m in base_modes:
+                for rloc in r_locals:
+                    for rglob in r_globals:
+                        name = (
+                            f"bmode_{_slugify_token(m)}"
+                            f"__rlocal_{_format_radius_token(rloc)}"
+                            f"__rglobal_{_format_radius_token(rglob)}"
+                        )
+                        combos.append(
+                            {
+                                "name": name,
+                                "b_base_mode": m,
+                                "b_theta_init_radius_local": rloc,
+                                "b_theta_init_radius_global": rglob,
+                                "outdir": str(umbrella_outdir / name),
+                            }
+                        )
+            (umbrella_outdir / "combos.json").write_text(
+                json.dumps({"cmd": " ".join(sys.argv), "combos": combos}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            def _strip_flag(argv: List[str], flag: str) -> List[str]:
+                out: List[str] = []
+                i = 0
+                while i < len(argv):
+                    a = argv[i]
+                    if a == flag:
+                        i += 2
+                        continue
+                    if a.startswith(flag + "="):
+                        i += 1
+                        continue
+                    out.append(a)
+                    i += 1
+                return out
+
+            # Base argv: inherit all other CLI args, but replace base-mode/radii/outdir per combo.
+            child_args = sys.argv[1:]
+            for flg in [
+                "--b-base-mode",
+                "--b-theta-init-radius-local",
+                "--b-theta-init-radius-global",
+                "--outdir",
+                "--n-job",
+                "--b-grid-child",
+            ]:
+                child_args = _strip_flag(child_args, flg)
+
+            def _run_one_combo(combo: Dict[str, Any]) -> Dict[str, Any]:
+                import subprocess
+
+                sub_outdir = Path(str(combo["outdir"]))
+                sub_outdir.mkdir(parents=True, exist_ok=True)
+                log_path = sub_outdir / "run.log"
+                status_path = sub_outdir / "status.json"
+                cmd = (
+                    [sys.executable, "-m", "dfl_portfolio.experiments.local_opt_study_b"]
+                    + child_args
+                    + [
+                        "--b-grid-child",
+                        "--b-base-mode",
+                        str(combo["b_base_mode"]),
+                        "--outdir",
+                        str(sub_outdir),
+                    ]
+                )
+                if combo.get("b_theta_init_radius_local", None) is not None:
+                    cmd += ["--b-theta-init-radius-local", str(combo["b_theta_init_radius_local"])]
+                if combo.get("b_theta_init_radius_global", None) is not None:
+                    cmd += ["--b-theta-init-radius-global", str(combo["b_theta_init_radius_global"])]
+
+                start_wall = time.time()
+                status_path.write_text(
+                    json.dumps(
+                        {"name": combo["name"], "cmd": " ".join(cmd), "start_time": start_wall, "state": "running"},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+                start_perf = time.perf_counter()
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write("[cmd]\n" + " ".join(cmd) + "\n\n")
+                    res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, text=True)
+                elapsed = float(time.perf_counter() - start_perf)
+                end_wall = time.time()
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "name": combo["name"],
+                            "cmd": " ".join(cmd),
+                            "start_time": start_wall,
+                            "end_time": end_wall,
+                            "elapsed_sec": elapsed,
+                            "returncode": int(res.returncode),
+                            "state": "done" if int(res.returncode) == 0 else "failed",
+                            "log": str(log_path),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                return {
+                    "name": combo["name"],
+                    "returncode": int(res.returncode),
+                    "outdir": str(sub_outdir),
+                    "log": str(log_path),
+                    "elapsed_sec": elapsed,
+                }
+
+            print(
+                f"[local-opt-B] grid run: combos={len(combos)} max_workers={max_workers} outdir={umbrella_outdir}"
+            )
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            results: List[Dict[str, Any]] = []
+            grid_start = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_run_one_combo, c) for c in combos]
+                total = len(futs)
+                done = 0
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    results.append(r)
+                    done += 1
+                    elapsed_grid = float(time.perf_counter() - grid_start)
+                    per = elapsed_grid / max(done, 1)
+                    eta = per * (total - done)
+                    eta_str = f"{eta/60:.1f}m" if eta >= 60 else f"{eta:.0f}s"
+                    el_str = f"{float(r.get('elapsed_sec', float('nan')))/60:.1f}m"
+                    print(
+                        f"[local-opt-B] combo {done}/{total} done "
+                        f"rc={r['returncode']} elapsed={el_str} eta≈{eta_str} -> {r['outdir']}"
+                    )
+
+            (umbrella_outdir / "combo_results.json").write_text(
+                json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            failed = [r for r in results if int(r.get("returncode", 1)) != 0]
+            if failed:
+                raise RuntimeError(
+                    "Some combos failed:\n"
+                    + "\n".join([f"- {r['name']} rc={r['returncode']} log={r['log']}" for r in failed])
+                )
+            print(f"[local-opt-B] finished all combos. outputs -> {umbrella_outdir}")
+            return
+
     tickers = parse_tickers(args.tickers)
 
     base_delta = float(args.delta)
@@ -1096,7 +1368,10 @@ def main() -> None:
     cfg = vars(args).copy()
     cfg["tickers"] = tickers
     cfg["init_seeds"] = init_seeds
-    (analysis_csv / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    (analysis_csv / "config.json").write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
 
     print(f"[local-opt-B] finished. outputs -> {outdir}")
 
@@ -1111,15 +1386,16 @@ if __name__ == "__main__":  # pragma: no cover
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
 python -m dfl_portfolio.experiments.local_opt_study_b \
+  --start 2016-01-01 --end 2025-12-31 \
   --b-target "kkt" \
   --b-process-seed 0 \
-  --b-base-mode ipo-none \
-  --b-theta-init-base-mode-local ipo \
+  --b-base-mode "none,init-ipo,pen-5-init-ipo" \
   --b-init-seeds "0,1,2,3,4,5,6,7,8,9" \
   --b-init-families "local" \
-  --b-theta-init-radius-local 0.15 \
-  --b-theta-init-radius-global 2.0 \
-  --b-theta-init-clip-auto
+  --b-theta-init-radius-local "0.15,0.3" \
+  --b-theta-init-clip-auto \
+  --n-job 6
+
 
 ※ radius を指定した場合、内部では sigma = radius / sqrt(d) に変換されます。
   （d=4 なら sqrt(d)=2 なので、radius=0.2 → sigma=0.1 と等価）
@@ -1137,7 +1413,10 @@ python -m dfl_portfolio.experiments.local_opt_study_b \
 - --b-base-mode（base run の「初期θ＋θペナルティ」プリセット）
   - none: theta_init=none、θペナルティ=0
   - init-ipo: theta_init=ipo（IPO解析解）、θペナルティ=0
+  - pen-5: theta_init=none、θペナルティ=5（アンカー=ipo）
+  - pen-5-init-ipo: theta_init=ipo（IPO解析解）、θペナルティ=5（アンカー=ipo）
   - pen-10: theta_init=none、θペナルティ=10（アンカー=ipo）
+  - pen-10-init-ipo: theta_init=ipo（IPO解析解）、θペナルティ=10（アンカー=ipo）
 - --b-init-seeds "0..9"
   - ランダム初期θを10種類（同じ seed を全ターゲットで共有）
 - --b-init-families "local,global"

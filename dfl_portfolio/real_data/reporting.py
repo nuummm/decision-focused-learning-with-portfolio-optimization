@@ -85,6 +85,8 @@ MODEL_LINESTYLE_MAP: Dict[str, str] = {
     "benchmark_equal_weight": "-",
 }
 MODEL_LINEWIDTH_MAP: Dict[str, float] = {
+    # 提案手法（KKT）は少しだけ強調して前面に
+    "flex_kkt": 2.6,
     "flex_dual_kkt_ens": 1.8,
 }
 MODEL_ALPHA_MAP: Dict[str, float] = {
@@ -135,6 +137,9 @@ def _model_plot_kwargs(model: str, base_alpha: float = 1.0) -> Dict[str, object]
     linewidth = MODEL_LINEWIDTH_MAP.get(model)
     if linewidth:
         kwargs["linewidth"] = linewidth
+    # 重要なモデルは前面に描画（重なったときに見やすくする）
+    if model == "flex_kkt":
+        kwargs["zorder"] = 10
     alpha = MODEL_ALPHA_MAP.get(model, 1.0) * base_alpha
     if alpha != 1.0:
         kwargs["alpha"] = alpha
@@ -206,8 +211,8 @@ def plot_wealth_curve(dates: Sequence[pd.Timestamp], wealth: Sequence[float], pa
     plt.figure(figsize=(10, 4))
     plt.plot(dates, wealth, label="wealth")
     plt.xlabel("日付")
-    plt.ylabel("累積リターン")
-    plt.title("ポートフォリオ累積リターン")
+    plt.ylabel("累積資産（初期資産=1）")
+    plt.title("累積資産推移")
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -333,7 +338,7 @@ def plot_wealth_correlation_heatmap(corr_df: pd.DataFrame, path: Path) -> None:
     ax.set_xticklabels(corr_df.columns, rotation=45, ha="right")
     ax.set_yticks(range(len(corr_df.index)))
     ax.set_yticklabels(corr_df.index)
-    ax.set_title("累積リターン相関")
+    ax.set_title("累積資産推移の相関")
     for i in range(data.shape[0]):
         for j in range(data.shape[1]):
             ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
@@ -731,14 +736,16 @@ def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
     if plt is None:
         return
     plt.figure(figsize=(10, 4))
-    for model, df in wealth_dict.items():
+    # 描画順は「前面に見せたいもの（DFL-OPT-K）」を最後に描く
+    for model in reversed(_sort_models_for_display(list(wealth_dict.keys()))):
+        df = wealth_dict[model]
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
         kwargs.update(_model_plot_kwargs(model))
         plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
     plt.xlabel("日付")
-    plt.ylabel("累積リターン")
-    plt.title("累積リターン比較")
+    plt.ylabel("累積資産（初期資産=1）")
+    plt.title("累積資産推移の比較")
     # 開始・終了を控えめにマーキング
     all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
     if not all_dates.empty:
@@ -757,7 +764,9 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
     if plt is None:
         return
     plt.figure(figsize=(10, 4))
-    for model, df in wealth_dict.items():
+    # 描画順は「前面に見せたいもの（DFL-OPT-K）」を最後に描く
+    for model in reversed(_sort_models_for_display(list(wealth_dict.keys()))):
+        df = wealth_dict[model]
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
         kwargs.update(_model_plot_kwargs(model))
@@ -774,8 +783,8 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
     else:
         title_range = ""
     plt.xlabel("日付")
-    plt.ylabel("累積リターン")
-    plt.title(f"累積リターン {title_range}".strip())
+    plt.ylabel("累積資産（初期資産=1）")
+    plt.title(f"累積資産推移 2006/01/01 - 2025/12/31")
     _apply_sorted_legend(plt.gca())
     plt.tight_layout()
     fig_path = path
@@ -834,8 +843,8 @@ def plot_wealth_window_normalized(
         return
     plt.axhline(1.0, color="black", linestyle="--", linewidth=0.8, alpha=0.7)
     plt.xlabel("日付")
-    plt.ylabel("累積リターン（開始を1に正規化）")
-    plt.title(f"期間別累積リターン（開始=1）: {period_name}")
+    plt.ylabel("累積資産（初期資産=1）")
+    plt.title(f"期間別累積資産推移）: {period_name}")
     ax = plt.gca()
     _add_range_markers(ax, start_ts, end_ts)
     plt.legend(loc="upper left")

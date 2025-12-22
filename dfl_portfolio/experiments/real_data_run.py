@@ -100,6 +100,15 @@ RESULTS_BASE = PROJECT_ROOT / "results"
 RESULTS_ROOT = RESULTS_BASE / "exp_real_data"
 DEBUG_ROOT = RESULTS_BASE / "debug_outputs"
 
+
+def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 # Suppress Pyomo-related warnings (only show errors)
 logging.getLogger("pyomo").setLevel(logging.ERROR)
 logging.getLogger("pyomo.solvers").setLevel(logging.ERROR)
@@ -1125,9 +1134,40 @@ def main() -> None:
     summary_path = outdir / "experiment_summary.json"
     summary_path.write_text(json.dumps(bundle_summary, ensure_ascii=False, indent=2))
 
+    # ---------------------------------------------------------------------
+    # Data snapshot for reproducibility
+    # ---------------------------------------------------------------------
+    snapshot_records: List[Dict[str, object]] = []
+    try:
+        cache_path = Path(bundle.dataset.fetch_result.cache_path)
+    except Exception:
+        cache_path = None
+
+    if cache_path and cache_path.exists():
+        snapshot_dst = analysis_csv_dir / "price_cache_snapshot.csv"
+        try:
+            shutil.copy2(cache_path, snapshot_dst)
+            snapshot_sha256 = _sha256_file(snapshot_dst)
+            (analysis_csv_dir / "price_cache_snapshot_sha256.txt").write_text(
+                snapshot_sha256 + "\n", encoding="utf-8"
+            )
+            snapshot_records.extend(
+                [
+                    {"parameter": "price_cache_path", "value": str(cache_path)},
+                    {"parameter": "price_cache_snapshot", "value": str(snapshot_dst)},
+                    {"parameter": "price_cache_sha256", "value": snapshot_sha256},
+                ]
+            )
+        except Exception as exc:  # pragma: no cover - best effort
+            snapshot_records.append(
+                {"parameter": "price_cache_snapshot_error", "value": repr(exc)}
+            )
+
     config_records = []
     for key, value in sorted(vars(args).items()):
         config_records.append({"parameter": key, "value": value})
+    if snapshot_records:
+        config_records.extend(snapshot_records)
     config_csv_path = analysis_csv_dir / "2-experiment_config.csv"
     pd.DataFrame(config_records).to_csv(config_csv_path, index=False)
     # Quick access copy under analysis/
@@ -1855,7 +1895,7 @@ python -m dfl_portfolio.experiments.real_data_run \
   --lambda-theta-anchor 0.0 \
   --theta-anchor-mode ipo \
   --theta-init-mode ipo \
-  --ipo-grad-seed 0 \
+  --ipo-grad-seed 42 \
   --benchmarks "spy,1/n" \
   --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
@@ -1867,7 +1907,7 @@ CLI options (defaults follow the parser definitions)
 ---------------------------------------------------
 データ取得・前処理
 - `--tickers` (str, default `SPY,GLD,EEM,TLT`): ティッカーをカンマ区切りで指定。
-- `--start` / `--end` (str, default `2006-01-01` / `2025-12-01`): 取得期間。
+- `--start` / `--end` (str, default `2006-01-01` / `2025-12-31`): 取得期間。
 - `--interval` (str, default `1d`): Yahoo Finance から取得する原系列の足。
 - `--price-field` (str, default `Close`): 使用する価格列。
 - `--return-kind` (str, `simple|log`, default `log`): 目的変数のリターン種別。
@@ -1894,11 +1934,11 @@ CLI options (defaults follow the parser definitions)
 - `--delta-down` (float ∈ [0,1], default `None` → `--delta-up`): DFL 制約で使う δ。
 - `--models` (str, default `ols,ipo,ipo_grad,spo_plus,flex`): 走らせるモデル一覧。
 - `--flex-solver` (str, default `knitro`).
-- `--flex-formulation` (str, default `dual,kkt,dual&kkt`): Flex の定式化。
+- `--flex-formulation` (str, default `kkt`): Flex の定式化。
 - `--flex-ensemble-weight-dual` (float ∈ [0,1], default `0.5`): dual/kkt ensemble の重み。
-- `--theta-init-mode` (str, default `None`): flex/IPO-GRAD 共通の θ 初期化（指定時のみ適用、個別フラグを上書き）。
-- `--lambda-theta-anchor` (float, default `None`): flex/IPO-GRAD 共通の θ アンカー強度（指定時のみ適用、個別フラグを上書き）。
-- `--theta-anchor-mode` (str, default `None`): flex/IPO-GRAD 共通の θ アンカー基準（`ipo|zero|none`、指定時のみ適用、個別フラグを上書き）。
+- `--theta-init-mode` (str, default `ipo`): flex/IPO-GRAD 共通の θ 初期化（指定時のみ適用、個別フラグを上書き）。
+- `--lambda-theta-anchor` (float, default `0.0`): flex/IPO-GRAD 共通の θ アンカー強度（指定時のみ適用、個別フラグを上書き）。
+- `--theta-anchor-mode` (str, default `ipo`): flex/IPO-GRAD 共通の θ アンカー基準（`ipo|zero|none`、指定時のみ適用、個別フラグを上書き）。
 - `--w-warmstart` / `--no-w-warmstart` (bool, default `False`): w の warm-start 有効/無効（現在は flex の初期 w に適用）。
 - `--flex-lambda-theta-anchor` / `--flex-lambda-theta-iso` (float, default `0.0` / `0.0`): θ 罰則。
 - `--flex-theta-anchor-mode` (str, default `ipo`), `--flex-theta-init-mode` (str, default `none`): θ アンカー / 初期化モード。
@@ -1914,7 +1954,7 @@ IPO-GRAD（IPO-NN）設定
 - `--ipo-grad-lambda-anchor` (float, default `0.0`): θ に対する L2 アンカー強度（0 で無効）。
 - `--ipo-grad-theta-anchor-mode` (str, default `ipo`): アンカー基準 (`ipo` 解析解 or `zero`)。
 - `--ipo-grad-debug-kkt`: IPO-GRAD の各リバランスで KKT 条件のデバッグチェックを有効化。
-- `--ipo-grad-seed` (int, default `None` → `--base-seed`): IPO-GRAD 用の seed 上書き（指定時のみ IPO-GRAD のみ別 seed 系列にする）。
+- `--ipo-grad-seed` (int, default `0`): IPO-GRAD 用の seed 上書き（指定時のみ IPO-GRAD のみ別 seed 系列にする）。
 
 SPO+ 設定
 - `--spo-plus-epochs` (int, default `250`): SPO+ の学習エポック数。
@@ -1933,9 +1973,9 @@ SPO+ 設定
 
 実行制御・出力
 - `--tee`: ソルバログを表示。
-- `--jobs` (int, default `0` → 自動): モデルグループ並列実行数。
+- `--jobs` (int, default `4`): モデルグループ並列実行数。
 - `--debug-roll` / `--no-debug-roll`: ローリング進捗ログの表示切替（デフォルト有効）。
-- `--benchmarks` (str, default `""`): 新しいベンチマーク指定（例 `spy,1/n,tsmom_spy`）。空文字のときは従来フラグにフォールバック。
+- `--benchmarks` (str, default `"spy,1/n"`): 新しいベンチマーク指定（例 `spy,1/n,tsmom_spy`）。空文字のときは従来フラグにフォールバック。
 - `--outdir` (Path, default `None` → `results/exp_real_data/<timestamp>` に自動作成)。
 - `--no-debug`: データローダのデバッグログを抑止。
 """
