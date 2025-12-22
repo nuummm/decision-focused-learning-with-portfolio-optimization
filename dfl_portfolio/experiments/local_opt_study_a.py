@@ -554,6 +554,7 @@ def main() -> None:
     raw_asset_costs = parse_trading_cost_map(args.trading_cost_per_asset) if args.trading_cost_per_asset else {}
     asset_cost_overrides_dec = {k.upper(): float(v) / 10000.0 for k, v in raw_asset_costs.items()}
     trading_costs_enabled = bool(asset_cost_overrides_dec)
+    trading_cost_default_bps = 0.0
 
     tickers = parse_tickers(args.tickers)
     loader_cfg = MarketLoaderConfig.for_cli(
@@ -576,7 +577,7 @@ def main() -> None:
         cov_factor_shrinkage=args.cov_factor_shrinkage,
         cov_ewma_alpha=args.cov_ewma_alpha,
         auto_adjust=not args.no_auto_adjust,
-        cache_dir=None,
+        cache_dir=getattr(args, "cache_dir", None),
         force_refresh=args.force_refresh,
         debug=False,
         train_window=args.train_window,
@@ -701,6 +702,7 @@ def main() -> None:
                 delta_up=float(args.delta_up),
                 delta_down_candidates=[float(args.delta_down)],
                 trading_cost_enabled=trading_costs_enabled,
+                trading_cost_default_bps=trading_cost_default_bps,
                 asset_cost_overrides=asset_cost_overrides_dec,
                 solver_spec=solver_spec,
                 flex_options=flex_options,

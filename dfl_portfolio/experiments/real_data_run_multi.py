@@ -407,7 +407,7 @@ def main() -> None:
         cov_factor_shrinkage=args.cov_factor_shrinkage,
         cov_ewma_alpha=getattr(args, "cov_ewma_alpha", 0.94),
         auto_adjust=not args.no_auto_adjust,
-        cache_dir=None,
+        cache_dir=getattr(args, "cache_dir", None),
         force_refresh=args.force_refresh,
         debug=not args.no_debug,
         train_window=args.train_window,

@@ -503,6 +503,7 @@ def run_rolling_experiment(
     delta_up: float,
     delta_down_candidates: Sequence[float],
     trading_cost_enabled: bool,
+    trading_cost_default_bps: float,
     asset_cost_overrides: Dict[str, float] | None,
     solver_spec: SolverSpec,
     flex_options: Dict[str, Any] | None,
@@ -536,6 +537,7 @@ def run_rolling_experiment(
         tickers,
         asset_cost_overrides or {},
         enable_default_costs=trading_cost_enabled,
+        default_bps_if_missing=trading_cost_default_bps,
     )
     costs_active = bool(np.any(asset_cost_rates > 0.0))
     cost_label_entries: List[str] = []
@@ -1067,6 +1069,7 @@ def main() -> None:
     delta_up = float(delta_up_list[0])
     delta_down_list = _parse_delta_list(cli_delta_down, delta_up, allow_multiple=True)
     trading_costs_enabled = float(getattr(args, "trading_cost_bps", 0.0)) > 0.0
+    trading_cost_default_bps = float(getattr(args, "trading_cost_bps", 0.0) or 0.0)
     raw_asset_costs: Dict[str, float] = getattr(args, "trading_cost_per_asset", {}) or {}
     asset_cost_overrides_dec = {
         ticker.upper(): max(float(rate), 0.0) / 10000.0 for ticker, rate in raw_asset_costs.items()
@@ -1108,7 +1111,7 @@ def main() -> None:
         cov_factor_shrinkage=args.cov_factor_shrinkage,
         cov_ewma_alpha=getattr(args, "cov_ewma_alpha", 0.94),
         auto_adjust=not args.no_auto_adjust,
-        cache_dir=None,
+        cache_dir=getattr(args, "cache_dir", None),
         force_refresh=args.force_refresh,
         debug=not args.no_debug,
         train_window=args.train_window,
@@ -1373,6 +1376,7 @@ def main() -> None:
                 delta_up=delta_up,
                 delta_down_candidates=delta_down_list,
                 trading_cost_enabled=trading_costs_enabled,
+                trading_cost_default_bps=trading_cost_default_bps,
                 asset_cost_overrides=asset_cost_overrides_dec,
                 solver_spec=solver_spec,
                 flex_options=flex_options,

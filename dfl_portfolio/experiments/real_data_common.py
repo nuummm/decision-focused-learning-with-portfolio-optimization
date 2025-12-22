@@ -32,8 +32,15 @@ def mvo_cost(z: np.ndarray, y: np.ndarray, V: np.ndarray, delta: float = 1.0) ->
 DEFAULT_TRADING_COST_BPS: Dict[str, float] = {
     "SPY": 5.0,
     "TLT": 5.0,
+    "IEF": 5.0,
     "GLD": 10.0,
     "EEM": 10.0,
+    "DBC": 10.0,
+    "LQD": 5.0,
+    "HYG": 10.0,
+    "VNQ": 10.0,
+    "IWM": 10.0,
+    "EFA": 10.0,
     "EURUSD=X": 2.0,
 }
 DEFAULT_TRADING_COST_RATES: Dict[str, float] = {
@@ -46,9 +53,12 @@ def resolve_trading_cost_rates(
     overrides: Dict[str, float] | None,
     *,
     enable_default_costs: bool,
+    default_bps_if_missing: float | None = None,
 ) -> np.ndarray:
     """Return per-asset trading cost rates (decimal) with safety checks."""
     overrides_upper = {str(k).upper(): float(v) for k, v in (overrides or {}).items()}
+    default_bps = float(default_bps_if_missing) if default_bps_if_missing is not None else 0.0
+    default_rate = default_bps / 10000.0 if default_bps > 0.0 else 0.0
     rates: List[float] = []
     for ticker in tickers:
         key = ticker.upper()
@@ -57,11 +67,16 @@ def resolve_trading_cost_rates(
             continue
         if enable_default_costs:
             if key not in DEFAULT_TRADING_COST_RATES:
-                raise ValueError(
-                    f"Trading cost is enabled but ticker '{ticker}' has no default cost entry. "
-                    "Specify the cost via --trading-cost-per-asset."
-                )
-            rates.append(DEFAULT_TRADING_COST_RATES[key])
+                if default_rate > 0.0:
+                    rates.append(default_rate)
+                else:
+                    raise ValueError(
+                        f"Trading cost is enabled but ticker '{ticker}' has no default cost entry. "
+                        "Specify the cost via --trading-cost-per-asset (or set --trading-cost-bps > 0 "
+                        "to use it as a fallback for unknown tickers)."
+                    )
+            else:
+                rates.append(DEFAULT_TRADING_COST_RATES[key])
         else:
             rates.append(0.0)
     return np.asarray(rates, dtype=float)

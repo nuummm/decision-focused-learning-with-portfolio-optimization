@@ -978,7 +978,7 @@ def main() -> None:
         cov_factor_shrinkage=args.cov_factor_shrinkage,
         cov_ewma_alpha=args.cov_ewma_alpha,
         auto_adjust=not args.no_auto_adjust,
-        cache_dir=None,
+        cache_dir=getattr(args, "cache_dir", None),
         force_refresh=args.force_refresh,
         debug=False,
         train_window=args.train_window,
@@ -1005,7 +1005,8 @@ def main() -> None:
     asset_cost_overrides_dec = {
         ticker.upper(): max(float(rate), 0.0) / 10000.0 for ticker, rate in raw_asset_costs.items()
     }
-    trading_costs_enabled = float(getattr(args, "trading_cost_bps", 0.0)) > 0.0 or bool(asset_cost_overrides_dec)
+    trading_cost_default_bps = float(getattr(args, "trading_cost_bps", 0.0) or 0.0)
+    trading_costs_enabled = trading_cost_default_bps > 0.0 or bool(asset_cost_overrides_dec)
 
     # Formulations to test
     formulations, include_ipo_grad = _parse_b_targets(getattr(args, "b_target", "dual,kkt,ipo_grad"))
@@ -1156,6 +1157,7 @@ def main() -> None:
                     delta_up=delta_up,
                     delta_down_candidates=[delta_down],
                     trading_cost_enabled=trading_costs_enabled,
+                    trading_cost_default_bps=trading_cost_default_bps,
                     asset_cost_overrides=asset_cost_overrides_dec,
                     solver_spec=ipo_grad_solver_spec if is_ipo_grad else solver_spec,
                     flex_options=flex_options,
@@ -1183,6 +1185,7 @@ def main() -> None:
                 delta_up=delta_up,
                 delta_down_candidates=[delta_down],
                 trading_cost_enabled=trading_costs_enabled,
+                trading_cost_default_bps=trading_cost_default_bps,
                 asset_cost_overrides=asset_cost_overrides_dec,
                 solver_spec=ipo_grad_solver_spec if is_ipo_grad else solver_spec,
                 flex_options=flex_options,

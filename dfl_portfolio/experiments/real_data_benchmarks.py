@@ -266,6 +266,7 @@ def run_benchmark_suite(
         tickers,
         asset_cost_overrides,
         enable_default_costs=trading_costs_enabled,
+        default_bps_if_missing=float(getattr(args, "trading_cost_bps", 0.0) or 0.0),
     )
     mean_cost_bps = float(np.mean(trading_cost_rates) * 10000.0) if trading_costs_enabled else 0.0
 

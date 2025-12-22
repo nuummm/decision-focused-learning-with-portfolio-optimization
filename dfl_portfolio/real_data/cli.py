@@ -126,6 +126,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cov-factor-shrinkage", type=float, default=0.5)
     parser.add_argument("--no-auto-adjust", action="store_true")
     parser.add_argument("--force-refresh", action="store_true")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional cache directory for downloaded Yahoo price data. "
+            "When omitted, the default cache location is used. "
+            "Each ticker set creates its own cache file, so existing caches are preserved."
+        ),
+    )
 
     parser.add_argument("--train-window", type=int, default=26)
     parser.add_argument("--rebal-interval", type=int, default=4)
@@ -252,7 +262,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Set to a positive value to enable the built-in per-asset trading cost table "
             "(values expressed in basis points). "
-            "Specify --trading-cost-per-asset for custom overrides."
+            "Specify --trading-cost-per-asset for custom overrides. "
+            "If an unknown ticker appears, this value is used as a fallback cost (bps)."
         ),
     )
     parser.add_argument(
