@@ -1112,6 +1112,8 @@ def main() -> None:
         cov_ewma_alpha=getattr(args, "cov_ewma_alpha", 0.94),
         auto_adjust=not args.no_auto_adjust,
         cache_dir=getattr(args, "cache_dir", None),
+        cache_readonly=getattr(args, "cache_readonly", False),
+        freeze_default_cache=getattr(args, "freeze_default_cache", True),
         force_refresh=args.force_refresh,
         debug=not args.no_debug,
         train_window=args.train_window,
@@ -1901,12 +1903,12 @@ python -m dfl_portfolio.experiments.real_data_run \
   --theta-init-mode ipo \
   --ipo-grad-seed 42 \
   --benchmarks "spy,1/n" \
-  --trading-cost-bps 1 \
-  --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
-  --jobs 4 \
+  --jobs 1 \
   --debug-roll
 
-
+  --trading-cost-bps 1 \
+  --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \
+  
 CLI options (defaults follow the parser definitions)
 ---------------------------------------------------
 データ取得・前処理

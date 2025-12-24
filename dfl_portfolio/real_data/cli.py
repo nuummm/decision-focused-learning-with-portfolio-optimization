@@ -136,6 +136,25 @@ def build_parser() -> argparse.ArgumentParser:
             "Each ticker set creates its own cache file, so existing caches are preserved."
         ),
     )
+    parser.add_argument(
+        "--cache-readonly",
+        action="store_true",
+        default=False,
+        help=(
+            "Do not write/extend the price cache file. "
+            "If the required date range is not already covered by the cache, the run fails."
+        ),
+    )
+    parser.add_argument(
+        "--no-freeze-default-cache",
+        dest="freeze_default_cache",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the built-in frozen cache for the default 4 tickers (SPY,GLD,EEM,TLT). "
+            "By default, those tickers use a read-only frozen cache to keep results stable."
+        ),
+    )
 
     parser.add_argument("--train-window", type=int, default=26)
     parser.add_argument("--rebal-interval", type=int, default=4)

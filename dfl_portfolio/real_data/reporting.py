@@ -742,10 +742,10 @@ def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
         display_label = display_model_name(model)
         kwargs = {"label": display_label}
         kwargs.update(_model_plot_kwargs(model))
-        plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
+    plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
     plt.xlabel("日付")
     plt.ylabel("累積資産（初期資産=1）")
-    plt.title("累積資産推移の比較")
+    plt.title("累積資産推移の比較 2006-01-01 ~ 2025-12-31")
     # 開始・終了を控えめにマーキング
     all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
     if not all_dates.empty:

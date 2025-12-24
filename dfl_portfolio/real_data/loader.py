@@ -14,6 +14,9 @@ from .covariance import CovarianceStats, estimate_shrinkage_covariances
 ReturnKind = Literal["simple", "log"]
 FrequencyKind = Literal["daily", "weekly", "monthly"]
 
+DEFAULT_FROZEN_CACHE = Path(__file__).resolve().parent / "frozen_cache"
+DEFAULT_FROZEN_TICKERS = {"SPY", "GLD", "EEM", "TLT"}
+
 
 @dataclass
 class MarketLoaderConfig:
@@ -46,6 +49,8 @@ class MarketLoaderConfig:
     cov_factor_shrinkage: float = 0.5
     auto_adjust: bool = True
     cache_dir: Optional[Path] = None
+    cache_readonly: bool = False
+    freeze_default_cache: bool = True
     force_refresh: bool = False
     debug: bool = True
 
@@ -59,7 +64,18 @@ class MarketLoaderConfig:
         **kwargs,
     ) -> "MarketLoaderConfig":
         tickers_list = [t.strip().upper() for t in tickers if t.strip()]
-        return cls(tickers=tickers_list, start=start, end=end, **kwargs)
+        cfg = cls(tickers=tickers_list, start=start, end=end, **kwargs)
+
+        if (
+            cfg.freeze_default_cache
+            and cfg.cache_dir is None
+            and not cfg.force_refresh
+            and set(cfg.tickers) == DEFAULT_FROZEN_TICKERS
+        ):
+            cfg.cache_dir = DEFAULT_FROZEN_CACHE
+            cfg.cache_readonly = True
+
+        return cfg
 
 
 @dataclass
@@ -171,6 +187,7 @@ def load_market_dataset(config: MarketLoaderConfig) -> MarketDataset:
         interval=config.interval,
         auto_adjust=config.auto_adjust,
         cache_dir=config.cache_dir,
+        cache_readonly=config.cache_readonly,
         force_refresh=config.force_refresh,
         debug=config.debug,
     )

@@ -182,6 +182,7 @@ def fetch_yahoo_prices(
     interval: str = "1d",
     auto_adjust: bool = True,
     cache_dir: Path | None = None,
+    cache_readonly: bool = False,
     force_refresh: bool = False,
     debug: bool = True,
 ) -> Tuple[pd.DataFrame, FetchResult]:
@@ -201,13 +202,23 @@ def fetch_yahoo_prices(
         raise ValueError("end は start より後の日付を指定してください。")
 
     cache_root = cache_dir or DEFAULT_CACHE
-    cache_root.mkdir(parents=True, exist_ok=True)
+    if cache_readonly:
+        if not cache_root.exists():
+            raise FileNotFoundError(
+                f"cache-dir '{cache_root}' does not exist (cache is read-only). "
+                "Disable --cache-readonly or provide an existing --cache-dir."
+            )
+    else:
+        cache_root.mkdir(parents=True, exist_ok=True)
 
     cache_name = _cache_name(ticker_list, start_dt, interval=interval, auto_adjust=auto_adjust)
     cache_path = cache_root / cache_name
 
     # 既存キャッシュがあれば読込。
     # end はキーに含めないため、まずは “スナップショット” を読み、その後必要なら末尾だけ追記する。
+    effective_start_dt = start_dt
+    effective_end_dt = end_dt
+
     if cache_path.exists() and not force_refresh:
         if debug:
             print(f"[real-data] cache hit (append-only): {cache_path}")
@@ -215,38 +226,71 @@ def fetch_yahoo_prices(
         cache_min = cached.index.min()
         cache_max = cached.index.max()
 
-        # 末尾延長: キャッシュの最終日以降のみ追記（過去は更新しない）
-        if pd.Timestamp(end_dt) > cache_max:
-            fetch_start = (cache_max + pd.Timedelta(days=1)).to_pydatetime()
-            fetched_tail = _download_yahoo(
-                ticker_list,
-                fetch_start,
-                end_dt,
-                interval=interval,
-                auto_adjust=auto_adjust,
-                debug=debug,
-                allow_empty=True,
-            )
-            cached = _append_only_merge(cached, fetched_tail)
+        if cache_readonly:
+            # Read-only mode: never touch the cache. If the requested range exceeds the
+            # cached span, clamp to the available span instead of failing (common when
+            # the requested start/end lands on a non-trading day or in the future).
+            effective_start_dt = max(pd.Timestamp(start_dt), cache_min).to_pydatetime()
+            effective_end_dt = min(pd.Timestamp(end_dt), cache_max).to_pydatetime()
+            if effective_end_dt <= effective_start_dt:
+                raise ValueError(
+                    "cache is read-only but has no overlap with the requested date range. "
+                    f"requested=[{pd.Timestamp(start_dt).date()}..{pd.Timestamp(end_dt).date()}], "
+                    f"cache=[{cache_min.date()}..{cache_max.date()}]. "
+                    "Disable --cache-readonly, change --cache-dir, or use --force-refresh."
+                )
+            if debug and (effective_start_dt != start_dt or effective_end_dt != end_dt):
+                print(
+                    "[real-data] cache-readonly: clamped requested range to cache span",
+                    {
+                        "requested": [pd.Timestamp(start_dt).date().isoformat(), pd.Timestamp(end_dt).date().isoformat()],
+                        "effective": [pd.Timestamp(effective_start_dt).date().isoformat(), pd.Timestamp(effective_end_dt).date().isoformat()],
+                        "cache": [cache_min.date().isoformat(), cache_max.date().isoformat()],
+                    },
+                )
+            df = _slice_df(cached, effective_start_dt, effective_end_dt)
+        else:
+            cache_modified = False
+            # 末尾延長: キャッシュの最終日以降のみ追記（過去は更新しない）
+            if pd.Timestamp(end_dt) > cache_max:
+                fetch_start = (cache_max + pd.Timedelta(days=1)).to_pydatetime()
+                fetched_tail = _download_yahoo(
+                    ticker_list,
+                    fetch_start,
+                    end_dt,
+                    interval=interval,
+                    auto_adjust=auto_adjust,
+                    debug=debug,
+                    allow_empty=True,
+                )
+                cached = _append_only_merge(cached, fetched_tail)
+                cache_modified = True
 
-        # 先頭拡張（必要な場合のみ）：キャッシュより前の期間が要求された場合、先頭側を追加する。
-        if pd.Timestamp(start_dt) < cache_min:
-            fetch_end = (cache_min - pd.Timedelta(days=1)).to_pydatetime()
-            fetched_head = _download_yahoo(
-                ticker_list,
-                start_dt,
-                fetch_end,
-                interval=interval,
-                auto_adjust=auto_adjust,
-                debug=debug,
-                allow_empty=True,
-            )
-            cached = _append_only_merge(fetched_head, cached)
+            # 先頭拡張（必要な場合のみ）：キャッシュより前の期間が要求された場合、先頭側を追加する。
+            if pd.Timestamp(start_dt) < cache_min:
+                fetch_end = (cache_min - pd.Timedelta(days=1)).to_pydatetime()
+                fetched_head = _download_yahoo(
+                    ticker_list,
+                    start_dt,
+                    fetch_end,
+                    interval=interval,
+                    auto_adjust=auto_adjust,
+                    debug=debug,
+                    allow_empty=True,
+                )
+                cached = _append_only_merge(fetched_head, cached)
+                cache_modified = True
 
-        # キャッシュは常にフルのスナップショットを保存し直す
-        _atomic_to_csv(cached, cache_path)
-        df = _slice_df(cached, start_dt, end_dt)
+            # キャッシュ内容が変わった場合のみスナップショットを保存し直す
+            if cache_modified:
+                _atomic_to_csv(cached, cache_path)
+            df = _slice_df(cached, start_dt, end_dt)
     else:
+        if cache_readonly:
+            raise FileNotFoundError(
+                f"cache file '{cache_path}' is missing (cache is read-only). "
+                "Disable --cache-readonly, change --cache-dir, or use --force-refresh."
+            )
         # force_refresh または初回: 全期間を新規取得して保存
         df_full = _download_yahoo(
             ticker_list,
@@ -264,8 +308,8 @@ def fetch_yahoo_prices(
     # 取得メタ情報を JSON 化しやすい dataclass にまとめて返す
     result = FetchResult(
         tickers=ticker_list,
-        start=start_dt.isoformat(),
-        end=end_dt.isoformat(),
+        start=effective_start_dt.isoformat(),
+        end=effective_end_dt.isoformat(),
         interval=interval,
         auto_adjust=auto_adjust,
         cache_path=cache_path,
