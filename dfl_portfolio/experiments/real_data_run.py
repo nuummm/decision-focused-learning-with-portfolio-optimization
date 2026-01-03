@@ -1900,11 +1900,13 @@ python -m dfl_portfolio.experiments.real_data_run \
   --flex-formulation 'kkt' \
   --lambda-theta-anchor 0.0 \
   --theta-anchor-mode ipo \
-  --theta-init-mode ipo \
+  --theta-init-mode none \
   --ipo-grad-seed 42 \
   --benchmarks "spy,1/n" \
   --jobs 1 \
-  --debug-roll
+  --debug-roll \
+  --cache-dir dfl_portfolio/real_data/cache \
+  --cache-readonly \
 
   --trading-cost-bps 1 \
   --trading-cost-per-asset "SPY:5,GLD:10,EEM:10,TLT:5" \

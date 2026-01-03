@@ -1512,10 +1512,77 @@ def compute_benchmark_series(
     if not ticker:
         return None
     returns_df = bundle.dataset.returns
-    if ticker not in returns_df.columns:
-        print(f"[benchmark] ticker '{ticker}' not found in returns; skipping benchmark.")
-        return None
-    series = returns_df[ticker].dropna()
+
+    def _fetch_external_returns_series() -> Optional[pd.Series]:
+        cfg = getattr(bundle.dataset, "config", None)
+        if cfg is None:
+            return None
+        try:
+            from dfl_portfolio.real_data.fetch_yahoo import (
+                YahooFinanceUnavailable,
+                fetch_yahoo_prices,
+            )
+            from dfl_portfolio.real_data.loader import (
+                _compute_returns,
+                _determine_fetch_start,
+                _resample_prices,
+            )
+        except Exception as exc:  # pragma: no cover - defensive import
+            print(f"[benchmark] failed to import real-data fetch utilities ({exc}); skipping benchmark.")
+            return None
+
+        try:
+            effective_start = _determine_fetch_start(cfg)
+            df, _ = fetch_yahoo_prices(
+                [ticker],
+                effective_start,
+                cfg.end,
+                interval=cfg.interval,
+                auto_adjust=cfg.auto_adjust,
+                cache_dir=cfg.cache_dir,
+                cache_readonly=cfg.cache_readonly,
+                force_refresh=cfg.force_refresh,
+                debug=bool(getattr(cfg, "debug", False)),
+                allow_empty=True,
+            )
+        except YahooFinanceUnavailable as exc:
+            print(f"[benchmark] {exc}; skipping benchmark.")
+            return None
+        except Exception as exc:
+            print(f"[benchmark] failed to fetch ticker '{ticker}' ({exc}); skipping benchmark.")
+            return None
+
+        if df.empty:
+            return None
+
+        price_col = f"{ticker}_{cfg.price_field}"
+        if price_col not in df.columns:
+            print(f"[benchmark] fetched data missing '{price_col}'; skipping benchmark.")
+            return None
+        prices = df[[price_col]].copy()
+        prices.columns = [ticker]
+        prices = _resample_prices(prices, cfg)
+        rets = _compute_returns(prices, cfg.return_kind)
+        if ticker not in rets.columns:
+            return None
+        return rets[ticker].dropna()
+
+    if ticker in returns_df.columns:
+        series = returns_df[ticker].dropna()
+    else:
+        print(f"[benchmark] ticker '{ticker}' not found in returns; attempting direct fetch.")
+        fetched = _fetch_external_returns_series()
+        if fetched is None or fetched.empty:
+            print(f"[benchmark] ticker '{ticker}' could not be fetched; skipping benchmark.")
+            return None
+        # Align to the dataset's calendar when possible (same resample rule).
+        series = fetched
+        try:
+            aligned = series.reindex(returns_df.index)
+            if aligned.notna().sum() > 0:
+                series = aligned.dropna()
+        except Exception:
+            series = series.dropna()
     start_ts = pd.Timestamp(start_date) if start_date is not None else None
     if start_ts is not None:
         series = series.loc[series.index >= start_ts]

@@ -184,6 +184,7 @@ def fetch_yahoo_prices(
     cache_dir: Path | None = None,
     cache_readonly: bool = False,
     force_refresh: bool = False,
+    allow_empty: bool = False,
     debug: bool = True,
 ) -> Tuple[pd.DataFrame, FetchResult]:
     """ティッカー群の OHLCV を取得し、フラットな DataFrame とメタ情報を返す。"""
@@ -299,6 +300,7 @@ def fetch_yahoo_prices(
             interval=interval,
             auto_adjust=auto_adjust,
             debug=debug,
+            allow_empty=allow_empty,
         )
         _atomic_to_csv(df_full, cache_path)
         if debug:
