@@ -207,7 +207,10 @@ def fit_dfl_p1_flex_multi(
     def obj_rule(m):
         total = 0.0
         for t in m.T:
-            lin = sum(_yhat_expr(m, t, j) * m.w[t, j] for j in m.J)
+            # NOTE: Align with the univariate flex implementation.
+            # The upper-level objective is evaluated on realized returns (m.y), not yhat.
+            # Using yhat here makes the problem scale-unstable (theta can blow up without penalty).
+            lin = sum(m.y[t, j] * m.w[t, j] for j in m.J)
             quad = sum(
                 m.w[t, j] * sum(m.V[t, j, k] * m.w[t, k] for k in m.J)
                 for j in m.J
@@ -246,6 +249,10 @@ def fit_dfl_p1_flex_multi(
     res = opt.solve(m, tee=tee)
     cleanup_knitro_logs()
     meta = _solver_metadata(opt, res, solver)
+    try:
+        meta["objective_value"] = float(pyo.value(m.obj))
+    except Exception:
+        meta["objective_value"] = None
 
     theta_hat = np.zeros((d, K), dtype=float)
     for j in m.J:

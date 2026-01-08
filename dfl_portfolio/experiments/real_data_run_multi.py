@@ -18,6 +18,14 @@ import pandas as pd
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("KMP_USE_SHM", "0")
 
+try:  # matplotlib is only needed for custom window plots
+    import matplotlib
+
+    matplotlib.use("Agg")  # must be set before importing pyplot
+    import matplotlib.pyplot as plt  # type: ignore
+except Exception:  # pragma: no cover - best effort
+    plt = None
+
 from dfl_portfolio.real_data.loader import MarketLoaderConfig
 from dfl_portfolio.real_data.pipeline import PipelineConfig, build_data_bundle
 from dfl_portfolio.real_data.cli import (
@@ -30,6 +38,8 @@ from dfl_portfolio.real_data.cli import (
 from dfl_portfolio.real_data.reporting import (
     WEIGHT_THRESHOLD,
     PERIOD_WINDOWS,
+    MODEL_COLOR_MAP,
+    ASSET_COLOR_SEQUENCE,
     compute_correlation_stats,
     compute_period_metrics,
     compute_pairwise_mean_return_tests,
@@ -38,16 +48,22 @@ from dfl_portfolio.real_data.reporting import (
     display_model_name,
     export_average_weights,
     export_max_return_winner_counts,
+    export_winner_capture_frequency,
     export_weight_threshold_frequency,
     export_weight_variance_correlation,
     format_summary_for_output,
     max_drawdown,
     plot_asset_correlation,
+    plot_condition_numbers,
+    plot_delta_paths,
     plot_drawdown_curves,
+    plot_flex_solver_debug,
     plot_multi_wealth,
+    plot_solver_summary_bars,
     plot_wealth_correlation_heatmap,
     plot_wealth_curve,
     plot_wealth_with_events,
+    plot_wealth_window_normalized,
     plot_weight_comparison,
     plot_weight_histograms,
     plot_weight_paths,
@@ -63,6 +79,7 @@ from dfl_portfolio.models.dfl_p1_flex_multi import fit_dfl_p1_flex_multi
 from dfl_portfolio.models.ipo_closed_form_multi import fit_ipo_closed_form_multi
 from dfl_portfolio.models.ipo_grad_multi import fit_ipo_grad_multi
 from dfl_portfolio.models.spo_plus_multi import fit_spo_plus_multi
+from dfl_portfolio.registry import GUROBI_DEFAULTS, KNITRO_DEFAULTS
 from dfl_portfolio.experiments.real_data_common import (
     mvo_cost,
     build_rebalance_schedule,
@@ -81,6 +98,175 @@ DEBUG_ROOT = RESULTS_BASE / "debug_outputs_multi"
 
 logging.getLogger("pyomo").setLevel(logging.ERROR)
 logging.getLogger("pyomo.solvers").setLevel(logging.ERROR)
+
+# For window plots (match real_data_run.py ordering).
+PREFERRED_MODEL_ORDER = [
+    "Buy&Hold SPY",
+    "1/N",
+    "TSMOM (SPY)",
+    "OLS",
+    "IPO",
+    "IPO-GRAD",
+    "SPO+",
+    "DFL-CF",
+    "DFL-OPT-K",
+    "DFL-QCQP-ens",
+]
+
+
+def plot_weight_window_with_connections(
+    weight_dict: Dict[str, pd.DataFrame],
+    path: Path,
+    *,
+    returns_df: Optional[pd.DataFrame] = None,
+) -> None:
+    """Render stacked weights per model and optional winner diagnostics.
+
+    - Saves the stacked weights figure to `path`.
+    - If `returns_df` is provided (index=date, columns=assets), it also adds a bottom
+      subplot that indicates, per period, which asset achieved the maximum realized
+      return (winner=1, others=0).
+    - It additionally saves a standalone effective number plot (N_eff = 1/sum(w^2))
+      to `path` with the suffix `_neff.png`.
+    """
+
+    if plt is None or not weight_dict:
+        return
+    order_map = {name: idx for idx, name in enumerate(PREFERRED_MODEL_ORDER)}
+    entries: List[Tuple[str, pd.DataFrame]] = []
+    for model_key, df in weight_dict.items():
+        if df.empty or "date" not in df.columns:
+            continue
+        tmp = df.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"])
+        tmp = tmp.sort_values("date")
+        entries.append((str(model_key), tmp))
+    # Sort by preferred display order; unknowns last.
+    entries.sort(key=lambda pair: order_map.get(display_model_name(pair[0]), len(order_map)))
+    if not entries:
+        return
+
+    # Window range for axis clamping.
+    window_start: Optional[pd.Timestamp] = None
+    window_end: Optional[pd.Timestamp] = None
+    for _, df_model in entries:
+        if df_model.empty:
+            continue
+        d = pd.to_datetime(df_model["date"])
+        if d.empty:
+            continue
+        d_min = pd.Timestamp(d.min())
+        d_max = pd.Timestamp(d.max())
+        window_start = d_min if window_start is None else min(window_start, d_min)
+        window_end = d_max if window_end is None else max(window_end, d_max)
+
+    n_models = len(entries)
+    add_winner = returns_df is not None and isinstance(returns_df, pd.DataFrame) and not returns_df.empty
+    n_rows = n_models + (1 if add_winner else 0)
+    fig_height = max(2.5 * n_models + (1.8 if add_winner else 0.0), 4)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(12, fig_height), sharex=True)
+    axes = np.atleast_1d(axes)
+    axes_list = list(axes)
+    winner_ax = axes_list[-1] if add_winner else None
+    model_axes = axes_list[:-1] if add_winner else axes_list
+
+    first_dates: Optional[pd.Series] = None
+    first_asset_cols: List[str] = []
+    for idx, ((model_key, df_model), ax) in enumerate(zip(entries, model_axes)):
+        asset_cols = [c for c in df_model.columns if c not in {"date", "portfolio_return_sq"}]
+        if not asset_cols:
+            continue
+        values = df_model[asset_cols].astype(float)
+        dates = pd.to_datetime(df_model["date"])
+        if first_dates is None:
+            first_dates = dates
+            first_asset_cols = list(asset_cols)
+        bottom = np.zeros(len(values))
+        for col in asset_cols:
+            label = col if idx == 0 else None
+            ax.bar(dates, values[col], bottom=bottom, width=5, label=label)
+            bottom += values[col].to_numpy()
+        ax.set_ylabel(display_model_name(model_key))
+        ax.set_ylim(0.0, 1.0)
+        if idx == 0 and asset_cols:
+            ax.legend(loc="upper right", fontsize=8)
+
+    if add_winner and winner_ax is not None and first_dates is not None and first_asset_cols:
+        try:
+            r = returns_df.copy()
+            if not isinstance(r.index, pd.DatetimeIndex):
+                r.index = pd.to_datetime(r.index)
+            # Align to the same date grid as the weights plot (weekly dates)
+            r = r.reindex(pd.to_datetime(first_dates))
+            r = r.replace([np.inf, -np.inf], np.nan)
+            asset_cols = [c for c in first_asset_cols if c in r.columns]
+            if asset_cols:
+                asset_color_map = {
+                    col: ASSET_COLOR_SEQUENCE[i % len(ASSET_COLOR_SEQUENCE)]
+                    for i, col in enumerate(asset_cols)
+                }
+                winners = r[asset_cols].idxmax(axis=1)
+                bottom = np.zeros(len(r.index), dtype=float)
+                for col in asset_cols:
+                    vals = (winners == col).astype(float).to_numpy()
+                    winner_ax.bar(
+                        r.index,
+                        vals,
+                        bottom=bottom,
+                        width=5,
+                        color=asset_color_map.get(col, None),
+                        alpha=0.85,
+                        edgecolor="black",
+                        linewidth=0.3,
+                    )
+                    bottom += vals
+                winner_ax.set_ylim(0.0, 1.0)
+                winner_ax.set_yticks([0.0, 1.0])
+                winner_ax.set_ylabel("勝者(1/0)")
+                winner_ax.set_title("週次：最大リターン資産（勝者=1）")
+                winner_ax.grid(axis="y", alpha=0.15)
+        except Exception:  # pragma: no cover
+            pass
+
+    if window_start is not None and window_end is not None:
+        for ax in axes_list:
+            ax.set_xlim(window_start, window_end)
+
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+    # Standalone N_eff plot (with crisis windows shaded)
+    neff_path = path.with_name(f"{path.stem}_neff.png")
+    fig2, ax2 = plt.subplots(figsize=(12, 3.6))
+    for _, start_s, end_s in PERIOD_WINDOWS:
+        start_ts = pd.Timestamp(start_s)
+        end_ts = pd.Timestamp(end_s)
+        ax2.axvspan(start_ts, end_ts, color="grey", alpha=0.15, zorder=0)
+
+    for _, (model_key, df_model) in enumerate(entries):
+        asset_cols = [c for c in df_model.columns if c not in {"date", "portfolio_return_sq"}]
+        if not asset_cols:
+            continue
+        values = df_model[asset_cols].astype(float)
+        dates = pd.to_datetime(df_model["date"])
+        h_val = (values.pow(2).sum(axis=1)).replace(0.0, np.nan)
+        neff = (1.0 / h_val).astype(float)
+        color = MODEL_COLOR_MAP.get(str(model_key), None) or MODEL_COLOR_MAP.get(
+            display_model_name(model_key), None
+        )
+        ax2.plot(dates, neff, label=display_model_name(model_key), color=color, linewidth=1.8)
+
+    if window_start is not None and window_end is not None:
+        ax2.set_xlim(window_start, window_end)
+    ax2.set_ylabel("N_eff")
+    ax2.set_xlabel("日付")
+    ax2.set_title("有効資産数 (N_eff)")
+    ax2.legend(loc="upper right", fontsize=8)
+    ax2.grid(axis="y", alpha=0.2)
+    fig2.tight_layout()
+    fig2.savefig(neff_path)
+    plt.close(fig2)
 
 
 def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -173,10 +359,33 @@ def build_multi_parser():
         help="Include VIX index level as an additional feature (broadcasted to all assets).",
     )
     parser.add_argument(
+        "--multi-intercept",
+        action="store_true",
+        default=False,
+        help=(
+            "Add a constant 1 feature to enable a per-asset intercept term for all models. "
+            "With this flag, the prediction model becomes y_hat = alpha + x^T beta."
+        ),
+    )
+    parser.add_argument(
         "--multi-vix-ticker",
         type=str,
         default="^VIX",
         help="Yahoo Finance ticker for the VIX index (default: '^VIX').",
+    )
+    parser.add_argument(
+        "--nlp_algorithm",
+        "--nlp-algorithm",
+        dest="nlp_algorithm",
+        type=int,
+        default=1,
+        help="Knitro option nlp_algorithm used by flex in multi runs (default: 1).",
+    )
+    parser.add_argument(
+        "--hessopt",
+        type=int,
+        default=2,
+        help="Knitro option hessopt used by flex in multi runs (default: 2).",
     )
 
     # Multi runner default run: match the documented example below.
@@ -198,14 +407,19 @@ class MultiFeatureConfig:
     momentum_windows: List[int]
     vol_window: int
     include_vix: bool
+    include_intercept: bool
     vix_ticker: str
+    vix_zscore_window: int
 
     def feature_names(self) -> List[str]:
-        names = [f"mom_{w}" for w in self.momentum_windows]
+        names: List[str] = []
+        if self.include_intercept:
+            names.append("const_1")
+        names.extend([f"mom_{w}" for w in self.momentum_windows])
         if self.vol_window > 0:
             names.append(f"vol_{self.vol_window}")
         if self.include_vix:
-            names.append(f"vix_{self.vix_ticker}")
+            names.append(f"vix_logz{self.vix_zscore_window}_{self.vix_ticker}")
         return names
 
 
@@ -216,6 +430,8 @@ def build_multi_features(bundle, cfg: MultiFeatureConfig) -> Tuple[np.ndarray, L
     returns = bundle.dataset.returns.copy()
 
     feats: List[np.ndarray] = []
+    if cfg.include_intercept:
+        feats.append(np.ones((len(idx), len(tickers)), dtype=float))
     for window in cfg.momentum_windows:
         win = int(window)
         if win <= 0:
@@ -303,9 +519,23 @@ def build_multi_features(bundle, cfg: MultiFeatureConfig) -> Tuple[np.ndarray, L
                 f"VIX feature contains missing values after alignment ({missing} missing). "
                 "Try expanding the date range or disabling --cache-readonly so the VIX cache can be built."
             )
-        vix_vec = vix_series.to_numpy(dtype=float)
-        vix_feat = np.tile(vix_vec[:, None], (1, len(tickers)))
-        feats.append(vix_feat.astype(float))
+        # Scale-align: use log-level and rolling z-score so this feature does not dominate by magnitude.
+        # (raw VIX level is O(10~100), while returns/momentum features are O(1e-2~1e-1)).
+        vix_level = pd.to_numeric(vix_series, errors="coerce").astype(float)
+        if vix_level.isna().any():
+            raise ValueError("VIX series contains non-numeric entries after alignment.")
+        vix_log = np.log(np.maximum(vix_level.to_numpy(dtype=float), 1e-12))
+        win = int(cfg.vix_zscore_window)
+        if win <= 1:
+            raise ValueError(f"vix_zscore_window must be >=2, got {cfg.vix_zscore_window}")
+        vix_log_s = pd.Series(vix_log, index=idx)
+        roll_mean = vix_log_s.rolling(win, min_periods=max(2, win // 3)).mean()
+        roll_std = vix_log_s.rolling(win, min_periods=max(2, win // 3)).std(ddof=0)
+        vix_z = (vix_log_s - roll_mean) / roll_std.replace(0.0, np.nan)
+        vix_z = vix_z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        vix_vec = vix_z.to_numpy(dtype=float)
+        vix_feat = np.tile(vix_vec[:, None], (1, len(tickers))).astype(float)
+        feats.append(vix_feat)
 
     if not feats:
         raise ValueError("No features were configured for multi experiment.")
@@ -390,6 +620,53 @@ def run_rolling_experiment_multi(
     asset_rows: List[Dict[str, Any]] = []
     delta_history: List[Dict[str, Any]] = []
     prev_weights: Optional[np.ndarray] = None
+
+    # 訓練時（in-sample）の予測性能: 各リバランスで学習窓の (Y, Yhat) をプールして R^2 を計算
+    train_n = 0
+    train_sum_y = 0.0
+    train_sum_yhat = 0.0
+    train_sum_y2 = 0.0
+    train_sum_yhat2 = 0.0
+    train_sum_y_yhat = 0.0
+    train_sum_sqerr = 0.0
+
+    def _update_train_stats(y_mat: np.ndarray, yhat_mat: np.ndarray) -> None:
+        nonlocal train_n, train_sum_y, train_sum_yhat, train_sum_y2, train_sum_yhat2, train_sum_y_yhat, train_sum_sqerr
+        y = np.asarray(y_mat, dtype=float).reshape(-1)
+        yhat = np.asarray(yhat_mat, dtype=float).reshape(-1)
+        if y.size == 0 or yhat.size == 0:
+            return
+        mask = np.isfinite(y) & np.isfinite(yhat)
+        if not np.any(mask):
+            return
+        y = y[mask]
+        yhat = yhat[mask]
+        train_n += int(y.size)
+        train_sum_y += float(np.sum(y))
+        train_sum_yhat += float(np.sum(yhat))
+        train_sum_y2 += float(np.sum(y * y))
+        train_sum_yhat2 += float(np.sum(yhat * yhat))
+        train_sum_y_yhat += float(np.sum(y * yhat))
+        diff = yhat - y
+        train_sum_sqerr += float(np.sum(diff * diff))
+
+    def _finalize_train_metrics() -> tuple[float, float]:
+        if train_n < 2:
+            return float("nan"), float("nan")
+        n = float(train_n)
+        mean_y = train_sum_y / n
+        mean_yhat = train_sum_yhat / n
+        cov = (train_sum_y_yhat / n) - (mean_y * mean_yhat)
+        var_y = (train_sum_y2 / n) - (mean_y * mean_y)
+        var_yhat = (train_sum_yhat2 / n) - (mean_yhat * mean_yhat)
+        denom = float(np.sqrt(max(var_y, 0.0) * max(var_yhat, 0.0)))
+        if denom <= 0.0 or not np.isfinite(denom):
+            r2_train = float("nan")
+        else:
+            corr = cov / denom
+            r2_train = float(corr * corr) if np.isfinite(corr) else float("nan")
+        rmse_train = float(np.sqrt(train_sum_sqerr / n)) if train_sum_sqerr >= 0.0 else float("nan")
+        return r2_train, rmse_train
 
     total_cycles = len(schedule)
     for cycle_id, item in enumerate(schedule):
@@ -651,6 +928,15 @@ def run_rolling_experiment_multi(
             elif model_key == "flex":
                 form = (formulation or "dual").lower()
                 solver_name = str(flex_options.get("flex_solver", "knitro") if flex_options else "knitro")
+                solver_name_key = solver_name.lower().strip()
+                solver_options = None
+                if solver_name_key == "knitro":
+                    solver_options = dict(KNITRO_DEFAULTS)
+                    if flex_options is not None:
+                        solver_options["nlp_algorithm"] = int(flex_options.get("flex_knitro_nlp_algorithm", 1))
+                        solver_options["hessopt"] = int(flex_options.get("flex_knitro_hessopt", 2))
+                elif solver_name_key == "gurobi":
+                    solver_options = dict(GUROBI_DEFAULTS)
                 theta_hat_local, _, _, _, _, info = fit_dfl_p1_flex_multi(
                     X_feat,
                     Y,
@@ -662,7 +948,7 @@ def run_rolling_experiment_multi(
                     delta=float(delta_for_training),
                     theta_init=theta_init_override,
                     solver=solver_name,
-                    solver_options=None,
+                    solver_options=solver_options,
                     tee=tee,
                     lambda_theta_anchor=float(flex_options.get("flex_lambda_theta_anchor", 0.0) if flex_options else 0.0),
                     theta_anchor=theta_anchor_override,
@@ -701,6 +987,13 @@ def run_rolling_experiment_multi(
             theta_hat, info, elapsed = _train_once(selected_delta_down)
 
         Yhat_all = predict_yhat_multi(X_feat, theta_hat)
+        try:
+            _update_train_stats(
+                Y[item.train_start : item.train_end + 1],
+                Yhat_all[item.train_start : item.train_end + 1],
+            )
+        except Exception:
+            pass
 
         rebalance_rows.append(
             {
@@ -905,6 +1198,8 @@ def run_rolling_experiment_multi(
         r2 = float("nan")
         rmse = float("nan")
 
+    r2_train, rmse_train = _finalize_train_metrics()
+
     model_debug_dir = debug_dir / f"model_{model_label}"
     model_debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -924,6 +1219,7 @@ def run_rolling_experiment_multi(
     )
     wealth_df.to_csv(model_debug_dir / "wealth.csv", index=False)
     plot_wealth_curve(wealth_dates, wealth_values, model_debug_dir / "wealth.png")
+    plot_condition_numbers(step_df, model_debug_dir / "condition_numbers.png")
 
     # weights for analysis
     weights_df: pd.DataFrame
@@ -947,6 +1243,7 @@ def run_rolling_experiment_multi(
         weights_df.to_csv(results_model_dir / "weights.csv", index=False)
         plot_weight_paths(weights_df, model_label, results_model_dir / "weights.png")
     step_df.to_csv(results_model_dir / "step_metrics.csv", index=False)
+    plot_condition_numbers(step_df, results_model_dir / "condition_numbers.png")
 
     lengths = (rebalance_df["train_end"] - rebalance_df["train_start"] + 1).tolist()
     status_counts = rebalance_df["solver_status"].value_counts().to_dict()
@@ -979,7 +1276,9 @@ def run_rolling_experiment_multi(
         "cvar_95": cvar_95,
         "cvar_95_net": cvar_95_net,
         "r2": r2,
+        "r2_train": r2_train,
         "rmse": rmse,
+        "rmse_train": rmse_train,
         "ann_return_net": mean_return_net,
         "ann_volatility_net": std_return_net,
         "sharpe_net": sharpe_net,
@@ -1090,7 +1389,9 @@ def main() -> None:
         momentum_windows=momentum_windows,
         vol_window=int(getattr(args, "multi_vol_window", 0) or 0),
         include_vix=bool(getattr(args, "multi_vix", False)),
+        include_intercept=bool(getattr(args, "multi_intercept", False)),
         vix_ticker=str(getattr(args, "multi_vix_ticker", "^VIX")),
+        vix_zscore_window=max(26, int(getattr(args, "train_window", 26) or 26)),
     )
     effective_momentum_window = max(
         cfg_multi.momentum_windows + ([cfg_multi.vol_window] if cfg_multi.vol_window > 0 else [])
@@ -1140,6 +1441,7 @@ def main() -> None:
             "multi_features": {
                 "momentum_windows": cfg_multi.momentum_windows,
                 "vol_window": cfg_multi.vol_window,
+                "include_intercept": cfg_multi.include_intercept,
                 "feature_names": cfg_multi.feature_names(),
             },
         }
@@ -1178,7 +1480,12 @@ def main() -> None:
         config_records.append({"parameter": key, "value": value})
     if snapshot_records:
         config_records.extend(snapshot_records)
-    pd.DataFrame(config_records).to_csv(analysis_csv_dir / "2-experiment_config.csv", index=False)
+    config_csv_path = analysis_csv_dir / "2-experiment_config.csv"
+    pd.DataFrame(config_records).to_csv(config_csv_path, index=False)
+    try:
+        shutil.copy2(config_csv_path, analysis_dir / "2-experiment_config.csv")
+    except Exception:
+        pass
 
     # ---------------------------------------------------------------------
     # Data overview plots + correlation diagnostics
@@ -1268,6 +1575,8 @@ def main() -> None:
         "flex_lambda_theta_iso": getattr(args, "flex_lambda_theta_iso", 0.0),
         "flex_theta_anchor_mode": getattr(args, "flex_theta_anchor_mode", "ipo"),
         "flex_theta_init_mode": getattr(args, "flex_theta_init_mode", "ipo"),
+        "flex_knitro_nlp_algorithm": int(getattr(args, "nlp_algorithm", 1)),
+        "flex_knitro_hessopt": int(getattr(args, "hessopt", 2)),
     }
     spo_plus_options: Dict[str, Any] = {
         "spo_plus_epochs": getattr(args, "spo_plus_epochs", 500),
@@ -1398,6 +1707,14 @@ def main() -> None:
                 base_seed=base_seed,
                 init_seed=init_seed,
             )
+            # condition_numbers はデータ依存でモデル間で共通なので、analysis/figures に 1 枚だけ保存する
+            cond_src = results_dir / "condition_numbers.png"
+            cond_dst = analysis_fig_dir / "condition_numbers.png"
+            if cond_src.exists() and not cond_dst.exists():
+                try:
+                    shutil.copy2(cond_src, cond_dst)
+                except Exception:
+                    pass
             outputs.append((spec, run_result))
         return outputs
 
@@ -1511,6 +1828,29 @@ def main() -> None:
         period_df.to_csv(analysis_csv_dir / "period_metrics.csv", index=False)
 
     if wealth_dict:
+        # Solver status events (for plotting annotations in window analyses).
+        solver_events_by_model: Dict[str, pd.DataFrame] = {}
+        if rebalance_log_frames:
+            tmp_events: Dict[str, List[pd.DataFrame]] = {}
+            for df in rebalance_log_frames:
+                if df is None or df.empty:
+                    continue
+                statuses = df.get("solver_status", "").astype(str)
+                mask = ~statuses.str.contains("optimal", case=False, na=False)
+                mask &= ~statuses.str.contains("ok", case=False, na=False)
+                df_bad = df.loc[mask]
+                if df_bad.empty:
+                    continue
+                need_cols = {"model", "rebalance_date", "solver_status"}
+                if not need_cols.issubset(df_bad.columns):
+                    continue
+                for model, sub in df_bad[list(need_cols)].groupby("model"):
+                    tmp_events.setdefault(model, []).append(sub)
+            solver_events_by_model = {
+                model: pd.concat(chunks, ignore_index=True).sort_values("rebalance_date")
+                for model, chunks in tmp_events.items()
+            }
+
         wealth_merge = None
         for model, wdf in wealth_dict.items():
             display_label = display_model_name(model)
@@ -1523,9 +1863,144 @@ def main() -> None:
             wealth_merge = wealth_merge.sort_values("date")
             wealth_merge = wealth_merge.groupby("date", as_index=False).last()
             wealth_merge.to_csv(analysis_csv_dir / "wealth_comparison.csv", index=False)
-            plot_multi_wealth({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_comparison.png")
-            plot_wealth_with_events({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "wealth_events.png")
-            plot_drawdown_curves({m: df for m, df in wealth_dict.items()}, analysis_fig_dir / "drawdown_curves.png")
+            plot_multi_wealth(
+                {m: df for m, df in wealth_dict.items()},
+                analysis_fig_dir / "wealth_comparison.png",
+            )
+            plot_drawdown_curves(
+                {m: df for m, df in wealth_dict.items()},
+                analysis_fig_dir / "drawdown_curves.png",
+            )
+
+            # 1) Wealth events (all models): write primary copy under analysis/ and also under analysis/figures/
+            wealth_events_base_path = analysis_dir / "wealth_events.png"
+            wealth_events_primary_path = analysis_dir / "2-wealth_events.png"
+            plot_wealth_with_events(
+                {m: df for m, df in wealth_dict.items()},
+                wealth_events_base_path,
+            )
+            if wealth_events_primary_path.exists():
+                try:
+                    shutil.copy2(
+                        wealth_events_primary_path,
+                        analysis_fig_dir / wealth_events_primary_path.name,
+                    )
+                except Exception:
+                    pass
+
+            # 2) Primary learning models only (DFL + IPO + SPO+)
+            primary_models = {
+                m: df
+                for m, df in wealth_dict.items()
+                if any(key in str(m) for key in ["flex", "ipo", "spo_plus"])
+            }
+            if primary_models:
+                plot_wealth_with_events(
+                    primary_models,
+                    analysis_fig_dir / "wealth_events_dfl_only.png",
+                )
+
+            # 3) flex_dual vs benchmarks (if present)
+            flex_dual_key = None
+            for key in wealth_dict.keys():
+                key_str = str(key)
+                if "flex" in key_str and ("dual" in key_str or key_str == "flex"):
+                    flex_dual_key = key
+                    break
+            if flex_dual_key is not None:
+                dual_vs_others: Dict[str, pd.DataFrame] = {}
+                dual_vs_others[flex_dual_key] = wealth_dict[flex_dual_key]
+                for key, df in wealth_dict.items():
+                    if key == flex_dual_key:
+                        continue
+                    key_str = str(key)
+                    if not (key_str.startswith("benchmark_") or key_str == "benchmark_equal_weight"):
+                        continue
+                    dual_vs_others[key] = df
+                if len(dual_vs_others) > 1:
+                    plot_wealth_with_events(
+                        dual_vs_others,
+                        analysis_fig_dir / "wealth_events_flex_dual_vs_baselines.png",
+                    )
+
+            # 4) Crisis windows (normalized to 1 at window start)
+            event_fig_dir = analysis_fig_dir / "event_windows"
+            event_fig_dir.mkdir(parents=True, exist_ok=True)
+            for name, start, end in PERIOD_WINDOWS:
+                sub_dict: Dict[str, pd.DataFrame] = {}
+                for m, df in wealth_dict.items():
+                    if df.empty:
+                        continue
+                    tmp = df.copy()
+                    tmp["date"] = pd.to_datetime(tmp["date"])
+                    mask = (tmp["date"] >= pd.Timestamp(start)) & (tmp["date"] <= pd.Timestamp(end))
+                    tmp = tmp.loc[mask]
+                    if not tmp.empty:
+                        sub_dict[m] = tmp[["date", "wealth"]].copy()
+                if sub_dict:
+                    plot_wealth_window_normalized(
+                        sub_dict,
+                        name,
+                        start,
+                        end,
+                        event_fig_dir / f"wealth_window_{name}.png",
+                        events_by_model=solver_events_by_model,
+                    )
+
+            # 5) 5-year rolling windows
+            five_year_dir = analysis_fig_dir / "wealth_windows_5y"
+            five_year_dir_all = five_year_dir / "all_models"
+            five_year_dir_dfl = five_year_dir / "dfl_only"
+            five_year_dir_all.mkdir(parents=True, exist_ok=True)
+            five_year_dir_dfl.mkdir(parents=True, exist_ok=True)
+            all_dates: List[pd.Timestamp] = []
+            for df in wealth_dict.values():
+                if df.empty or "date" not in df.columns:
+                    continue
+                d = pd.to_datetime(df["date"])
+                if not d.empty:
+                    all_dates.append(d.min())
+                    all_dates.append(d.max())
+            if all_dates:
+                start_all = min(all_dates)
+                end_all = max(all_dates)
+                start_win = start_all
+                while start_win < end_all:
+                    end_win = start_win + pd.DateOffset(years=5)
+                    if end_win > end_all:
+                        end_win = end_all
+                    window_label = f"{start_win.year}_{end_win.year}"
+                    sub_dict = {}
+                    for m, df in wealth_dict.items():
+                        if df.empty or "date" not in df.columns:
+                            continue
+                        tmp = df.copy()
+                        tmp["date"] = pd.to_datetime(tmp["date"])
+                        mask = (tmp["date"] >= start_win) & (tmp["date"] < end_win)
+                        tmp = tmp.loc[mask]
+                        if not tmp.empty:
+                            sub_dict[m] = tmp[["date", "wealth"]].copy()
+                    if sub_dict:
+                        plot_wealth_window_normalized(
+                            sub_dict,
+                            window_label,
+                            start_win,
+                            end_win,
+                            five_year_dir_all / f"wealth_window_5y_{window_label}.png",
+                            events_by_model=solver_events_by_model,
+                        )
+                        flex_only = {m: df for m, df in sub_dict.items() if "flex" in str(m)}
+                        if flex_only:
+                            plot_wealth_window_normalized(
+                                flex_only,
+                                window_label,
+                                start_win,
+                                end_win,
+                                five_year_dir_dfl / f"wealth_window_5y_{window_label}.png",
+                                events_by_model=solver_events_by_model,
+                            )
+                    start_win = start_win + pd.DateOffset(years=5)
+
             wealth_returns = wealth_merge.copy()
             wealth_returns["date"] = pd.to_datetime(wealth_returns["date"])
             wealth_returns = (
@@ -1550,8 +2025,11 @@ def main() -> None:
                     summarize_dfl_performance_significance(analysis_csv_dir)
 
     if weight_dict:
-        plot_weight_comparison(weight_dict, analysis_fig_dir / "weights_comparison.png")
+        # Event-window weights comparison (figures/event_windows)
+        event_fig_dir = analysis_fig_dir / "event_windows"
+        event_fig_dir.mkdir(parents=True, exist_ok=True)
         for name, start, end in [
+            ("lehman_2008", "2007-07-01", "2009-06-30"),
             ("covid_2020", "2020-02-01", "2020-12-31"),
             ("inflation_2022", "2022-01-01", "2023-12-31"),
         ]:
@@ -1566,9 +2044,56 @@ def main() -> None:
                 if not tmp.empty:
                     sub_weights[m] = tmp
             if sub_weights:
-                plot_weight_comparison(
-                    sub_weights, analysis_fig_dir / f"weights_comparison_{name}.png"
-                )
+                plot_weight_comparison(sub_weights, event_fig_dir / f"weights_comparison_{name}.png")
+
+        # 2-year windows stacked weights (+ winner + N_eff)
+        weights_2y_dir = analysis_fig_dir / "weights_windows_2y"
+        weights_all_dir = weights_2y_dir / "all_models"
+        weights_dfl_dir = weights_2y_dir / "dfl_only"
+        weights_all_dir.mkdir(parents=True, exist_ok=True)
+        weights_dfl_dir.mkdir(parents=True, exist_ok=True)
+        all_dates: List[pd.Timestamp] = []
+        for df in weight_dict.values():
+            if df.empty or "date" not in df.columns:
+                continue
+            d = pd.to_datetime(df["date"])
+            if not d.empty:
+                all_dates.append(d.min())
+                all_dates.append(d.max())
+        if all_dates:
+            start_all = min(all_dates)
+            end_all = max(all_dates)
+            start_win = start_all
+            while start_win < end_all:
+                end_win = start_win + pd.DateOffset(years=2)
+                if end_win > end_all:
+                    end_win = end_all
+                window_label = f"{start_win.year}_{end_win.year}"
+                sub_weights = {}
+                for m, df in weight_dict.items():
+                    if df.empty or "date" not in df.columns:
+                        continue
+                    tmp = df.copy()
+                    tmp["date"] = pd.to_datetime(tmp["date"])
+                    mask = (tmp["date"] >= start_win) & (tmp["date"] < end_win)
+                    tmp = tmp.loc[mask]
+                    if not tmp.empty:
+                        sub_weights[m] = tmp
+                if sub_weights:
+                    plot_weight_window_with_connections(
+                        sub_weights,
+                        weights_all_dir / f"weights_window_2y_{window_label}.png",
+                        returns_df=bundle.dataset.returns,
+                    )
+                    flex_only = {k: v for k, v in sub_weights.items() if "flex" in str(k)}
+                    if flex_only:
+                        plot_weight_window_with_connections(
+                            flex_only,
+                            weights_dfl_dir / f"weights_window_2y_{window_label}.png",
+                            returns_df=bundle.dataset.returns,
+                        )
+                start_win = start_win + pd.DateOffset(years=2)
+
         export_weight_variance_correlation(
             weight_dict,
             analysis_csv_dir / "weight_variance_correlation.csv",
@@ -1586,6 +2111,33 @@ def main() -> None:
             analysis_csv_dir / "weight_threshold_freq.csv",
             analysis_fig_dir / "weight_threshold_freq.png",
         )
+        # Winner capture analysis: whether each model allocates >=5% weight to the weekly winner asset.
+        try:
+            winner_dir = analysis_fig_dir / "winner_capture"
+            winner_dir.mkdir(parents=True, exist_ok=True)
+            export_winner_capture_frequency(
+                returns_df=bundle.dataset.returns,
+                weight_dict=weight_dict,
+                threshold=0.05,
+                csv_path=analysis_csv_dir / "winner_capture_rate.csv",
+                fig_path=winner_dir / "winner_capture_rate.png",
+                by_asset_csv_path=analysis_csv_dir / "winner_capture_by_asset.csv",
+                by_asset_fig_path=winner_dir / "winner_capture_by_asset_heatmap.png",
+            )
+            flex_only = {k: v for k, v in weight_dict.items() if "flex" in str(k)}
+            if flex_only:
+                export_winner_capture_frequency(
+                    returns_df=bundle.dataset.returns,
+                    weight_dict=flex_only,
+                    threshold=0.05,
+                    csv_path=analysis_csv_dir / "winner_capture_rate_dfl_only.csv",
+                    fig_path=winner_dir / "winner_capture_rate_dfl_only.png",
+                    by_asset_csv_path=analysis_csv_dir / "winner_capture_by_asset_dfl_only.csv",
+                    by_asset_fig_path=winner_dir / "winner_capture_by_asset_heatmap_dfl_only.png",
+                    title="週次最大リターン資産の捕捉率（DFLのみ, w>=閾値）",
+                )
+        except Exception as exc:  # pragma: no cover
+            print(f"[analysis-multi] winner capture analysis failed: {exc}")
 
     if train_window_records:
         pd.DataFrame(train_window_records).to_csv(
@@ -1595,9 +2147,40 @@ def main() -> None:
         rebalance_df = pd.DataFrame(rebalance_records)
         rebalance_df.to_csv(analysis_csv_dir / "rebalance_summary.csv", index=False)
 
+    solver_debug_dir = analysis_fig_dir / "solver_debug"
+    if rebalance_log_frames:
+        solver_debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            rebalance_log_df = pd.concat(rebalance_log_frames, ignore_index=True)
+            plot_solver_summary_bars(rebalance_log_df, solver_debug_dir)
+        except Exception:  # pragma: no cover
+            pass
+    if flex_rebalance_logs:
+        solver_debug_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            flex_debug_df = pd.concat(flex_rebalance_logs, ignore_index=True)
+            plot_flex_solver_debug(flex_debug_df, solver_debug_dir / "flex_solver_debug.png")
+        except Exception:  # pragma: no cover
+            pass
+
     run_extended_analysis(analysis_csv_dir, analysis_fig_dir, model_outputs_dir, asset_pred_dir)
     if delta_records:
-        pd.DataFrame(delta_records).to_csv(analysis_csv_dir / "flex_delta_history.csv", index=False)
+        delta_df = pd.DataFrame(delta_records)
+        # Keep legacy/debug file name for multi runs
+        delta_df.to_csv(analysis_csv_dir / "flex_delta_history.csv", index=False)
+        # Match real_data_run.py artifact names
+        delta_df.to_csv(analysis_csv_dir / "delta_trajectory.csv", index=False)
+        delta_plot_df = delta_df.copy()
+        if "model" in delta_plot_df.columns and "delta_used" in delta_plot_df.columns:
+            means = delta_plot_df.groupby("model")["delta_used"].mean().to_dict()
+            delta_plot_df["model"] = delta_plot_df["model"].map(
+                lambda m: (
+                    f"{m} (avg={means.get(m, float('nan')):.3f})"
+                    if m in means and np.isfinite(means.get(m, np.nan))
+                    else str(m)
+                )
+            )
+        plot_delta_paths(delta_plot_df, analysis_fig_dir / "delta_paths.png")
     if rebalance_log_frames:
         pd.concat(rebalance_log_frames, ignore_index=True).to_csv(
             analysis_csv_dir / "rebalance_log_all_models.csv", index=False
@@ -1633,13 +2216,18 @@ python -m dfl_portfolio.experiments.real_data_run_multi \
   --flex-formulation 'kkt' \
   --lambda-theta-anchor 0.0 \
   --theta-anchor-mode ipo \
-  --theta-init-mode none \
+  --theta-init-mode ipo \
   --ipo-grad-seed 42 \
   --benchmarks "spy,1/n" \
   --jobs 1 \
-  --debug-roll
+  --debug-roll \
+  --nlp_algorithm 3 \
+  --hessopt 4 \
 
 
+--nlp_algorithm 1
+--hessopt 2
 --momentum-window 4
 --multi-vix
+--multi-intercept
 """

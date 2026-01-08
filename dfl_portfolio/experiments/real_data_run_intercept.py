@@ -81,11 +81,16 @@ from dfl_portfolio.real_data.reporting import (
     format_summary_for_output,
     build_cost_adjusted_summary,
 )
-from dfl_portfolio.registry import SolverSpec, get_trainer
-from dfl_portfolio.models.ols import predict_yhat, train_ols
-from dfl_portfolio.models.ipo_closed_form import fit_ipo_closed_form
+from dfl_portfolio.registry import SolverSpec, KNITRO_DEFAULTS, GUROBI_DEFAULTS
+from dfl_portfolio.models._intercept_utils import coerce_theta_intercept
+from dfl_portfolio.models.ols_intercept import predict_yhat_intercept
+from dfl_portfolio.models.ols_baseline_intercept import fit_ols_baseline_intercept
+from dfl_portfolio.models.ipo_closed_form_intercept import fit_ipo_closed_form_intercept
+from dfl_portfolio.models.ipo_grad_intercept import fit_ipo_grad_intercept
+from dfl_portfolio.models.spo_plus_intercept import fit_spo_plus_intercept
+from dfl_portfolio.models.dfl_p1_flex_intercept import fit_dfl_p1_flex_intercept
 from dfl_portfolio.models.ols_gurobi import solve_mvo_gurobi, solve_series_mvo_gurobi
-from dfl_portfolio.experiments.real_data_common import (
+from dfl_portfolio.experiments.real_data_common_intercept import (
     mvo_cost,
     ScheduleItem,
     build_rebalance_schedule,
@@ -97,8 +102,200 @@ from dfl_portfolio.experiments.real_data_benchmarks import run_benchmark_suite
 HERE = Path(__file__).resolve()
 PROJECT_ROOT = HERE.parents[3]
 RESULTS_BASE = PROJECT_ROOT / "results"
-RESULTS_ROOT = RESULTS_BASE / "exp_real_data"
+RESULTS_ROOT = RESULTS_BASE / "exp_real_data_intercept"
 DEBUG_ROOT = RESULTS_BASE / "debug_outputs"
+
+def _merge_solver_defaults(spec: SolverSpec) -> SolverSpec:
+    """Attach default solver options when spec.options is empty (match registry behavior)."""
+    if spec.options:
+        return spec
+    name = (spec.name or "").lower()
+    if name == "knitro":
+        return SolverSpec(name=spec.name, options=dict(KNITRO_DEFAULTS), tee=spec.tee)
+    if name == "gurobi":
+        return SolverSpec(name=spec.name, options=dict(GUROBI_DEFAULTS), tee=spec.tee)
+    return spec
+
+
+def get_trainer(model_key: str, solver_spec: SolverSpec):
+    """Intercept-aware trainer resolver (OLS/IPO/IPO-GRAD/SPO+/DFL all with intercept)."""
+    key = (model_key or "").lower().strip()
+    spec = _merge_solver_defaults(solver_spec)
+
+    if key in ("flex", "dfl_flex", "dfl_p1_flex"):
+        def _runner(
+            X, Y, Vhats, idx,
+            start_index=None, end_index=None,
+            delta: float = 1.0, theta_init=None,
+            tee: bool = False,
+            solver: str = "",
+            solver_options: Optional[Dict[str, Any]] = None,
+            **kw,
+        ):
+            use_solver = (solver or spec.name)
+            use_opts = dict(spec.options)
+            if solver_options:
+                use_opts.update(solver_options)
+            local_tee = bool(tee or spec.tee)
+            fit_kwargs: Dict[str, Any] = dict(
+                start_index=start_index,
+                end_index=end_index,
+                delta=float(delta),
+                solver=use_solver,
+                solver_options=use_opts,
+                tee=local_tee,
+            )
+            if theta_init is not None:
+                fit_kwargs["theta_init"] = theta_init
+            fit_kwargs.update(kw)
+            return fit_dfl_p1_flex_intercept(X, Y, Vhats, idx, **fit_kwargs)
+
+        return _runner
+
+    if key in ("ols", "vanilla", "baseline"):
+        def _runner(
+            X, Y, Vhats, idx,
+            start_index=None, end_index=None,
+            delta: float = 1.0, theta_init=None,
+            tee: bool = False, solver: str = "", solver_options: Optional[Dict[str, Any]] = None,
+            **kw,
+        ):
+            ret = fit_ols_baseline_intercept(
+                X,
+                Y,
+                Vhats,
+                idx,
+                start_index=start_index,
+                end_index=end_index,
+                delta=float(delta),
+                theta_init=theta_init,
+                tee=tee,
+            )
+            if isinstance(ret, (list, tuple)) and len(ret) == 5:
+                theta_hat, Z, MU, LAM, used_idx = ret
+                info = {}
+                return theta_hat, Z, MU, LAM, used_idx, info
+            return ret
+
+        return _runner
+
+    if key in ("ipo", "ipo_closed_form", "ipo-analytic"):
+        def _runner(
+            X, Y, Vhats, idx,
+            start_index=None, end_index=None,
+            delta: float = 1.0, theta_init=None,
+            tee: bool = False,
+            solver: str = "analytic",
+            solver_options: Optional[Dict[str, Any]] = None,
+            **kw,
+        ):
+            mode = kw.pop("ipo_mode", "budget")
+            psd_eps = kw.pop("ipo_psd_eps", 1e-12)
+            ridge_theta = kw.pop("ipo_ridge_theta", 1e-10)
+            return fit_ipo_closed_form_intercept(
+                X,
+                Y,
+                Vhats,
+                idx,
+                start_index=start_index,
+                end_index=end_index,
+                delta=float(delta),
+                mode=mode,
+                psd_eps=float(psd_eps),
+                ridge_theta=float(ridge_theta),
+                tee=tee,
+                theta_init=theta_init,
+            )
+
+        return _runner
+
+    if key in ("ipo_grad", "ipo-nn", "ipo_nn"):
+        def _runner(
+            X, Y, Vhats, idx,
+            start_index=None, end_index=None,
+            delta: float = 1.0, theta_init=None,
+            tee: bool = False,
+            solver: str = "ipo_grad",
+            solver_options: Optional[Dict[str, Any]] = None,
+            **kw,
+        ):
+            epochs = int(kw.pop("ipo_grad_epochs", 500))
+            lr = float(kw.pop("ipo_grad_lr", 1e-3))
+            batch_size = int(kw.pop("ipo_grad_batch_size", 0))
+            qp_max_iter = int(kw.pop("ipo_grad_qp_max_iter", 5000))
+            qp_tol = float(kw.pop("ipo_grad_qp_tol", 1e-6))
+            debug_kkt = bool(kw.pop("ipo_grad_debug_kkt", False))
+            seed = kw.pop("ipo_grad_seed", None)
+            lambda_anchor = float(kw.pop("ipo_grad_lambda_anchor", 0.0))
+            theta_anchor = kw.pop("ipo_grad_theta_anchor", None)
+            return fit_ipo_grad_intercept(
+                X,
+                Y,
+                Vhats,
+                idx,
+                start_index=start_index,
+                end_index=end_index,
+                delta=float(delta),
+                epochs=epochs,
+                lr=lr,
+                batch_size=batch_size,
+                qp_max_iter=qp_max_iter,
+                qp_tol=qp_tol,
+                seed=seed,
+                theta_init=theta_init,
+                lambda_anchor=lambda_anchor,
+                theta_anchor=theta_anchor,
+                tee=tee,
+                debug_kkt=debug_kkt,
+            )
+
+        return _runner
+
+    if key in ("spo_plus", "spo+", "spoplus", "spo_plus_risk"):
+        def _runner(
+            X, Y, Vhats, idx,
+            start_index=None, end_index=None,
+            delta: float = 1.0, theta_init=None,
+            tee: bool = False,
+            solver: str = "spo_plus",
+            solver_options: Optional[Dict[str, Any]] = None,
+            **kw,
+        ):
+            epochs = int(kw.pop("spo_plus_epochs", 500))
+            lr = float(kw.pop("spo_plus_lr", 1e-3))
+            batch_size = int(kw.pop("spo_plus_batch_size", 0))
+            lambda_reg = float(kw.pop("spo_plus_lambda_reg", 0.0))
+            lambda_anchor = float(kw.pop("spo_plus_lambda_anchor", 0.0))
+            theta_anchor = kw.pop("spo_plus_theta_anchor", None)
+            risk_constraint = bool(kw.pop("spo_plus_risk_constraint", True))
+            risk_mult = float(kw.pop("spo_plus_risk_mult", 2.0))
+            psd_eps = float(kw.pop("spo_plus_psd_eps", 1e-9))
+            kw.pop("spo_plus_init_mode", None)
+            kw.pop("spo_plus_theta_anchor_mode", None)
+            return fit_spo_plus_intercept(
+                X,
+                Y,
+                Vhats,
+                idx,
+                start_index=start_index,
+                end_index=end_index,
+                delta=float(delta),
+                epochs=epochs,
+                lr=lr,
+                batch_size=batch_size,
+                lambda_reg=lambda_reg,
+                lambda_anchor=lambda_anchor,
+                theta_anchor=theta_anchor,
+                risk_constraint=risk_constraint,
+                risk_mult=risk_mult,
+                psd_eps=psd_eps,
+                tee=tee,
+                theta_init=theta_init,
+            )
+
+        return _runner
+
+    raise KeyError(f"Unknown model_key: {model_key}. Expected one of: ols, ipo, ipo_grad, spo_plus, flex")
 
 
 def _sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -347,7 +544,7 @@ def train_model_window(
             if init_mode == "ipo":
                 # Warm-start IPO-GRAD from the analytical IPO closed-form solution
                 try:
-                    theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
+                    theta_ipo, _, _, _, _, _ = fit_ipo_closed_form_intercept(
                         bundle.dataset.X,
                         bundle.dataset.Y,
                         bundle.covariances,
@@ -365,14 +562,14 @@ def train_model_window(
                     if tee:
                         print(f"[IPO-GRAD] IPO closed-form warm-start failed: {exc}")
             else:
-                theta_init_override = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+                theta_init_override = np.zeros((bundle.dataset.X.shape[1], 2), dtype=float)
     if model_key == "spo_plus" and spo_plus_options:
         init_mode = str(spo_plus_options.get("spo_plus_init_mode", "zero")).lower()
         if init_mode == "none":
             init_mode = "zero"
         if init_mode == "ipo":
             try:
-                theta_ipo, _, _, _, _, _ = fit_ipo_closed_form(
+                theta_ipo, _, _, _, _, _ = fit_ipo_closed_form_intercept(
                     bundle.dataset.X,
                     bundle.dataset.Y,
                     bundle.covariances,
@@ -397,7 +594,7 @@ def train_model_window(
                 anchor_mode = "zero"
             if anchor_mode == "ipo":
                 try:
-                    theta_anchor, _, _, _, _, _ = fit_ipo_closed_form(
+                    theta_anchor, _, _, _, _, _ = fit_ipo_closed_form_intercept(
                         bundle.dataset.X,
                         bundle.dataset.Y,
                         bundle.covariances,
@@ -412,9 +609,9 @@ def train_model_window(
                     )
                     trainer_kwargs["spo_plus_theta_anchor"] = np.asarray(theta_anchor, dtype=float)
                 except Exception:
-                    trainer_kwargs["spo_plus_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+                    trainer_kwargs["spo_plus_theta_anchor"] = np.zeros((bundle.dataset.X.shape[1], 2), dtype=float)
             else:
-                trainer_kwargs["spo_plus_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+                trainer_kwargs["spo_plus_theta_anchor"] = np.zeros((bundle.dataset.X.shape[1], 2), dtype=float)
             trainer_kwargs["spo_plus_lambda_anchor"] = lam_anchor
     if theta_init_override is not None:
         trainer_kwargs["theta_init"] = theta_init_override
@@ -428,7 +625,7 @@ def train_model_window(
                 anchor_mode = str(ipo_grad_options.get("ipo_grad_theta_anchor_mode", "ipo")).lower()
                 if anchor_mode == "ipo":
                     try:
-                        theta_anchor, _, _, _, _, _ = fit_ipo_closed_form(
+                        theta_anchor, _, _, _, _, _ = fit_ipo_closed_form_intercept(
                             bundle.dataset.X,
                             bundle.dataset.Y,
                             bundle.covariances,
@@ -443,9 +640,9 @@ def train_model_window(
                         )
                         trainer_kwargs["ipo_grad_theta_anchor"] = np.asarray(theta_anchor, dtype=float)
                     except Exception:
-                        trainer_kwargs["ipo_grad_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+                        trainer_kwargs["ipo_grad_theta_anchor"] = np.zeros((bundle.dataset.X.shape[1], 2), dtype=float)
                 else:
-                    trainer_kwargs["ipo_grad_theta_anchor"] = np.zeros(bundle.dataset.X.shape[1], dtype=float)
+                    trainer_kwargs["ipo_grad_theta_anchor"] = np.zeros((bundle.dataset.X.shape[1], 2), dtype=float)
         if seed_event is not None:
             trainer_kwargs["ipo_grad_seed"] = int(seed_event)
     if model_key == "spo_plus" and spo_plus_options:
@@ -566,53 +763,6 @@ def run_rolling_experiment(
     delta_history: List[Dict[str, object]] = []
     prev_weights: Optional[np.ndarray] = None
 
-    # 訓練時（in-sample）の予測性能: 各リバランスで学習窓の (Y, Yhat) をプールして R^2 を計算
-    train_n = 0
-    train_sum_y = 0.0
-    train_sum_yhat = 0.0
-    train_sum_y2 = 0.0
-    train_sum_yhat2 = 0.0
-    train_sum_y_yhat = 0.0
-    train_sum_sqerr = 0.0
-
-    def _update_train_stats(y_mat: np.ndarray, yhat_mat: np.ndarray) -> None:
-        nonlocal train_n, train_sum_y, train_sum_yhat, train_sum_y2, train_sum_yhat2, train_sum_y_yhat, train_sum_sqerr
-        y = np.asarray(y_mat, dtype=float).reshape(-1)
-        yhat = np.asarray(yhat_mat, dtype=float).reshape(-1)
-        if y.size == 0 or yhat.size == 0:
-            return
-        mask = np.isfinite(y) & np.isfinite(yhat)
-        if not np.any(mask):
-            return
-        y = y[mask]
-        yhat = yhat[mask]
-        train_n += int(y.size)
-        train_sum_y += float(np.sum(y))
-        train_sum_yhat += float(np.sum(yhat))
-        train_sum_y2 += float(np.sum(y * y))
-        train_sum_yhat2 += float(np.sum(yhat * yhat))
-        train_sum_y_yhat += float(np.sum(y * yhat))
-        diff = yhat - y
-        train_sum_sqerr += float(np.sum(diff * diff))
-
-    def _finalize_train_metrics() -> tuple[float, float]:
-        if train_n < 2:
-            return float("nan"), float("nan")
-        n = float(train_n)
-        mean_y = train_sum_y / n
-        mean_yhat = train_sum_yhat / n
-        cov = (train_sum_y_yhat / n) - (mean_y * mean_yhat)
-        var_y = (train_sum_y2 / n) - (mean_y * mean_y)
-        var_yhat = (train_sum_yhat2 / n) - (mean_yhat * mean_yhat)
-        denom = float(np.sqrt(max(var_y, 0.0) * max(var_yhat, 0.0)))
-        if denom <= 0.0 or not np.isfinite(denom):
-            r2_train = float("nan")
-        else:
-            corr = cov / denom
-            r2_train = float(corr * corr) if np.isfinite(corr) else float("nan")
-        rmse_train = float(np.sqrt(train_sum_sqerr / n)) if train_sum_sqerr >= 0.0 else float("nan")
-        return r2_train, rmse_train
-
     total_cycles = len(schedule)
     for cycle_id, item in enumerate(schedule):
         seed_event = None
@@ -689,14 +839,10 @@ def run_rolling_experiment(
             train_objective = float(obj_raw) if obj_raw is not None else float("nan")
             grid_stats.append({"delta_down": float(selected_delta), "objective": train_objective})
             selected_delta_down = selected_delta
-        Yhat_all = predict_yhat(bundle.dataset.X, theta_hat)
-        try:
-            _update_train_stats(
-                bundle.dataset.Y[item.train_start : item.train_end + 1],
-                Yhat_all[item.train_start : item.train_end + 1],
-            )
-        except Exception:
-            pass
+        theta_hat_mat = coerce_theta_intercept(np.asarray(theta_hat, dtype=float), int(bundle.dataset.X.shape[1]))
+        if theta_hat_mat is None:
+            raise RuntimeError("theta_hat was None after training.")
+        Yhat_all = predict_yhat_intercept(bundle.dataset.X, theta_hat_mat)
 
         if debug_roll:
             progress = (cycle_id + 1) / max(total_cycles, 1)
@@ -988,8 +1134,6 @@ def run_rolling_experiment(
         r2 = float("nan")
         rmse = float("nan")
 
-    r2_train, rmse_train = _finalize_train_metrics()
-
     terminal_wealth = float(wealth_values[-1]) if wealth_values else 1.0
     terminal_wealth_net = float(wealth_net_values[-1]) if wealth_net_values else 1.0
     total_return = terminal_wealth - 1.0
@@ -1010,9 +1154,7 @@ def run_rolling_experiment(
         "cvar_95": cvar_95,
         "cvar_95_net": cvar_95_net,
         "r2": r2,
-        "r2_train": r2_train,
         "rmse": rmse,
-        "rmse_train": rmse_train,
         "max_drawdown": max_drawdown(wealth_values),
         "max_drawdown_net": max_drawdown(wealth_net_values),
         "terminal_wealth": terminal_wealth,
@@ -1229,6 +1371,8 @@ def main() -> None:
     config_records = []
     for key, value in sorted(vars(args).items()):
         config_records.append({"parameter": key, "value": value})
+    config_records.append({"parameter": "intercept_models", "value": "ols,ipo,ipo_grad,spo_plus,flex"})
+    config_records.append({"parameter": "intercept_form", "value": "per-asset: y_hat = alpha + beta * x"})
     if snapshot_records:
         config_records.extend(snapshot_records)
     config_csv_path = analysis_csv_dir / "2-experiment_config.csv"
@@ -1517,7 +1661,7 @@ def main() -> None:
 
     # Build flex dual/kkt ensemble if requested, using step_log.csv (convex combination of returns).
     if flex_ensemble_enabled:
-        from dfl_portfolio.experiments.real_data_common import build_flex_dual_kkt_ensemble
+        from dfl_portfolio.experiments.real_data_common_intercept import build_flex_dual_kkt_ensemble
 
         build_flex_dual_kkt_ensemble(
             bundle=bundle,
@@ -1944,7 +2088,7 @@ Baseline execution (defaults match the CLI parser):
 ----------------------------------------------------------
 cd "/Users/kensei/VScode/卒業研究2/Decision-Focused-Learning with Portfolio Optimization"
 
-python -m dfl_portfolio.experiments.real_data_run \
+python -m dfl_portfolio.experiments.real_data_run_intercept \
   --tickers "SPY,GLD,EEM,TLT" \
   --start 2006-01-01 --end 2025-12-31 \
   --momentum-window 26 \
@@ -1959,6 +2103,30 @@ python -m dfl_portfolio.experiments.real_data_run \
   --lambda-theta-anchor 0.0 \
   --theta-anchor-mode ipo \
   --theta-init-mode ipo \
+  --ipo-grad-seed 42 \
+  --benchmarks "spy,1/n" \
+  --jobs 1 \
+  --debug-roll \
+  --cache-dir dfl_portfolio/real_data/cache \
+  --cache-readonly \
+
+Intercept-all-models variant:
+----------------------------------------------------------
+python -m dfl_portfolio.experiments.real_data_run_intercept \
+  --tickers "SPY,GLD,EEM,TLT" \
+  --start 2006-01-01 --end 2025-12-31 \
+  --momentum-window 26 \
+  --cov-window 13 \
+  --cov-method oas \
+  --train-window 26 \
+  --rebal-interval 4 \
+  --delta 0.5 \
+  --models "ols,ipo,ipo_grad,spo_plus,flex" \
+  --flex-solver knitro \
+  --flex-formulation 'kkt' \
+  --lambda-theta-anchor 0.0 \
+  --theta-anchor-mode ipo \
+  --theta-init-mode none \
   --ipo-grad-seed 42 \
   --benchmarks "spy,1/n" \
   --jobs 1 \

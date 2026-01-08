@@ -212,7 +212,7 @@ def plot_wealth_curve(dates: Sequence[pd.Timestamp], wealth: Sequence[float], pa
     plt.plot(dates, wealth, label="wealth")
     plt.xlabel("日付")
     plt.ylabel("累積資産（初期資産=1）")
-    plt.title("累積資産推移")
+    plt.title("累積資産価値の推移")
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
@@ -268,7 +268,32 @@ def plot_weight_comparison(
 ) -> None:
     if plt is None or not weight_dict:
         return
-    models = _sort_models_for_display(list(weight_dict.keys()))
+
+    def _sort_models_for_weight_comparison(raw_models: Sequence[str]) -> List[str]:
+        # Place DFL-OPT-K and PFL consecutively for readability in papers.
+        preferred = [
+            "DFL-OPT-K",
+            "PFL",
+            "DFL-CF",
+            "IPO-GRAD",
+            "SPO+",
+            "DFL-OPT-D",
+            "DFL-OPT-ENS",
+            "Buy&Hold",
+            "1/N",
+            "TSMOM (SPY)",
+        ]
+        order_map = {name: idx for idx, name in enumerate(preferred)}
+
+        def _key(m: str) -> tuple[int, str, str]:
+            disp = display_model_name(m)
+            # Normalize Buy&Hold variants to the base label.
+            disp_key = "Buy&Hold" if disp.startswith("Buy&Hold") else disp
+            return (order_map.get(disp_key, 999), disp, str(m))
+
+        return sorted(list(raw_models), key=_key)
+
+    models = _sort_models_for_weight_comparison(list(weight_dict.keys()))
     n = len(models)
     fig, axes = plt.subplots(n, 1, figsize=(10, 3 * n), sharex=True)
     if n == 1:
@@ -285,7 +310,7 @@ def plot_weight_comparison(
             ax.bar(dates, values[col], bottom=bottom, label=col, width=5)
             bottom += values[col].to_numpy()
         ax.set_ylim(0, 1)
-        ax.set_ylabel(model)
+        ax.set_ylabel(display_model_name(model))
         ax.legend(loc="upper right")
     axes[-1].set_xlabel("日付")
     fig.suptitle("資産ウェイト推移（直近ポイント）")
@@ -338,7 +363,7 @@ def plot_wealth_correlation_heatmap(corr_df: pd.DataFrame, path: Path) -> None:
     ax.set_xticklabels(corr_df.columns, rotation=45, ha="right")
     ax.set_yticks(range(len(corr_df.index)))
     ax.set_yticklabels(corr_df.index)
-    ax.set_title("累積資産推移の相関")
+    ax.set_title("累積資産価値の推移の相関")
     for i in range(data.shape[0]):
         for j in range(data.shape[1]):
             ax.text(j, i, f"{data[i, j]:.2f}", ha="center", va="center", color="black")
@@ -457,9 +482,13 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
     # R^2 は高精度確認用に 6 桁
     if "r2" in df.columns:
         df["r2"] = df["r2"].astype(float).round(6)
+    if "r2_train" in df.columns:
+        df["r2_train"] = df["r2_train"].astype(float).round(6)
     # RMSE も小さい値になりがちなので 6 桁
     if "rmse" in df.columns:
         df["rmse"] = df["rmse"].astype(float).round(6)
+    if "rmse_train" in df.columns:
+        df["rmse_train"] = df["rmse_train"].astype(float).round(6)
     # CVaR は「損失期待値」なので負の値のまま % 表示
     if "cvar_95" in df.columns:
         df["cvar_95"] = (df["cvar_95"].astype(float) * 100.0).round(2)
@@ -496,7 +525,9 @@ def format_summary_for_output(summary_df: pd.DataFrame) -> pd.DataFrame:
         "avg_trading_cost",
         # サブ指標
         "r2",
+        "r2_train",
         "rmse",
+        "rmse_train",
         # カウント系
         "n_retrain",
         "n_invest_steps",
@@ -745,7 +776,7 @@ def plot_multi_wealth(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> None:
     plt.plot(pd.to_datetime(df["date"]), df["wealth"], **kwargs)
     plt.xlabel("日付")
     plt.ylabel("累積資産（初期資産=1）")
-    plt.title("累積資産推移の比較 2006-01-01 ~ 2025-12-31")
+    plt.title("累積資産価値の推移 2006-01-01 ~ 2025-12-31")
     # 開始・終了を控えめにマーキング
     all_dates = pd.concat([pd.to_datetime(df["date"]) for df in wealth_dict.values() if not df.empty])
     if not all_dates.empty:
@@ -784,7 +815,7 @@ def plot_wealth_with_events(wealth_dict: Dict[str, pd.DataFrame], path: Path) ->
         title_range = ""
     plt.xlabel("日付")
     plt.ylabel("累積資産（初期資産=1）")
-    plt.title(f"累積資産推移 2006/01/01 - 2025/12/31")
+    plt.title(f"累積資産価値の推移 2006/01/01 - 2025/12/31")
     _apply_sorted_legend(plt.gca())
     plt.tight_layout()
     fig_path = path
@@ -844,7 +875,7 @@ def plot_wealth_window_normalized(
     plt.axhline(1.0, color="black", linestyle="--", linewidth=0.8, alpha=0.7)
     plt.xlabel("日付")
     plt.ylabel("累積資産（初期資産=1）")
-    plt.title(f"期間別累積資産推移）: {period_name}")
+    plt.title(f"期間別累積資産価値の推移: {period_name}")
     ax = plt.gca()
     _add_range_markers(ax, start_ts, end_ts)
     plt.legend(loc="upper left")
@@ -1329,13 +1360,40 @@ def plot_drawdown_curves(wealth_dict: Dict[str, pd.DataFrame], path: Path) -> No
         palette.setdefault(str(internal_key), color)
 
     fig, ax = plt.subplots(figsize=(10.5, 4.2))
-    for model, df in series_by_model.items():
+    # Emphasize the proposed method (DFL-OPT-K) by drawing it last with higher z-order/linewidth.
+    highlight = "DFL-OPT-K"
+    models = list(series_by_model.keys())
+    ordered_models = [m for m in models if m != highlight]
+    if highlight in series_by_model:
+        ordered_models.append(highlight)
+
+    for model in ordered_models:
+        df = series_by_model.get(model)
+        if df is None:
+            continue
         sub = df.dropna(subset=["date", "drawdown"])
         if sub.empty:
             continue
         color = palette.get(str(model), "tab:blue")
         linestyle = ":" if "ens" in str(model).lower() else "-"
-        ax.plot(sub["date"], sub["drawdown"] * 100.0, label=str(model), color=color, lw=1.3, linestyle=linestyle)
+        if str(model) == highlight:
+            lw = 2.8
+            zorder = 12
+            alpha = 1.0
+        else:
+            lw = 1.2
+            zorder = 3
+            alpha = 0.85
+        ax.plot(
+            sub["date"],
+            sub["drawdown"] * 100.0,
+            label=str(model),
+            color=color,
+            lw=lw,
+            linestyle=linestyle,
+            zorder=zorder,
+            alpha=alpha,
+        )
 
     # Crisis windows background (reuse PERIOD_WINDOWS)
     for _, start, end in PERIOD_WINDOWS:
@@ -3084,6 +3142,7 @@ def export_dataframe_table_png(
     row_id_col: str = "model",
     highlight_truthy_cells: bool = False,
     truthy_cell_color: str = "#b7f7c1",
+    highlight_values_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """Render a DataFrame as a PNG table for quick visual inspection."""
     if plt is None or df is None:
@@ -3093,10 +3152,21 @@ def export_dataframe_table_png(
     # Important: reset index so that table row positions line up with numeric ranking indices
     # (callers often filter rows without resetting the index).
     df_disp = df.copy().reset_index(drop=True)
+    df_hl = highlight_values_df.copy().reset_index(drop=True) if isinstance(highlight_values_df, pd.DataFrame) else None
     if max_cols is not None and df_disp.shape[1] > max_cols:
         df_disp = df_disp.iloc[:, :max_cols]
+        if df_hl is not None:
+            df_hl = df_hl.reindex(columns=df_disp.columns)
     if max_rows is not None and df_disp.shape[0] > max_rows:
         df_disp = df_disp.iloc[:max_rows, :]
+        if df_hl is not None:
+            df_hl = df_hl.iloc[:max_rows, :]
+    if df_hl is not None:
+        # Align highlight values to the displayed table shape/columns.
+        try:
+            df_hl = df_hl.reindex(columns=df_disp.columns)
+        except Exception:
+            df_hl = None
 
     digits_map = {str(k): int(v) for k, v in (float_digits_by_col or {}).items()}
     fmt_map = {str(k): v for k, v in (formatters_by_col or {}).items()}
@@ -3119,7 +3189,8 @@ def export_dataframe_table_png(
         return str(x)
 
     # Keep numeric copy for highlighting before formatting to strings.
-    df_num = df_disp.copy()
+    # If highlight_values_df is provided, use it for ranking, while keeping df_disp for display.
+    df_num = df_hl.copy() if df_hl is not None else df_disp.copy()
     df_str = df_disp.copy()
     for col in df_str.columns:
         df_str[col] = df_str[col].map(lambda v, c=col: _fmt_cell(v, c))
@@ -3348,6 +3419,7 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
         # prediction loss
         "mse",
         "rmse",
+        "rmse_train",
     ]
     for name in targets:
         src = analysis_csv_dir / name
@@ -3363,7 +3435,9 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
             # Default: 2 decimals. Some columns need higher precision.
             digits_by_col = {
                 "r2": 6,
+                "r2_train": 6,
                 "rmse": 6,
+                "rmse_train": 6,
                 "avg_trading_cost": 6,
                 "total_trading_cost": 6,
             }
@@ -3382,7 +3456,7 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
                 mant = v / (10.0 ** exp)
                 return f"{mant:.2f}×10^{exp}"
 
-            formatters_by_col = {"r2": _fmt_sci_scaled}
+            formatters_by_col = {"r2": _fmt_sci_scaled, "r2_train": _fmt_sci_scaled}
             # Hide columns that are not helpful for quick visual inspection.
             drop_cols = {"n_retrain", "n_invest_steps", "trading_cost_bps", "avg_trading_cost_mean", "avg_trading_cost_means"}
             try:
@@ -3417,6 +3491,105 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
 
                 bench_models = {"1/N", "TSMOM (SPY)", "TSMOM(SPY)", "Buy&Hold(SPY)", "Buy&Hold SPY"}
                 exclude_rows_by_col = {"avg_turnover": bench_models, "total_trading_cost": bench_models}
+
+                # Summary tables: show a compact set of metrics with Japanese headers.
+                if name in {"1-summary.csv", "1-summary_cost.csv"}:
+                    def _pick_first(candidates: Sequence[str]) -> Optional[str]:
+                        for c in candidates:
+                            if c in df.columns:
+                                return str(c)
+                        return None
+
+                    include_turnover = bool(name == "1-summary_cost.csv")
+                    col_model = _pick_first(["model"])
+                    col_ann_return = _pick_first(["ann_return", "ann_return_net"])
+                    col_total_return = _pick_first(["total_return", "total_return_net"])
+                    col_ann_vol = _pick_first(["ann_volatility", "ann_volatility_net"])
+                    col_terminal_wealth = _pick_first(["terminal_wealth", "terminal_wealth_net"])
+                    col_sharpe = _pick_first(["sharpe", "sharpe_net"])
+                    col_cvar = _pick_first(["cvar_95", "cvar_95_net"])
+                    col_turnover = _pick_first(["avg_turnover"]) if include_turnover else None
+                    col_r2 = _pick_first(["r2"])
+                    col_r2_train = _pick_first(["r2_train"])
+
+                    # For the cost-adjusted summary table, show annual volatility instead of total return.
+                    col_mid_risk = col_ann_vol if name == "1-summary_cost.csv" else col_total_return
+                    desired_cols = [
+                        col_model,
+                        col_ann_return,
+                        col_mid_risk,
+                        col_terminal_wealth,
+                        col_sharpe,
+                        col_cvar,
+                        col_turnover,
+                        col_r2,
+                        col_r2_train,
+                    ]
+                    keep3 = [c for c in desired_cols if c is not None and c in df.columns]
+                    if keep3:
+                        df = df[keep3]
+
+                    rename_map: Dict[str, str] = {}
+                    if col_model:
+                        rename_map[col_model] = "モデル"
+                    if col_ann_return:
+                        rename_map[col_ann_return] = "年率リターン(%)"
+                    if col_mid_risk:
+                        if name == "1-summary_cost.csv":
+                            rename_map[col_mid_risk] = "年率ボラ(%)"
+                        else:
+                            rename_map[col_mid_risk] = "最終リターン(%)"
+                    if col_terminal_wealth:
+                        rename_map[col_terminal_wealth] = "最終累積資産"
+                    if col_sharpe:
+                        rename_map[col_sharpe] = "シャープ比"
+                    if col_cvar:
+                        rename_map[col_cvar] = "CVaR_95"
+                    if col_turnover:
+                        rename_map[col_turnover] = "ターンオーバー"
+                    if col_r2:
+                        rename_map[col_r2] = "R^2(test)"
+                    if col_r2_train:
+                        rename_map[col_r2_train] = "R^2(train)"
+
+                    df = df.rename(columns=rename_map)
+                    # Model row ordering for tables (requested order).
+                    model_col_disp = "モデル"
+                    if model_col_disp in df.columns:
+                        order_map = {
+                            "DFL-OPT-K": 0,
+                            "DFL-CF": 1,
+                            "IPO-GRAD": 2,
+                            "SPO+": 3,
+                            "PFL": 4,
+                            "Buy&Hold": 5,
+                            "1/N": 6,
+                        }
+
+                        def _model_sort_key(v: object) -> int:
+                            s = str(v).strip()
+                            if s.startswith("Buy&Hold"):
+                                s = "Buy&Hold"
+                            return int(order_map.get(s, 999))
+
+                        df = df.assign(_sort_key=df[model_col_disp].map(_model_sort_key))
+                        df = df.sort_values("_sort_key", kind="mergesort").drop(columns=["_sort_key"])
+
+                    # Update display-specific formatting/highlight configs to match renamed columns.
+                    digits_by_col = {
+                        **{k: v for k, v in digits_by_col.items() if k not in {"r2", "rmse"}},
+                        "R^2(test)": 6,
+                        "R^2(train)": 6,
+                    }
+                    formatters_by_col = {"R^2(test)": _fmt_sci_scaled, "R^2(train)": _fmt_sci_scaled}
+                    lower_is_better_disp = ["CVaR_95"]
+                    exclude_rows_by_col = {}
+                    if name == "1-summary_cost.csv" and "年率ボラ(%)" in df.columns:
+                        lower_is_better_disp.append("年率ボラ(%)")
+                    if include_turnover and "ターンオーバー" in df.columns:
+                        lower_is_better_disp.append("ターンオーバー")
+                        exclude_rows_by_col["ターンオーバー"] = bench_models
+
                 export_dataframe_table_png(
                     df,
                     dst,
@@ -3427,9 +3600,10 @@ def export_analysis_csv_tables_as_png(analysis_csv_dir: Path, analysis_dir: Path
                     max_rows=200,
                     max_cols=40,
                     highlight_top_k=highlight,
-                    lower_is_better_cols=lower_is_better,
+                    lower_is_better_cols=lower_is_better_disp if name in {"1-summary.csv", "1-summary_cost.csv"} else lower_is_better,
                     highlight_truthy_cells=truthy,
                     exclude_highlight_rows_by_col=exclude_rows_by_col,
+                    row_id_col="モデル" if name in {"1-summary.csv", "1-summary_cost.csv"} else "model",
                 )
                 continue
             export_csv_table_png(
